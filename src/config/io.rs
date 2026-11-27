@@ -20,10 +20,11 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
 ];
 
 pub fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
+    match (crate::build_info::product_name(), cfg!(debug_assertions)) {
+        ("regents", true) => "regents-dev",
+        ("regents", false) => "regents",
+        (_, true) => "herdr-dev",
+        (_, false) => "herdr",
     }
 }
 

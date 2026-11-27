@@ -3,6 +3,7 @@ name = "herdr"
 version = "0.9.5"
 edition = "2021"
 build = "build.rs"
+default-run = "herdr"
 description = "terminal workspace manager for AI coding agents"
 license = "Apache-2.0"
 repository = "https://github.com/herdrdev/herdr"
@@ -19,6 +20,15 @@ include = [
     "LICENSE",
     "Cargo.toml",
 ]
+
+# Regents fork: a second binary built from the same sources (ADR-0002).
+# `src/main.rs` stays auto-discovered as the `herdr` binary. Unit tests run
+# once, through the `herdr` target.
+[[bin]]
+name = "regents"
+path = "src/bin/regents.rs"
+test = false
+bench = false
 
 [workspace]
 members = ["crates/ghostty-vt"]

@@ -45,6 +45,7 @@ mod product_announcements;
 mod protocol;
 mod pty;
 mod raw_input;
+mod regents;
 mod release_notes;
 mod remote;
 mod render_prof;
@@ -509,6 +510,7 @@ fn finish_cli(outcome: io::Result<cli::CommandOutcome>) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    regents::detach_from_other_product_server();
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
         Err(err) => {
@@ -724,7 +726,11 @@ fn main() -> io::Result<()> {
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
         platform::begin_cli_output();
-        println!("herdr {}", crate::build_info::version());
+        println!(
+            "{} {}",
+            crate::build_info::product_name(),
+            crate::build_info::version()
+        );
         return Ok(());
     }
 
