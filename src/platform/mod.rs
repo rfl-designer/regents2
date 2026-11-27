@@ -271,6 +271,13 @@ pub(crate) fn plugin_runtime_path(path: &std::path::Path) -> std::path::PathBuf 
     plugin_runtime_path_platform(path)
 }
 
+/// Canonical form of an existing path, in the standard form that native
+/// processes accept (on Windows, without a verbatim prefix when possible).
+pub(crate) fn canonical_path(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    Ok(plugin_runtime_path(&canonical))
+}
+
 pub(crate) fn normalize_cwd_for_launch(path: &std::path::Path) -> std::path::PathBuf {
     normalize_cwd_for_launch_platform(path)
 }

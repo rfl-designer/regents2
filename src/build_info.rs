@@ -11,6 +11,11 @@ pub fn product_name() -> &'static str {
     }
 }
 
+/// True for the `regents` binary of the Regents fork.
+pub fn is_regents() -> bool {
+    product_name() == "regents"
+}
+
 pub fn channel() -> &'static str {
     non_empty(option_env!("HERDR_BUILD_CHANNEL")).unwrap_or("stable")
 }

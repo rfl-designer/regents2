@@ -94,6 +94,42 @@ pub struct WorkspaceInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
+    /// Workspace folder that gives this workspace its identity (Regents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<WorkspaceFolderInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceFolderInfo {
+    /// Stable ID from the folder's `.regents/workspace.toml`.
+    pub id: String,
+    pub path: String,
+}
+
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct WorkspaceAddParams => WorkspaceAddProjection {
+        /// Absolute path of the folder on the server host.
+        pub path: String => Field::new(String::new()).input(bindings::folder_path()),
+        #[serde(default)]
+        pub focus: bool => Field::new(false)
+            .input(bindings::boolean("focus", true).order(1))
+            .input(bindings::boolean("no-focus", false).order(2)),
+    }
+}
+
+/// A folder in the global workspace registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RegisteredWorkspaceInfo {
+    pub path: String,
+    /// ID from `.regents/workspace.toml`; absent when the file cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Open workspace bound to this folder, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

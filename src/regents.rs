@@ -7,6 +7,9 @@
 //! module removes that binding at startup, so herdr and Regents never see each
 //! other's servers.
 
+pub(crate) mod folder;
+pub(crate) mod registry;
+
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -27,13 +30,19 @@ const SERVER_PANE_ENV_VARS: &[&str] = &[
     SERVER_BIN_PATH_ENV_VAR,
 ];
 
+/// Registry of workspace folders for the running product. Only Regents has
+/// folder workspaces.
+pub(crate) fn workspace_registry_path() -> Option<std::path::PathBuf> {
+    crate::build_info::is_regents().then(registry::default_path)
+}
+
 /// Removes an inherited binding to a server of another product. Call it at the
 /// start of `main`, before other threads start.
 pub(crate) fn detach_from_other_product_server() {
-    let product = crate::build_info::product_name();
-    if product != "regents" {
+    if !crate::build_info::is_regents() {
         return;
     }
+    let product = crate::build_info::product_name();
     if std::env::var_os(crate::HERDR_ENV_VAR).as_deref() != Some(OsStr::new(crate::HERDR_ENV_VALUE))
     {
         return;

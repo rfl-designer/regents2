@@ -57,6 +57,9 @@ pub struct WorkspaceSnapshot {
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
+    /// Regents workspace folder binding; absent for herdr workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<crate::regents::folder::FolderBinding>,
     #[serde(default)]
     pub public_pane_numbers: HashMap<u32, usize>,
     #[serde(default)]
@@ -169,6 +172,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             custom_name: snap.custom_name,
             identity_cwd,
             worktree_space: None,
+            folder: None,
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
             public_tab_numbers: Vec::new(),
@@ -307,6 +311,7 @@ fn capture_workspace(
         custom_name: ws.custom_name.clone(),
         identity_cwd,
         worktree_space: ws.worktree_space.clone(),
+        folder: ws.folder.clone(),
         public_pane_numbers: ws
             .public_pane_numbers
             .iter()
@@ -728,6 +733,7 @@ mod tests {
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
+                folder: None,
                 public_pane_numbers: HashMap::from([(0, 1), (1, 2)]),
                 next_public_pane_number: 3,
                 public_tab_numbers: vec![1],
@@ -953,6 +959,62 @@ mod tests {
             snapshot.workspaces[0].worktree_space,
             state.workspaces[0].worktree_space
         );
+    }
+
+    fn folder_binding(id: &str, root: &str) -> crate::regents::folder::FolderBinding {
+        crate::regents::folder::FolderBinding {
+            id: id.into(),
+            root: PathBuf::from(root),
+        }
+    }
+
+    #[test]
+    fn capture_contract_tracks_folder_binding() {
+        let mut state = state_with_workspaces(&["bound", "legacy"]);
+        state.workspaces[0].folder = Some(folder_binding("ws-id", "/work/project"));
+
+        let snapshot = capture_from_state(&state);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let parsed = parse_snapshot(&json.to_string()).unwrap();
+
+        assert_eq!(
+            parsed.workspaces[0].folder,
+            Some(folder_binding("ws-id", "/work/project"))
+        );
+        assert_eq!(parsed.workspaces[1].folder, None);
+        assert!(
+            json["workspaces"][1].get("folder").is_none(),
+            "an unbound workspace keeps the herdr session format"
+        );
+    }
+
+    #[test]
+    fn folder_identity_does_not_follow_the_root_pane_cwd() {
+        let mut state = state_with_workspaces(&["bound"]);
+        state.workspaces[0].folder = Some(folder_binding("ws-id", "/work/project"));
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&terminal_id).unwrap().cwd = PathBuf::from("/elsewhere");
+
+        let snapshot = capture_from_state(&state);
+
+        assert_eq!(
+            snapshot.workspaces[0].identity_cwd,
+            PathBuf::from("/elsewhere")
+        );
+        assert_eq!(
+            snapshot.workspaces[0].folder,
+            Some(folder_binding("ws-id", "/work/project"))
+        );
+    }
+
+    #[test]
+    fn session_without_folder_bindings_parses_as_unbound() {
+        let snap = parse_snapshot(session_fixture("current-herdr")).unwrap();
+
+        assert!(snap.workspaces.iter().all(|ws| ws.folder.is_none()));
     }
 
     #[test]
@@ -1429,6 +1491,7 @@ mod tests {
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
+                folder: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),

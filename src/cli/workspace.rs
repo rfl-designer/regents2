@@ -1,5 +1,5 @@
 use super::projection::ParseError;
-use super::workspace_bindings::{command, LEAVES};
+use super::workspace_bindings::{command, leaves};
 
 pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
     let print_commands = || eprintln!("{}", super::projection::group_commands(&command()));
@@ -11,7 +11,7 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
         print_commands();
         return Ok(0);
     }
-    let Some(leaf) = LEAVES.iter().find(|leaf| leaf.name == subcommand) else {
+    let Some(leaf) = leaves().into_iter().find(|leaf| leaf.name == subcommand) else {
         print_commands();
         return Ok(2);
     };

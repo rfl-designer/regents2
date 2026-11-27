@@ -162,6 +162,7 @@ mod tests {
             "workspace.move",
             "workspace.move_block",
             "workspace.report_metadata",
+            "workspace.add",
             "workspace.close",
             "worktree.create",
             "worktree.open",

@@ -425,6 +425,7 @@ fn restore_workspace(
             cached_git_ahead_behind: None,
             cached_git_space: None,
             worktree_space: snap.worktree_space.clone(),
+            folder: snap.folder.clone(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
@@ -1532,6 +1533,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                folder: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
@@ -1613,6 +1615,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                folder: None,
                 public_pane_numbers: HashMap::from([(10, 1), (20, 3)]),
                 next_public_pane_number: 4,
                 public_tab_numbers: vec![5],
@@ -1726,6 +1729,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                folder: None,
                 public_pane_numbers: HashMap::from([(10, 1), (11, 2), (12, 3), (13, 4)]),
                 next_public_pane_number: 5,
                 public_tab_numbers: vec![1, 3, 4, 5],
@@ -1809,6 +1813,7 @@ mod tests {
             custom_name: None,
             identity_cwd: cwd,
             worktree_space: None,
+            folder: None,
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
             public_tab_numbers: Vec::new(),
@@ -1848,6 +1853,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                folder: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
@@ -2163,6 +2169,127 @@ mod tests {
         }
     }
 
+    /// Workspace snapshot as JSON with raw pane ids replaced by public pane
+    /// numbers. Raw pane ids change on every restore; public numbers must not.
+    fn workspace_identity_view(snapshot: &WorkspaceSnapshot) -> serde_json::Value {
+        fn public(numbers: &HashMap<u32, usize>, raw: &serde_json::Value) -> serde_json::Value {
+            let raw = raw
+                .as_u64()
+                .or_else(|| raw.as_str().and_then(|raw| raw.parse().ok()))
+                .expect("pane id");
+            serde_json::json!(numbers[&(raw as u32)])
+        }
+        fn layout(numbers: &HashMap<u32, usize>, node: &mut serde_json::Value) {
+            if let Some(raw) = node.get("Pane").cloned() {
+                node["Pane"] = public(numbers, &raw);
+            } else if let Some(split) = node.get_mut("Split") {
+                layout(numbers, &mut split["first"]);
+                layout(numbers, &mut split["second"]);
+            }
+        }
+        let numbers = &snapshot.public_pane_numbers;
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value["public_pane_numbers"] = serde_json::json!({});
+        for tab in value["tabs"].as_array_mut().unwrap() {
+            layout(numbers, &mut tab["layout"]);
+            for key in ["focused", "root_pane"] {
+                if !tab[key].is_null() {
+                    tab[key] = public(numbers, &tab[key]);
+                }
+            }
+            let panes = tab["panes"].as_object().unwrap().clone();
+            tab["panes"] = panes
+                .into_iter()
+                .map(|(raw, pane)| (public(numbers, &serde_json::json!(raw)).to_string(), pane))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+        }
+        value
+    }
+
+    // Characterization of the restore contract before Regents adds folder
+    // identity to workspaces (refactor-risk, AGENTS.md): a capture, a JSON
+    // round trip and a restore keep workspace identity, names, public ids
+    // and layout, also for adversarial identity state.
+    #[tokio::test]
+    async fn restore_round_trip_preserves_adversarial_workspace_identity_and_layout() {
+        let state = crate::app::AppState::test_with_adversarial_identity_state();
+
+        let restored = assert_restore_round_trip(state);
+
+        assert_eq!(restored.workspaces[0].folder, None);
+    }
+
+    #[tokio::test]
+    async fn restore_round_trip_keeps_the_folder_workspace_identity() {
+        let mut state = crate::app::AppState::test_with_adversarial_identity_state();
+        state.workspaces.push(Workspace::test_new("legacy"));
+        state.ensure_test_terminals();
+        let binding = crate::regents::folder::FolderBinding {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            root: std::env::current_dir().unwrap(),
+        };
+        state.workspaces[0].folder = Some(binding.clone());
+
+        let restored = assert_restore_round_trip(state);
+
+        assert_eq!(restored.workspaces[0].folder, Some(binding));
+        assert_eq!(restored.workspaces[1].folder, None);
+    }
+
+    /// Captures `state`, saves it as JSON, restores it and checks that the
+    /// restored workspaces keep their identity and layout.
+    fn assert_restore_round_trip(mut state: crate::app::AppState) -> crate::app::AppState {
+        let cwd = std::env::current_dir().unwrap();
+        for workspace in &mut state.workspaces {
+            workspace.identity_cwd = cwd.clone();
+        }
+        for terminal in state.terminals.values_mut() {
+            terminal.cwd = cwd.clone();
+        }
+        let before = crate::persist::capture(
+            &state.workspaces,
+            &state.terminals,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            state.active,
+            state.selected,
+        );
+        let saved =
+            super::super::snapshot::parse_snapshot(&serde_json::to_string_pretty(&before).unwrap())
+                .unwrap();
+        let (events, _rx) = mpsc::channel(32);
+
+        let (workspaces, terminals, runtimes) = restore(
+            &saved,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let after = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+
+        assert_eq!(after.workspaces.len(), before.workspaces.len());
+        for (after, before) in after.workspaces.iter().zip(&before.workspaces) {
+            assert_eq!(
+                workspace_identity_view(after),
+                workspace_identity_view(before)
+            );
+        }
+        let mut restored = crate::app::AppState::test_new();
+        restored.workspaces = workspaces;
+        restored.terminals = terminals;
+        restored.active = Some(0);
+        restored.assert_invariants_for_test();
+        restored
+    }
+
     fn snapshot_with_saved_pane_history() -> (SessionSnapshot, SessionHistorySnapshot) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let mut panes = HashMap::new();
@@ -2204,6 +2331,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd,
                 worktree_space: None,
+                folder: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),

@@ -1317,6 +1317,7 @@ impl AppState {
         );
 
         let mut workspace_ids = std::collections::HashSet::new();
+        let mut folder_ids = std::collections::HashSet::new();
         let mut workspace_id_to_idx = std::collections::HashMap::new();
         let mut pane_ids = std::collections::HashSet::new();
         let mut attached_terminal_ids = std::collections::HashSet::new();
@@ -1328,6 +1329,13 @@ impl AppState {
                 ws_idx
             );
             workspace_id_to_idx.insert(ws.id.clone(), ws_idx);
+            if let Some(folder) = &ws.folder {
+                assert!(
+                    folder_ids.insert(folder.id.clone()),
+                    "folder workspace id {} is bound to more than one workspace",
+                    folder.id
+                );
+            }
             ws.assert_invariants_for_test();
 
             for tab in &ws.tabs {
@@ -1433,6 +1441,43 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    fn bind_folder(ws: &mut crate::workspace::Workspace, id: &str) {
+        ws.folder = Some(crate::regents::folder::FolderBinding {
+            id: id.into(),
+            root: std::path::PathBuf::from("/work").join(id),
+        });
+    }
+
+    #[test]
+    fn adversarial_state_with_folder_bindings_keeps_invariants() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("legacy"));
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("second"));
+        state.ensure_test_terminals();
+        bind_folder(&mut state.workspaces[0], "first-folder");
+        bind_folder(&mut state.workspaces[2], "second-folder");
+
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    #[should_panic(expected = "bound to more than one workspace")]
+    fn invariants_reject_two_workspaces_with_the_same_folder_id() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("copy"));
+        state.ensure_test_terminals();
+        bind_folder(&mut state.workspaces[0], "same");
+        bind_folder(&mut state.workspaces[1], "same");
+
+        state.assert_invariants_for_test();
+    }
 
     #[test]
     fn new_pane_size_uses_headless_size_before_first_view() {

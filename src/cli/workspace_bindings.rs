@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use clap::{Arg, ArgMatches, Command};
 
 use crate::api::schema::workspaces::{
-    WorkspaceCloseProjection, WorkspaceCreateProjection, WorkspaceMetadataProjection,
-    WorkspaceRenameProjection,
+    WorkspaceAddProjection, WorkspaceCloseProjection, WorkspaceCreateProjection,
+    WorkspaceMetadataProjection, WorkspaceRenameProjection,
 };
 use crate::api::schema::{EmptyParams, Method, Request, WorkspaceTarget};
 
@@ -17,6 +17,16 @@ pub(crate) fn workspace_id() -> Input<String> {
         *slot = super::normalize_workspace_id(value);
         Ok(())
     })
+}
+
+/// Folder path argument. A local relative path becomes absolute here,
+/// because the server resolves paths from its own cwd.
+pub(crate) fn folder_path() -> Input<String> {
+    Input::positional("path", 0, |slot, value| {
+        *slot = super::worktree::normalize_path_arg(value)?;
+        Ok(())
+    })
+    .path()
 }
 
 pub(crate) fn label() -> Input<String> {
@@ -109,8 +119,11 @@ pub(crate) struct Leaf {
 impl Leaf {
     pub(crate) fn request(&self, args: &[String]) -> Result<Request, ParseError> {
         let method = super::projection::parse(
-            self.command()
-                .bin_name(format!("herdr workspace {}", self.name)),
+            self.command().bin_name(format!(
+                "{} workspace {}",
+                crate::build_info::product_name(),
+                self.name
+            )),
             args,
             self.method,
         )?;
@@ -196,10 +209,53 @@ pub(crate) const LEAVES: [Leaf; 7] = [
     },
 ];
 
+/// Regents commands for folder workspaces. `list` shows the registered
+/// folders instead of the open layout containers.
+const REGENTS_LEAVES: [Leaf; 2] = [
+    Leaf {
+        name: "add",
+        about: "Register a folder as a workspace and open it",
+        id: "cli:workspace:add",
+        quiet: false,
+        arguments: WorkspaceAddProjection::arguments,
+        method: |matches| WorkspaceAddProjection::from_matches(matches).map(Method::WorkspaceAdd),
+    },
+    Leaf {
+        name: "list",
+        about: "List registered workspaces",
+        id: "cli:workspace:list",
+        quiet: false,
+        arguments: WorkspaceListProjection::arguments,
+        method: |matches| {
+            WorkspaceListProjection::from_matches(matches).map(Method::WorkspaceRegistryList)
+        },
+    },
+];
+
+/// Workspace commands of the product. Regents commands replace herdr commands
+/// with the same name; the herdr binary keeps its commands unchanged.
+fn leaves_for(regents: bool) -> Vec<&'static Leaf> {
+    if !regents {
+        return LEAVES.iter().collect();
+    }
+    REGENTS_LEAVES
+        .iter()
+        .chain(LEAVES.iter().filter(|leaf| {
+            REGENTS_LEAVES
+                .iter()
+                .all(|regents| regents.name != leaf.name)
+        }))
+        .collect()
+}
+
+pub(crate) fn leaves() -> Vec<&'static Leaf> {
+    leaves_for(crate::build_info::is_regents())
+}
+
 pub(crate) fn command() -> Command {
     Command::new("workspace")
         .about("Manage workspaces over the socket API")
-        .subcommands(LEAVES.iter().map(Leaf::command))
+        .subcommands(leaves().into_iter().map(Leaf::command))
 }
 
 #[cfg(test)]
@@ -312,6 +368,65 @@ mod tests {
         assert!(
             matches!(request("report-metadata", &["id", "--source", "valid"]), Err(ParseError::Usage(message)) if message == "missing token to set or clear")
         );
+    }
+
+    fn product_request(
+        regents: bool,
+        command: &str,
+        args: &[&str],
+    ) -> Option<Result<Request, ParseError>> {
+        leaves_for(regents)
+            .into_iter()
+            .find(|leaf| leaf.name == command)
+            .map(|leaf| leaf.request(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn regents_workspace_add_sends_an_absolute_folder_path() {
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("projeto")
+            .display()
+            .to_string();
+
+        let request = product_request(true, "add", &["projeto", "--focus"])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "id": "cli:workspace:add", "method": "workspace.add",
+                "params": {"path": expected, "focus": true}
+            })
+        );
+        assert!(matches!(
+            product_request(true, "add", &[]),
+            Some(Err(ParseError::Clap(_)))
+        ));
+    }
+
+    #[test]
+    fn regents_workspace_list_shows_registered_workspaces_and_herdr_keeps_its_list() {
+        let regents = product_request(true, "list", &[]).unwrap().unwrap();
+        let herdr = product_request(false, "list", &[]).unwrap().unwrap();
+
+        assert_eq!(
+            serde_json::to_value(regents).unwrap()["method"],
+            "workspace.registry.list"
+        );
+        assert_eq!(
+            serde_json::to_value(herdr).unwrap()["method"],
+            "workspace.list"
+        );
+        assert!(product_request(false, "add", &["x"]).is_none());
+        let herdr_names: Vec<_> = leaves_for(false).iter().map(|leaf| leaf.name).collect();
+        let regents_names: Vec<_> = leaves_for(true).iter().map(|leaf| leaf.name).collect();
+        assert_eq!(
+            herdr_names,
+            LEAVES.iter().map(|leaf| leaf.name).collect::<Vec<_>>()
+        );
+        assert_eq!(regents_names.len(), LEAVES.len() + 1);
     }
 
     #[test]

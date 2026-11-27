@@ -10,6 +10,8 @@ pub(crate) mod plugins;
 pub(super) mod responses;
 mod session;
 mod tabs;
+mod workspace_folders;
+pub(super) use workspace_folders::folder_info;
 mod workspaces;
 mod worktrees;
 
@@ -1258,6 +1260,12 @@ impl App {
             }
             Method::PluginPaneClose(params) => {
                 return self.handle_plugin_pane_close(request.id, params);
+            }
+            Method::WorkspaceAdd(params) => {
+                return self.handle_workspace_add(request.id, params);
+            }
+            Method::WorkspaceRegistryList(_) => {
+                return self.handle_workspace_registry_list(request.id);
             }
             _ => {
                 return responses::encode_error(

@@ -409,6 +409,7 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+            folder: ws.folder.as_ref().map(super::api::folder_info),
         }
     }
 }

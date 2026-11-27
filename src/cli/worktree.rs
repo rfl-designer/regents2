@@ -7,7 +7,7 @@ pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
     super::run_json_request(bindings::request(args))
 }
 
-fn normalize_path_arg(value: &str) -> std::io::Result<String> {
+pub(super) fn normalize_path_arg(value: &str) -> std::io::Result<String> {
     if super::target::is_remote() {
         if super::target::remote_path_is_absolute(value) || value == "~" || value.starts_with("~/")
         {

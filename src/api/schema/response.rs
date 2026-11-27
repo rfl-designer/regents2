@@ -278,6 +278,16 @@ pub enum ResponseResult {
         projection_revision: u64,
     },
     Ok {},
+    WorkspaceAdded {
+        workspace: WorkspaceInfo,
+        /// The folder had no `.regents/` and received the initial structure.
+        initialized: bool,
+        /// The folder was already in the registry.
+        already_registered: bool,
+    },
+    RegisteredWorkspaceList {
+        workspaces: Vec<super::workspaces::RegisteredWorkspaceInfo>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

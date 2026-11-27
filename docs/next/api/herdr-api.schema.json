@@ -1074,6 +1074,22 @@
           ],
           "type": "object"
         },
+        "WorkspaceFolderInfo": {
+          "properties": {
+            "id": {
+              "description": "Stable ID from the folder's `.regents/workspace.toml`.",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "path"
+          ],
+          "type": "object"
+        },
         "WorkspaceInfo": {
           "properties": {
             "active_tab_id": {
@@ -1084,6 +1100,17 @@
             },
             "focused": {
               "type": "boolean"
+            },
+            "folder": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/WorkspaceFolderInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Workspace folder that gives this workspace its identity (Regents)."
             },
             "label": {
               "type": "string"
@@ -4366,6 +4393,22 @@
           ],
           "type": "string"
         },
+        "WorkspaceAddParams": {
+          "properties": {
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "path": {
+              "description": "Absolute path of the folder on the server host.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
         "WorkspaceCloseParams": {
           "properties": {
             "close_group": {
@@ -6305,6 +6348,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workspace.add",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceAddParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workspace.registry.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
             }
           },
           "required": [
@@ -9165,6 +9240,38 @@
           ],
           "type": "string"
         },
+        "RegisteredWorkspaceInfo": {
+          "description": "A folder in the global workspace registry.",
+          "properties": {
+            "id": {
+              "description": "ID from `.regents/workspace.toml`; absent when the file cannot be read.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Open workspace bound to this folder, if any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
         "ResponseResult": {
           "oneOf": [
             {
@@ -10415,6 +10522,51 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "already_registered": {
+                  "description": "The folder was already in the registry.",
+                  "type": "boolean"
+                },
+                "initialized": {
+                  "description": "The folder had no `.regents/` and received the initial structure.",
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "workspace_added",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/success_response/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace",
+                "initialized",
+                "already_registered"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "registered_workspace_list",
+                  "type": "string"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/RegisteredWorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspaces"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -10573,6 +10725,22 @@
           ],
           "type": "object"
         },
+        "WorkspaceFolderInfo": {
+          "properties": {
+            "id": {
+              "description": "Stable ID from the folder's `.regents/workspace.toml`.",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "path"
+          ],
+          "type": "object"
+        },
         "WorkspaceInfo": {
           "properties": {
             "active_tab_id": {
@@ -10583,6 +10751,17 @@
             },
             "focused": {
               "type": "boolean"
+            },
+            "folder": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkspaceFolderInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Workspace folder that gives this workspace its identity (Regents)."
             },
             "label": {
               "type": "string"
