@@ -49,6 +49,28 @@ cli_params! {
     }
 }
 
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct ChannelOpenParams => ChannelOpenProjection {
+        /// Workspace of the channel: its public ID or the stable ID from
+        /// `workspace.toml`. Absent means the active workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub workspace_id: Option<String> => Field::new(None)
+            .input(super::tabs::workspace_option("WORKSPACE_ID").order(0)),
+        /// Channel name (slug), for example `geral`.
+        pub channel: String => Field::new(String::new()).input(bindings::channel_name()),
+    }
+}
+
+/// The channel that a chat pane shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneChannelInfo {
+    /// Stable ID of the workspace folder, from `workspace.toml`.
+    pub folder_id: String,
+    /// Channel name (slug).
+    pub channel: String,
+}
+
 /// Who wrote a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]

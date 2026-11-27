@@ -41,12 +41,17 @@ impl App {
         if self.state.workspaces.is_empty() {
             SessionSaveJob::Clear
         } else {
-            let snapshot = crate::persist::capture(
+            let mut snapshot = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
                 self.state.active,
                 self.state.selected,
+            );
+            crate::regents::chat_panes::record_in_snapshot(
+                &mut snapshot,
+                &self.state.workspaces,
+                &self.state.channel_views,
             );
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(

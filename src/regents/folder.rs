@@ -42,6 +42,16 @@ pub(crate) struct OpenedFolder {
     pub(crate) initialized: bool,
 }
 
+/// Stable ID of the workspace folder that holds `dir`: the nearest ancestor
+/// with `.regents/workspace.toml`. `None` when there is none or it cannot be
+/// read.
+pub(crate) fn folder_workspace_id(dir: &Path) -> Option<String> {
+    let root = dir
+        .ancestors()
+        .find(|ancestor| ancestor.join(STATE_DIR).join(MANIFEST_FILE).is_file())?;
+    read_manifest(root).ok().map(|manifest| manifest.id)
+}
+
 /// Reads `.regents/workspace.toml` of `root`.
 pub(crate) fn read_manifest(root: &Path) -> io::Result<WorkspaceManifest> {
     let path = root.join(STATE_DIR).join(MANIFEST_FILE);

@@ -1044,6 +1044,10 @@ pub struct ClientShellWorkspace {
     /// servers.
     #[serde(default)]
     pub disconnected: bool,
+    /// Channel names of a Regents folder workspace. Optional for older
+    /// servers.
+    #[serde(default)]
+    pub channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2846,6 +2850,7 @@ mod tests {
                 agent_status: crate::api::schema::AgentStatus::Idle,
                 legacy: false,
                 disconnected: false,
+                channels: Vec::new(),
             }],
             tabs: vec![ClientShellTab {
                 tab_id: "w1:t1".into(),

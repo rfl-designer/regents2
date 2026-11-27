@@ -982,6 +982,9 @@ pub struct AppState {
     pub(crate) installed_plugins: InstalledPluginRegistry,
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
+    /// Regents: panes that show a channel as a chat.
+    pub(crate) channel_views:
+        std::collections::HashMap<PaneId, crate::regents::channel::ChannelView>,
     /// Session-modal terminal popup. This is intentionally outside workspace layouts.
     pub(crate) popup_pane: Option<PopupPaneState>,
     /// Recent plugin action/event command executions.
@@ -1221,6 +1224,7 @@ impl AppState {
                 crate::detect::manifest_update::ManifestUpdateStatus::default(),
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
+            channel_views: std::collections::HashMap::new(),
             popup_pane: None,
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
@@ -1286,6 +1290,10 @@ impl AppState {
             assert!(
                 self.plugin_panes.is_empty(),
                 "empty app state must not keep plugin pane records"
+            );
+            assert!(
+                self.channel_views.is_empty(),
+                "empty app state must not keep chat pane records"
             );
             assert!(
                 self.pending_agent_notifications.is_empty(),
@@ -1419,6 +1427,9 @@ impl AppState {
         }
         for &pane_id in self.plugin_panes.keys() {
             assert_live_pane(pane_id, "plugin pane record");
+        }
+        for &pane_id in self.channel_views.keys() {
+            assert_live_pane(pane_id, "chat pane record");
         }
     }
 

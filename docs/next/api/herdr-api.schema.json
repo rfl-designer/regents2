@@ -866,6 +866,24 @@
           ],
           "type": "string"
         },
+        "PaneChannelInfo": {
+          "description": "The channel that a chat pane shows.",
+          "properties": {
+            "channel": {
+              "description": "Channel name (slug).",
+              "type": "string"
+            },
+            "folder_id": {
+              "description": "Stable ID of the workspace folder, from `workspace.toml`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "folder_id",
+            "channel"
+          ],
+          "type": "object"
+        },
         "PaneInfo": {
           "properties": {
             "agent": {
@@ -886,6 +904,17 @@
             },
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
+            },
+            "channel": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PaneChannelInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The channel that this pane shows as a chat (Regents). Absent for a\nterminal pane."
             },
             "cwd": {
               "type": [
@@ -1206,6 +1235,13 @@
             },
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
+            },
+            "channels": {
+              "description": "Channel names of a Regents folder workspace, in name order. Absent\nmeans none.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "disconnected": {
               "description": "Regents disconnected workspace: its folder is no longer at the known\npath. `workspace.relink` binds it to the new path. Absent means false.",
@@ -1848,6 +1884,25 @@
           },
           "required": [
             "target"
+          ],
+          "type": "object"
+        },
+        "ChannelOpenParams": {
+          "properties": {
+            "channel": {
+              "description": "Channel name (slug), for example `geral`.",
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Workspace of the channel: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "channel"
           ],
           "type": "object"
         },
@@ -6774,6 +6829,22 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "channel.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ChannelOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -8465,6 +8536,24 @@
           ],
           "type": "string"
         },
+        "PaneChannelInfo": {
+          "description": "The channel that a chat pane shows.",
+          "properties": {
+            "channel": {
+              "description": "Channel name (slug).",
+              "type": "string"
+            },
+            "folder_id": {
+              "description": "Stable ID of the workspace folder, from `workspace.toml`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "folder_id",
+            "channel"
+          ],
+          "type": "object"
+        },
         "PaneDirection": {
           "enum": [
             "left",
@@ -8566,6 +8655,17 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "channel": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneChannelInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The channel that this pane shows as a chat (Regents). Absent for a\nterminal pane."
             },
             "cwd": {
               "type": [
@@ -11337,6 +11437,35 @@
                 "agents"
               ],
               "type": "object"
+            },
+            {
+              "description": "The chat pane of a channel has focus. `opened` is false when the\nchannel was already open in the workspace layout.",
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "opened": {
+                  "type": "boolean"
+                },
+                "pane": {
+                  "$ref": "#/schemas/success_response/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "channel_opened",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "channel",
+                "opened",
+                "pane"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -11675,6 +11804,13 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "channels": {
+              "description": "Channel names of a Regents folder workspace, in name order. Absent\nmeans none.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "disconnected": {
               "description": "Regents disconnected workspace: its folder is no longer at the known\npath. `workspace.relink` binds it to the new path. Absent means false.",

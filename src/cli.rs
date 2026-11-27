@@ -124,6 +124,12 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "status" => status::run_status_command(&args[2..])?,
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
+        "channel"
+            if crate::build_info::is_regents()
+                && args.get(2).map(String::as_str) == Some(channel_bindings::VIEW_COMMAND) =>
+        {
+            channel_bindings::run_view(&args[3..])?
+        }
         "channel" if crate::build_info::is_regents() => {
             run_json_request(channel_bindings::request(&args[2..]))?
         }

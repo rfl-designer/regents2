@@ -755,6 +755,7 @@ impl Workspace {
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         focus_new_pane: bool,
+        agent_detection: crate::pane::AgentDetection,
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         self.split_pane_with_runtime(
             pane_id,
@@ -769,7 +770,7 @@ impl Workspace {
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             extra_env,
             focus_new_pane,
-            Some(argv),
+            Some((argv, agent_detection)),
         )
     }
 
@@ -802,7 +803,7 @@ impl Workspace {
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             extra_env,
             focus_new_pane,
-            Some(argv),
+            Some((argv, crate::pane::AgentDetection::Enabled)),
         )
     }
 
@@ -821,14 +822,14 @@ impl Workspace {
         shell_config: crate::pane::PaneShellConfig<'_>,
         extra_env: Vec<(String, String)>,
         focus_new_pane: bool,
-        argv: Option<&[String]>,
+        argv: Option<(&[String], crate::pane::AgentDetection)>,
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         let tab_idx = self.find_tab_index_for_pane(pane_id)?;
         let pane_number = self.next_public_pane_number;
         let tab_number = self.tabs[tab_idx].number;
         let launch_env = self.launch_env_for_new_pane(tab_number, pane_number, extra_env);
         let tab = &mut self.tabs[tab_idx];
-        let new_pane = match if let Some(argv) = argv {
+        let new_pane = match if let Some((argv, agent_detection)) = argv {
             tab.split_pane_argv(
                 pane_id,
                 focus_new_pane,
@@ -839,6 +840,7 @@ impl Workspace {
                 cwd,
                 argv,
                 &launch_env,
+                agent_detection,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,

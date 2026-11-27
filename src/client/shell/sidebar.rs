@@ -236,9 +236,21 @@ pub(crate) fn render_sidebar(
             .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
     );
     hits.workspace_body = body;
-    let row_heights = entries
+    let shown = entries
         .iter()
         .map(|entry| {
+            snapshot
+                .workspaces
+                .get(entry.index)
+                .map_or(&[][..], |workspace| {
+                    shown_channels(workspace, state.expanded_channel_workspaces)
+                })
+        })
+        .collect::<Vec<_>>();
+    let row_heights = entries
+        .iter()
+        .zip(&shown)
+        .map(|(entry, channels)| {
             snapshot
                 .workspaces
                 .get(entry.index)
@@ -251,6 +263,7 @@ pub(crate) fn render_sidebar(
                     )
                     .len()
                     .max(1)
+                    .saturating_add(channels.len())
                     .min(u16::MAX as usize) as u16
                 })
                 .unwrap_or(1)
@@ -305,11 +318,15 @@ pub(crate) fn render_sidebar(
         };
         let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
         let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
-        let row_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
+        let channels = shown[entry_position];
+        let workspace_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
+        let row_height = workspace_height
+            .saturating_add(channels.len().min(u16::MAX as usize) as u16)
+            .min(body.height);
         if y.saturating_add(row_height) > body.bottom() {
             break;
         }
-        let rect = Rect::new(body.x, y, content_width, row_height);
+        let rect = Rect::new(body.x, y, content_width, workspace_height);
         let selected = state.selected_workspace_id.is_some_and(|target| {
             target.matches(state.active_endpoint_id, &workspace.workspace_id)
         });
@@ -341,6 +358,23 @@ pub(crate) fn render_sidebar(
             entry.index,
             state.collapsed_groups,
             palette,
+        );
+        if !workspace.channels.is_empty() {
+            let toggle = render_channel_toggle(buffer, rect, !channels.is_empty(), palette);
+            hits.channel_toggles.push((toggle, entry.index));
+        }
+        render_channel_rows(
+            buffer,
+            Rect::new(
+                body.x,
+                y.saturating_add(workspace_height),
+                content_width,
+                row_height.saturating_sub(workspace_height),
+            ),
+            entry.index,
+            channels,
+            palette,
+            hits,
         );
         hits.workspaces.push(WorkspaceHit {
             rect,
@@ -628,6 +662,79 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
         Style::default().fg(palette.accent),
     );
     Some((toggle, key))
+}
+
+/// Channels that the sidebar shows under `workspace`: all of them when the
+/// workspace is expanded, none otherwise.
+fn shown_channels<'a>(
+    workspace: &'a ClientShellWorkspace,
+    expanded: &HashSet<String>,
+) -> &'a [String] {
+    if expanded.contains(&workspace.workspace_id) {
+        &workspace.channels
+    } else {
+        &[]
+    }
+}
+
+/// Draws the expand toggle of a workspace with channels in the left column of
+/// its first row, which every row leaves blank. The right edge stays free
+/// for the worktree group toggle.
+fn render_channel_toggle(
+    buffer: &mut Buffer,
+    workspace_rect: Rect,
+    expanded: bool,
+    palette: &Palette,
+) -> Rect {
+    let toggle = Rect::new(
+        workspace_rect.x,
+        workspace_rect.y,
+        u16::from(workspace_rect.width > 0),
+        u16::from(workspace_rect.height > 0),
+    );
+    put_text(
+        buffer,
+        toggle.x,
+        toggle.y,
+        toggle.width,
+        if expanded { "▾" } else { "▸" },
+        Style::default().fg(palette.accent),
+    );
+    toggle
+}
+
+/// Draws one `#channel` row per channel below the workspace at
+/// `workspace_index` of the snapshot and records a hit for each one.
+fn render_channel_rows(
+    buffer: &mut Buffer,
+    area: Rect,
+    workspace_index: usize,
+    channels: &[String],
+    palette: &Palette,
+    hits: &mut ShellHitMap,
+) {
+    let style = Style::default().fg(palette.subtext0);
+    let name_x = area.x.saturating_add(4);
+    for (channel_index, channel) in channels.iter().enumerate() {
+        let y = area.y.saturating_add(channel_index as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        put_text(buffer, area.x.saturating_add(3), y, 1, "#", style);
+        put_text(
+            buffer,
+            name_x,
+            y,
+            area.right().saturating_sub(1).saturating_sub(name_x),
+            channel,
+            style,
+        );
+        hits.channels.push(ChannelHit {
+            rect: Rect::new(area.x, y, area.width, 1),
+            workspace_index,
+            channel_index,
+        });
+    }
 }
 
 pub(in crate::client::shell) fn displayed_workspace_status(

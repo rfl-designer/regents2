@@ -665,6 +665,7 @@ impl AppState {
         }
         for pane_id in pane_ids {
             self.plugin_panes.remove(&pane_id);
+            self.channel_views.remove(&pane_id);
         }
     }
 

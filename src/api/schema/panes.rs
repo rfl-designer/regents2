@@ -531,6 +531,10 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
     pub revision: u64,
+    /// The channel that this pane shows as a chat (Regents). Absent for a
+    /// terminal pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<super::channels::PaneChannelInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -372,6 +372,12 @@ impl App {
             agent_session: terminal_agent_session_info(terminal),
             scroll: None,
             revision: terminal.revision,
+            channel: self.state.channel_views.get(&pane_id).map(|view| {
+                crate::api::schema::PaneChannelInfo {
+                    folder_id: view.folder_id.clone(),
+                    channel: view.channel.clone(),
+                }
+            }),
         })
     }
 
@@ -422,6 +428,7 @@ impl App {
             folder: ws.folder.as_ref().map(super::api::folder_info),
             legacy: self.is_legacy_workspace(index),
             disconnected: self.is_disconnected_workspace(index),
+            channels: self.workspace_channel_names(index).to_vec(),
         }
     }
 }

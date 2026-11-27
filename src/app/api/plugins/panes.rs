@@ -143,6 +143,7 @@ impl App {
             self.state.host_terminal_theme,
             host_terminal_appearance,
             params.focus || placement == PluginPanePlacement::Zoomed,
+            crate::pane::AgentDetection::Enabled,
         );
         let (tab_idx, new_pane) = match result {
             Some(Ok(result)) => result,

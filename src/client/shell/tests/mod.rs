@@ -42,6 +42,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
             agent_status: AgentStatus::Idle,
             legacy: false,
             disconnected: false,
+            channels: Vec::new(),
         }],
         tabs: vec![ClientShellTab {
             tab_id: "tab_1".into(),
@@ -203,6 +204,7 @@ fn pane_scroll_result(
                 viewport_rows,
             }),
             revision: 0,
+            channel: None,
         },
     }
 }
@@ -264,5 +266,6 @@ mod link_hover;
 mod mobile;
 mod mouse_selection;
 mod popup_focus_projection;
+mod regents_channels;
 mod regents_workspaces;
 mod startup_overlays;

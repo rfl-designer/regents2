@@ -491,6 +491,7 @@ impl App {
                 self.state.host_terminal_theme,
                 host_terminal_appearance,
                 true,
+                crate::pane::AgentDetection::Enabled,
             );
             let (tab_idx, new_pane) = match result {
                 Some(Ok(result)) => result,

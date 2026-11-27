@@ -323,6 +323,14 @@ pub enum ResponseResult {
         workspace_id: String,
         agents: Vec<super::threads::AgentDefinitionInfo>,
     },
+    /// The chat pane of a channel has focus. `opened` is false when the
+    /// channel was already open in the workspace layout.
+    ChannelOpened {
+        workspace_id: String,
+        channel: String,
+        opened: bool,
+        pane: super::panes::PaneInfo,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

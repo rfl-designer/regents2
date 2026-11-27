@@ -123,6 +123,21 @@ impl App {
                 .record_pane_focus_change(previous_focus, ws_idx, new_pane.pane_id);
             self.state.mode = crate::app::Mode::Terminal;
         }
+        let Some(pane) = self.adopt_split_pane(ws_idx, target_tab_idx, new_pane) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    /// Takes a pane that a split of tab `tab_idx` created: it stores the
+    /// runtime and the terminal, saves the session and announces the pane
+    /// and the new layout. Returns the pane info.
+    pub(crate) fn adopt_split_pane(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+        new_pane: crate::workspace::NewPane,
+    ) -> Option<crate::api::schema::PaneInfo> {
         self.terminal_runtimes
             .insert(new_pane.terminal.id.clone(), new_pane.runtime);
         self.state
@@ -131,14 +146,13 @@ impl App {
             .terminals
             .insert(new_pane.terminal.id.clone(), new_pane.terminal);
         self.schedule_session_save();
-        let pane = self.pane_info(ws_idx, new_pane.pane_id).unwrap();
+        let pane = self.pane_info(ws_idx, new_pane.pane_id)?;
         self.emit_event(EventEnvelope {
             event: EventKind::PaneCreated,
             data: EventData::PaneCreated { pane: pane.clone() },
         });
-        self.emit_layout_updated_event(ws_idx, target_tab_idx);
-
-        encode_success(id, ResponseResult::PaneInfo { pane })
+        self.emit_layout_updated_event(ws_idx, tab_idx);
+        Some(pane)
     }
 
     pub(super) fn handle_pane_list(&mut self, id: String, params: PaneListParams) -> String {

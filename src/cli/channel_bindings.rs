@@ -5,7 +5,9 @@ use std::path::Path;
 
 use clap::Command;
 
-use crate::api::schema::channels::{ChannelPostProjection, ChannelReadProjection};
+use crate::api::schema::channels::{
+    ChannelOpenProjection, ChannelPostProjection, ChannelReadProjection,
+};
 use crate::api::schema::{Method, Request};
 
 use super::projection::{self, Input, Leaf, ParseError};
@@ -51,7 +53,7 @@ pub(crate) fn limit() -> Input<Option<u32>> {
     .help("Show at most N of the most recent messages")
 }
 
-const LEAVES: [Leaf; 2] = [
+const LEAVES: [Leaf; 3] = [
     Leaf {
         name: "post",
         about: "Post a message to a channel",
@@ -66,13 +68,68 @@ const LEAVES: [Leaf; 2] = [
         arguments: ChannelReadProjection::arguments,
         method: |matches| ChannelReadProjection::from_matches(matches).map(Method::ChannelRead),
     },
+    Leaf {
+        name: "open",
+        about: "Open a channel as a chat pane, or focus its chat pane",
+        id: "cli:channel:open",
+        arguments: ChannelOpenProjection::arguments,
+        method: |matches| ChannelOpenProjection::from_matches(matches).map(Method::ChannelOpen),
+    },
 ];
+
+/// `channel view`: the chat view that a chat pane runs. It is a terminal
+/// program, not one API request, so `cli.rs` runs it before the leaves.
+pub(crate) use crate::regents::chat_panes::VIEW_COMMAND;
+
+fn view_command() -> Command {
+    Command::new(VIEW_COMMAND)
+        .about("Show a channel as a chat in this terminal")
+        .arg(
+            clap::Arg::new("channel")
+                .value_name("CHANNEL")
+                .required(true),
+        )
+        .arg(
+            clap::Arg::new("workspace")
+                .long("workspace")
+                .value_name("WORKSPACE_ID")
+                .help("Workspace of the channel: its public ID or its stable ID"),
+        )
+}
+
+/// Runs `channel view <CHANNEL> [--workspace ID]`; `args` follow `view`.
+pub(crate) fn run_view(args: &[String]) -> std::io::Result<i32> {
+    let matches = match view_command()
+        .bin_name(format!(
+            "{} channel {VIEW_COMMAND}",
+            crate::build_info::product_name()
+        ))
+        .no_binary_name(true)
+        .try_get_matches_from(args)
+    {
+        Ok(matches) => matches,
+        Err(error) => return super::print_clap_error(&error),
+    };
+    let (channel, workspace_id) = view_arguments(&matches);
+    crate::regents::chat::run(channel, workspace_id)
+}
+
+fn view_arguments(matches: &clap::ArgMatches) -> (String, Option<String>) {
+    (
+        matches
+            .get_one::<String>("channel")
+            .cloned()
+            .unwrap_or_default(),
+        matches.get_one::<String>("workspace").cloned(),
+    )
+}
 
 pub(crate) fn command() -> Command {
     Command::new("channel")
         .about("Post and read channel messages over the socket API")
         .subcommand_required(true)
         .subcommands(LEAVES.iter().map(Leaf::command))
+        .subcommand(view_command())
 }
 
 pub(crate) fn request(args: &[String]) -> Result<Request, ParseError> {
@@ -102,27 +159,13 @@ fn request_in(args: &[String], cwd: &Path) -> Result<Request, ParseError> {
     let workspace_id = match &mut request.method {
         Method::ChannelPost(params) => &mut params.workspace_id,
         Method::ChannelRead(params) => &mut params.workspace_id,
+        Method::ChannelOpen(params) => &mut params.workspace_id,
         _ => return Ok(request),
     };
     if workspace_id.is_none() {
-        *workspace_id = folder_workspace_id(cwd);
+        *workspace_id = crate::regents::folder::folder_workspace_id(cwd);
     }
     Ok(request)
-}
-
-/// Stable ID of the workspace folder that holds `dir`: the nearest ancestor
-/// with `.regents/workspace.toml`. `None` when there is none or it cannot be
-/// read.
-pub(crate) fn folder_workspace_id(dir: &Path) -> Option<String> {
-    let root = dir.ancestors().find(|ancestor| {
-        ancestor
-            .join(crate::regents::folder::STATE_DIR)
-            .join(crate::regents::folder::MANIFEST_FILE)
-            .is_file()
-    })?;
-    crate::regents::folder::read_manifest(root)
-        .ok()
-        .map(|manifest| manifest.id)
 }
 
 #[cfg(test)]
@@ -272,5 +315,43 @@ mod tests {
         ] {
             assert!(fails(args), "{args:?}");
         }
+    }
+
+    #[test]
+    fn view_takes_a_channel_and_an_optional_workspace() {
+        let parse = |args: &[&str]| {
+            view_command()
+                .no_binary_name(true)
+                .try_get_matches_from(owned(args))
+                .map(|matches| view_arguments(&matches))
+        };
+
+        assert_eq!(parse(&["geral"]).unwrap(), ("geral".into(), None));
+        assert_eq!(
+            parse(&["geral", "--workspace", "abc"]).unwrap(),
+            ("geral".into(), Some("abc".into()))
+        );
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["geral", "--workspace"]).is_err());
+        assert!(parse(&["geral", "outro"]).is_err());
+    }
+
+    #[test]
+    fn view_parses_the_command_line_of_a_chat_pane() {
+        let view = crate::regents::channel::ChannelView {
+            folder_id: "f1".into(),
+            channel: "geral".into(),
+        };
+        let argv = crate::regents::chat_panes::view_argv(&view).unwrap();
+
+        assert_eq!(argv[1..3], ["channel", VIEW_COMMAND]);
+        let matches = view_command()
+            .no_binary_name(true)
+            .try_get_matches_from(&argv[3..])
+            .unwrap();
+        assert_eq!(
+            view_arguments(&matches),
+            ("geral".into(), Some("f1".into()))
+        );
     }
 }

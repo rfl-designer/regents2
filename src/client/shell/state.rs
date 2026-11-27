@@ -85,6 +85,11 @@ pub(super) enum ClientMobileTarget {
 pub(super) struct ShellHitMap {
     pub(super) machines: Vec<MachineHit>,
     pub(super) workspaces: Vec<WorkspaceHit>,
+    /// Regents: the expand toggle of each workspace with channels, with the
+    /// index of the workspace in the snapshot.
+    pub(super) channel_toggles: Vec<(Rect, usize)>,
+    /// Regents: the channel rows of the expanded workspaces.
+    pub(super) channels: Vec<ChannelHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
     pub(super) workspace_scroll_metrics: Option<crate::pane::ScrollMetrics>,
@@ -229,6 +234,15 @@ pub(super) enum ClientChromeDrag {
         last_sent_offset: Option<usize>,
         last_sent_at: Option<std::time::Instant>,
     },
+}
+
+/// A channel row of the sidebar (Regents): indexes into the snapshot that the
+/// hit map was drawn from, so the render path copies no string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ChannelHit {
+    pub(super) rect: Rect,
+    pub(super) workspace_index: usize,
+    pub(super) channel_index: usize,
 }
 
 pub(super) struct WorkspaceHit {
@@ -883,6 +897,8 @@ pub(crate) struct ClientShellState {
     pub(super) tab_press: Option<ClientTabPress>,
     pub(super) collapsed_groups: HashSet<String>,
     pub(super) remote_collapsed_groups: HashMap<ClientEndpointId, HashSet<String>>,
+    /// Regents: workspaces whose channels the sidebar shows as child rows.
+    pub(super) expanded_channel_workspaces: HashSet<String>,
     pub(super) workspace_scroll: usize,
     pub(super) agent_scroll: usize,
     pub(super) pending_agent_reveal: Option<(ClientEndpointId, String)>,
@@ -1057,6 +1073,7 @@ impl ClientShellState {
             tab_press: None,
             collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
             remote_collapsed_groups,
+            expanded_channel_workspaces: HashSet::new(),
             workspace_scroll: 0,
             agent_scroll: 0,
             pending_agent_reveal: None,

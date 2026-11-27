@@ -105,6 +105,10 @@ pub struct WorkspaceInfo {
     /// path. `workspace.relink` binds it to the new path. Absent means false.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub disconnected: bool,
+    /// Channel names of a Regents folder workspace, in name order. Absent
+    /// means none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

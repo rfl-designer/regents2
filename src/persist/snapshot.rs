@@ -114,6 +114,10 @@ pub struct PaneSnapshot {
     pub agent_resume: Option<PaneAgentResumeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Regents: the channel that this pane shows as a chat. A restore runs
+    /// the chat view of the channel again in the same place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_view: Option<crate::regents::channel::ChannelView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +399,8 @@ fn capture_tab(
                 agent_session,
                 agent_resume,
                 launch_argv,
+                // `regents::chat_panes::record_in_snapshot` fills it in.
+                channel_view: None,
             },
         );
     }
@@ -714,6 +720,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                channel_view: None,
             },
         );
         panes.insert(
@@ -726,6 +733,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                channel_view: None,
             },
         );
 
@@ -1469,6 +1477,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                channel_view: None,
             },
         );
         panes.insert(
@@ -1483,6 +1492,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                channel_view: None,
             },
         );
 

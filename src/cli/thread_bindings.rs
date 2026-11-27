@@ -70,7 +70,7 @@ fn with_folder_workspace(mut request: Request, cwd: &Path) -> Result<Request, Pa
         _ => return Ok(request),
     };
     if workspace_id.is_none() {
-        *workspace_id = super::channel_bindings::folder_workspace_id(cwd);
+        *workspace_id = crate::regents::folder::folder_workspace_id(cwd);
     }
     Ok(request)
 }

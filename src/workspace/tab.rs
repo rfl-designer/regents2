@@ -32,6 +32,7 @@ enum SplitCommand<'a> {
     Argv {
         argv: &'a [String],
         launch_env: &'a PaneLaunchEnv,
+        agent_detection: crate::pane::AgentDetection,
     },
 }
 
@@ -287,6 +288,7 @@ impl Tab {
         cwd: Option<PathBuf>,
         argv: &[String],
         launch_env: &PaneLaunchEnv,
+        agent_detection: crate::pane::AgentDetection,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -304,7 +306,11 @@ impl Tab {
             host_terminal_appearance,
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             launch_env,
-            Some(SplitCommand::Argv { argv, launch_env }),
+            Some(SplitCommand::Argv {
+                argv,
+                launch_env,
+                agent_detection,
+            }),
         )
     }
 
@@ -361,14 +367,18 @@ impl Tab {
                 self.render_notify.clone(),
                 self.render_dirty.clone(),
             ),
-            Some(SplitCommand::Argv { argv, launch_env }) => TerminalRuntime::spawn_argv_command(
+            Some(SplitCommand::Argv {
+                argv,
+                launch_env,
+                agent_detection,
+            }) => TerminalRuntime::spawn_argv_command(
                 new_id,
                 rows,
                 cols,
                 actual_cwd.clone(),
                 argv,
                 launch_env,
-                crate::pane::AgentDetection::Enabled,
+                agent_detection,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,

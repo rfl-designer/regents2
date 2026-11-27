@@ -1291,6 +1291,9 @@ impl App {
             Method::AgentDefinitionList(params) => {
                 return self.handle_agent_definition_list(request.id, params);
             }
+            Method::ChannelOpen(params) => {
+                return self.handle_channel_open(request.id, params);
+            }
             _ => {
                 return responses::encode_error(
                     request.id,

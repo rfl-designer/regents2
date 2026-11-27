@@ -145,6 +145,9 @@ pub struct App {
     /// the known path. Refreshed at load, list, relink and guard time and by
     /// the periodic check of the event loop, never during render.
     disconnected_folders: HashSet<String>,
+    /// Regents: channel names of each connected open folder workspace, by
+    /// folder ID. Refreshed with `disconnected_folders`, never during render.
+    folder_channels: HashMap<String, Vec<String>>,
     /// Regents: next periodic check of the open workspace folders; `None`
     /// until the first check.
     next_folder_connection_check: Option<Instant>,
@@ -600,6 +603,7 @@ impl App {
                 &mut plugin_installation_leases,
             ),
             plugin_panes: std::collections::HashMap::new(),
+            channel_views: std::collections::HashMap::new(),
             popup_pane: None,
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
@@ -679,6 +683,7 @@ impl App {
             folder_reopen_exhausted: false,
             reopen_excluded_folders: Vec::new(),
             disconnected_folders: HashSet::new(),
+            folder_channels: HashMap::new(),
             next_folder_connection_check: None,
             running_threads: HashMap::new(),
             expected_thread_exits: HashSet::new(),
@@ -731,6 +736,7 @@ impl App {
         app.configure_window_title(&config.ui.window_title);
         app.refresh_restored_workspace_git_metadata();
         app.refresh_folder_connections();
+        app.register_restored_channel_views();
         Ok(app)
     }
 
@@ -795,6 +801,7 @@ impl App {
         });
         app.refresh_restored_workspace_git_metadata();
         app.refresh_folder_connections();
+        app.register_restored_channel_views();
         Ok(app)
     }
 

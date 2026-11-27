@@ -1,14 +1,16 @@
-//! Channel commands (Regents): `channel.post` and `channel.read`. The store
-//! lives in `crate::regents::channel`; this module resolves the workspace
-//! folder, maps the store to the API and emits `channel.message_posted`.
+//! Channel commands (Regents): `channel.post`, `channel.read` and
+//! `channel.open`. The store lives in `crate::regents::channel`; this module
+//! resolves the workspace folder, maps the store to the API, emits
+//! `channel.message_posted` and opens chat panes (`crate::regents::chat_panes`).
 
 use crate::api::schema::{
-    ChannelAuthorInfo, ChannelAuthorKind, ChannelMessageInfo, ChannelPostParams, ChannelReadParams,
-    ErrorBody, EventData, EventEnvelope, EventKind, ResponseResult,
+    ChannelAuthorInfo, ChannelAuthorKind, ChannelMessageInfo, ChannelOpenParams, ChannelPostParams,
+    ChannelReadParams, ErrorBody, EventData, EventEnvelope, EventKind, ResponseResult,
 };
 use crate::app::App;
+use crate::layout::PaneId;
 use crate::regents::channel::{
-    self, Author, AuthorKind, ChannelError, Message, NewMessage, ReadRange,
+    self, Author, AuthorKind, ChannelError, ChannelView, Message, NewMessage, ReadRange,
 };
 use crate::regents::{agents, mention};
 
@@ -31,6 +33,130 @@ impl App {
             Ok(result) => encode_success(id, result),
             Err(error) => encode_error_body(id, error),
         }
+    }
+
+    pub(super) fn handle_channel_open(&mut self, id: String, params: ChannelOpenParams) -> String {
+        match self.open_channel_view(params) {
+            Ok(result) => encode_success(id, result),
+            Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    /// Gives focus to the chat pane of a channel. When no workspace has a
+    /// chat pane for the channel, it opens one next to the focused pane of
+    /// the channel's workspace.
+    fn open_channel_view(
+        &mut self,
+        params: ChannelOpenParams,
+    ) -> Result<ResponseResult, ErrorBody> {
+        let (index, state_dir) = self.folder_state_dir(params.workspace_id)?;
+        let channel = channel::open(&state_dir, &params.channel)?;
+        let binding = self.state.workspaces[index]
+            .folder
+            .as_ref()
+            .ok_or_else(|| error_body("workspace_legacy", "the workspace has no folder"))?;
+        let view = ChannelView {
+            folder_id: binding.id.clone(),
+            channel: channel.name().to_owned(),
+        };
+        let root = binding.root.clone();
+        let (pane_index, pane_id, opened) = match self.channel_view_pane(&view) {
+            Some((pane_index, pane_id)) => (pane_index, pane_id, false),
+            None => (index, self.spawn_channel_view(index, view, root)?, true),
+        };
+        self.state.focus_pane_in_workspace(pane_index, pane_id);
+        self.state.mark_active_tab_seen();
+        self.state.mode = crate::app::Mode::Terminal;
+        let pane = self
+            .pane_info(pane_index, pane_id)
+            .ok_or_else(|| error_body("channel_open_failed", "the chat pane disappeared"))?;
+        Ok(ResponseResult::ChannelOpened {
+            workspace_id: pane.workspace_id.clone(),
+            channel: channel.name().to_owned(),
+            opened,
+            pane,
+        })
+    }
+
+    /// The chat pane that shows `view` and the index of its workspace. A
+    /// moved chat pane can be in any workspace.
+    fn channel_view_pane(&self, view: &ChannelView) -> Option<(usize, PaneId)> {
+        let pane_id = self
+            .state
+            .channel_views
+            .iter()
+            .find_map(|(pane_id, shown)| (shown == view).then_some(*pane_id))?;
+        let index = self
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.find_tab_index_for_pane(pane_id).is_some())?;
+        Some((index, pane_id))
+    }
+
+    /// Opens a chat pane for `view` to the right of the focused pane of
+    /// workspace `index`. The chat view is not an agent, so the pane has no
+    /// agent detection.
+    fn spawn_channel_view(
+        &mut self,
+        index: usize,
+        view: ChannelView,
+        root: std::path::PathBuf,
+    ) -> Result<PaneId, ErrorBody> {
+        let open_failed = |err: std::io::Error| error_body("channel_open_failed", err.to_string());
+        let argv = crate::regents::chat_panes::view_argv(&view).map_err(open_failed)?;
+        let target = self
+            .state
+            .workspaces
+            .get(index)
+            .and_then(|workspace| workspace.focused_pane_id())
+            .ok_or_else(|| error_body("pane_not_found", "the workspace has no pane"))?;
+        let direction = ratatui::layout::Direction::Horizontal;
+        let (rows, cols) = self
+            .state
+            .new_pane_size(crate::ui::NewPanePlacement::Split {
+                ws_idx: index,
+                target,
+                direction,
+                ratio: 0.5,
+            });
+        let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
+        let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.pane_host_terminal_appearance();
+        let workspace = &mut self.state.workspaces[index];
+        let (tab_index, mut new_pane) = workspace
+            .split_pane_argv_command(
+                target,
+                direction,
+                rows,
+                cols,
+                Some(root),
+                &argv,
+                Vec::new(),
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+                true,
+                crate::pane::AgentDetection::Disabled,
+            )
+            .ok_or_else(|| error_body("pane_not_found", "the focused pane disappeared"))?
+            .map_err(open_failed)?;
+        new_pane
+            .terminal
+            .set_manual_label(format!("#{}", view.channel));
+        let pane_id = new_pane.pane_id;
+        self.state.channel_views.insert(pane_id, view);
+        self.adopt_split_pane(index, tab_index, new_pane);
+        Ok(pane_id)
+    }
+
+    /// Registers the chat panes of a restored session: the panes whose
+    /// command line is a chat view command.
+    pub(crate) fn register_restored_channel_views(&mut self) {
+        self.state.channel_views = crate::regents::chat_panes::restored_views(
+            &self.state.workspaces,
+            &self.state.terminals,
+        );
     }
 
     fn post_channel_message(
@@ -126,6 +252,38 @@ impl App {
         let (index, binding) = self.folder_workspace(&workspace_id)?;
         let state_dir = binding.root.join(crate::regents::folder::STATE_DIR);
         Ok((index, state_dir))
+    }
+
+    /// Lists the channels of each connected open folder workspace again. It
+    /// reads one directory per folder workspace: call it with the folder
+    /// checks (load, list, bind and the periodic check), never from render.
+    pub(crate) fn refresh_folder_channels(&mut self) {
+        let channels: std::collections::HashMap<String, Vec<String>> = self
+            .state
+            .workspaces
+            .iter()
+            .filter_map(|workspace| workspace.folder.as_ref())
+            .filter(|binding| !self.disconnected_folders.contains(&binding.id))
+            .map(|binding| {
+                let state_dir = binding.root.join(crate::regents::folder::STATE_DIR);
+                (binding.id.clone(), channel::list(&state_dir))
+            })
+            .collect();
+        if channels != self.folder_channels {
+            self.folder_channels = channels;
+            self.render_dirty.request_generic();
+        }
+    }
+
+    /// Channel names of the workspace at `index`, as of the last refresh. It
+    /// reads no file, so snapshot and render code can call it.
+    pub(crate) fn workspace_channel_names(&self, index: usize) -> &[String] {
+        self.state
+            .workspaces
+            .get(index)
+            .and_then(|workspace| workspace.folder.as_ref())
+            .and_then(|binding| self.folder_channels.get(&binding.id))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Public ID of the open workspace whose folder has the stable ID `id`.
@@ -398,5 +556,202 @@ mod tests {
         let response = fixture.request("channel.post", json!({"channel": "geral", "body": "oi"}));
 
         assert_eq!(response["error"]["code"], "unsupported", "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_workspace_shows_its_channels() {
+        let mut fixture = Fixture::new("channels");
+        let (folder, workspace_id) = fixture.workspace("projeto");
+        let channels = |fixture: &mut Fixture| {
+            fixture.request("workspace.get", json!({"workspace_id": workspace_id}))["result"]
+                ["workspace"]["channels"]
+                .clone()
+        };
+
+        assert_eq!(channels(&mut fixture), json!(["geral"]));
+
+        std::fs::create_dir_all(folder.join(".regents/channels/design")).unwrap();
+        fixture.app.refresh_folder_connections();
+
+        assert_eq!(channels(&mut fixture), json!(["design", "geral"]));
+    }
+
+    #[tokio::test]
+    async fn a_herdr_workspace_shows_no_channels_field() {
+        let mut fixture = Fixture::new("herdr-channels");
+        fixture.app.workspace_registry_path = None;
+        let created = fixture.request("workspace.create", json!({}));
+        let workspace = &created["result"]["workspace"];
+
+        assert!(workspace.get("channels").is_none(), "{created}");
+    }
+
+    fn pane_count(fixture: &mut Fixture, workspace_id: &str) -> u64 {
+        fixture.request("workspace.get", json!({"workspace_id": workspace_id}))["result"]
+            ["workspace"]["pane_count"]
+            .as_u64()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn opening_a_channel_adds_a_chat_pane_and_a_second_open_only_focuses_it() {
+        let mut fixture = Fixture::new("open");
+        let (folder, workspace_id) = fixture.workspace("projeto");
+        let folder_id = crate::regents::folder::read_manifest(&folder).unwrap().id;
+
+        let first = fixture.request(
+            "channel.open",
+            json!({"workspace_id": workspace_id, "channel": "geral"}),
+        );
+
+        let result = &first["result"];
+        assert_eq!(result["type"], "channel_opened", "{first}");
+        assert_eq!(result["opened"], true);
+        assert_eq!(result["channel"], "geral");
+        assert_eq!(result["pane"]["focused"], true);
+        assert_eq!(
+            result["pane"]["channel"],
+            json!({"folder_id": folder_id, "channel": "geral"})
+        );
+        let chat_pane = result["pane"]["pane_id"].as_str().unwrap().to_owned();
+        assert_eq!(pane_count(&mut fixture, &workspace_id), 2);
+
+        let other_pane = fixture.request("pane.list", json!({"workspace_id": workspace_id}))
+            ["result"]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pane| pane["pane_id"].as_str().unwrap().to_owned())
+            .find(|pane_id| *pane_id != chat_pane)
+            .unwrap();
+        fixture.request("pane.focus", json!({"pane_id": other_pane}));
+
+        let second = fixture.request("channel.open", json!({"channel": "geral"}));
+
+        assert_eq!(second["result"]["opened"], false, "{second}");
+        assert_eq!(second["result"]["pane"]["pane_id"], json!(chat_pane));
+        assert_eq!(second["result"]["pane"]["focused"], true);
+        assert_eq!(pane_count(&mut fixture, &workspace_id), 2);
+        fixture.app.state.assert_invariants_for_test();
+    }
+
+    #[tokio::test]
+    async fn opening_a_missing_channel_adds_no_pane() {
+        let mut fixture = Fixture::new("open-missing");
+        let (_, workspace_id) = fixture.workspace("projeto");
+
+        let response = fixture.request(
+            "channel.open",
+            json!({"workspace_id": workspace_id, "channel": "outro"}),
+        );
+
+        assert_eq!(response["error"]["code"], "channel_not_found", "{response}");
+        assert_eq!(pane_count(&mut fixture, &workspace_id), 1);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_pane_has_no_channel_field() {
+        let mut fixture = Fixture::new("plain-pane");
+        let (_, workspace_id) = fixture.workspace("projeto");
+
+        let panes = fixture.request("pane.list", json!({"workspace_id": workspace_id}));
+
+        assert!(
+            panes["result"]["panes"][0].get("channel").is_none(),
+            "{panes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_pane_moved_to_another_workspace_is_focused_not_duplicated() {
+        let mut fixture = Fixture::new("open-moved");
+        let (_, projeto) = fixture.workspace("projeto");
+        let (_, outro) = fixture.workspace("outro");
+        let opened = fixture.request(
+            "channel.open",
+            json!({"workspace_id": projeto, "channel": "geral"}),
+        );
+        let chat_pane = opened["result"]["pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let moved = fixture.request(
+            "pane.move",
+            json!({
+                "pane_id": chat_pane,
+                "destination": {"type": "new_tab", "workspace_id": outro},
+            }),
+        );
+        assert!(moved.get("error").is_none(), "{moved}");
+        let moved_pane = moved["result"]["move_result"]["pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let again = fixture.request(
+            "channel.open",
+            json!({"workspace_id": projeto, "channel": "geral"}),
+        );
+
+        assert_eq!(again["result"]["opened"], false, "{again}");
+        assert_eq!(again["result"]["pane"]["pane_id"], json!(moved_pane));
+        assert_eq!(again["result"]["workspace_id"], json!(outro));
+        assert_eq!(pane_count(&mut fixture, &projeto), 1);
+        fixture.app.state.assert_invariants_for_test();
+    }
+
+    #[tokio::test]
+    async fn the_session_saves_the_channel_of_a_chat_pane() {
+        let mut fixture = Fixture::new("save");
+        let (folder, workspace_id) = fixture.workspace("projeto");
+        let folder_id = crate::regents::folder::read_manifest(&folder).unwrap().id;
+        fixture.request(
+            "channel.open",
+            json!({"workspace_id": workspace_id, "channel": "geral"}),
+        );
+        let mut snapshot = crate::persist::capture(
+            &fixture.app.state.workspaces,
+            &fixture.app.state.terminals,
+            &fixture.app.terminal_runtimes,
+            fixture.app.state.active,
+            fixture.app.state.selected,
+        );
+
+        crate::regents::chat_panes::record_in_snapshot(
+            &mut snapshot,
+            &fixture.app.state.workspaces,
+            &fixture.app.state.channel_views,
+        );
+
+        let saved: Vec<_> = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .filter_map(|pane| pane.channel_view.clone())
+            .collect();
+        assert_eq!(
+            saved,
+            [ChannelView {
+                folder_id,
+                channel: "geral".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_chat_pane_drops_its_channel_record() {
+        let mut fixture = Fixture::new("close-chat");
+        let (_, workspace_id) = fixture.workspace("projeto");
+        let opened = fixture.request(
+            "channel.open",
+            json!({"workspace_id": workspace_id, "channel": "geral"}),
+        );
+        let chat_pane = opened["result"]["pane"]["pane_id"].clone();
+
+        let closed = fixture.request("pane.close", json!({"pane_id": chat_pane}));
+
+        assert!(closed.get("error").is_none(), "{closed}");
+        assert!(fixture.app.state.channel_views.is_empty());
+        let reopened = fixture.request("channel.open", json!({"channel": "geral"}));
+        assert_eq!(reopened["result"]["opened"], true, "{reopened}");
     }
 }

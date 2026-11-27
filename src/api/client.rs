@@ -74,6 +74,19 @@ impl ApiClient {
         read_json_line(&mut reader)
     }
 
+    /// Sends an `events.subscribe` request and returns the open stream: one
+    /// JSON line per event after the `subscription_started` response.
+    pub(crate) fn subscribe(
+        &self,
+        request: &Request,
+    ) -> Result<BufReader<LocalStream>, ApiClientError> {
+        let mut stream = self.connect()?;
+        write_request(&mut stream, request)?;
+        let mut reader = BufReader::new(stream);
+        parse_response_value(read_json_line(&mut reader)?)?;
+        Ok(reader)
+    }
+
     pub fn status(&self) -> Result<crate::api::RuntimeStatus, ApiClientError> {
         self.read_status(None)
     }

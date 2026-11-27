@@ -540,6 +540,7 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        let saved_channel_view = saved_pane.and_then(|p| p.channel_view.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
@@ -633,7 +634,34 @@ fn restore_tab(
             continue;
         }
 
-        let runtime_result = {
+        // A chat pane runs the chat view of its channel again, not a shell.
+        let channel_view_argv = saved_channel_view
+            .as_ref()
+            .filter(|_| imported_runtime.is_none())
+            .map(crate::regents::chat_panes::view_argv);
+        let restored_channel_view_argv = channel_view_argv
+            .as_ref()
+            .and_then(|argv| argv.as_ref().ok())
+            .cloned();
+        let runtime_result = if let Some(argv) = channel_view_argv {
+            argv.and_then(|argv| {
+                TerminalRuntime::spawn_argv_command(
+                    *id,
+                    rows,
+                    cols,
+                    cwd.clone(),
+                    &argv,
+                    &launch_env,
+                    crate::pane::AgentDetection::Disabled,
+                    runtime_context.scrollback_limit_bytes,
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    runtime_context.events.clone(),
+                    runtime_context.render_notify.clone(),
+                    runtime_context.render_dirty.clone(),
+                )
+            })
+        } else {
             #[cfg(unix)]
             if let Some(imported) = imported_runtime {
                 TerminalRuntime::from_handoff_fd(
@@ -692,8 +720,14 @@ fn restore_tab(
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
-                        terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
+                        terminal = terminal.with_launch_argv(argv);
+                        // A chat pane closes with its chat view.
+                        if saved_channel_view.is_none() {
+                            terminal = terminal.with_respawn_shell_on_exit();
+                        }
                     }
+                } else if let Some(argv) = restored_channel_view_argv {
+                    terminal = terminal.with_launch_argv(argv);
                 }
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
@@ -1525,6 +1559,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_chat_pane_restores_its_channel_view_in_the_same_layout_place() {
+        let cwd = std::env::current_dir().unwrap();
+        let pane = |channel_view| super::super::snapshot::PaneSnapshot {
+            cwd: cwd.clone(),
+            label: None,
+            agent_name: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            agent_resume: None,
+            launch_argv: None,
+            channel_view,
+        };
+        let view = crate::regents::channel::ChannelView {
+            folder_id: "f1".into(),
+            channel: "geral".into(),
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                folder: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Split {
+                        direction: super::super::snapshot::DirectionSnapshot::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutSnapshot::Pane(0)),
+                        second: Box::new(LayoutSnapshot::Pane(1)),
+                    },
+                    panes: HashMap::from([(0, pane(None)), (1, pane(Some(view.clone())))]),
+                    zoomed: false,
+                    focused: Some(1),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let tab = &workspaces[0].tabs[0];
+        let order = tab.layout.pane_ids();
+        assert_eq!(order.len(), 2);
+        let terminal = |pane_id| &terminals[tab.terminal_id(pane_id).unwrap()];
+        let views = crate::regents::chat_panes::restored_views(&workspaces, &terminals);
+        assert_eq!(views, HashMap::from([(order[1], view.clone())]));
+        assert_eq!(tab.layout.focused(), order[1]);
+        assert_eq!(
+            terminal(order[1]).launch_argv,
+            Some(crate::regents::chat_panes::view_argv(&view).unwrap())
+        );
+        assert!(!terminal(order[1]).respawn_shell_on_exit);
+        assert!(runtimes.contains_key(tab.terminal_id(order[1]).unwrap()));
+        assert_eq!(terminal(order[0]).launch_argv, None);
+    }
+
+    #[test]
+    fn a_pane_without_a_channel_view_saves_no_channel_field() {
+        let pane = super::super::snapshot::PaneSnapshot {
+            cwd: "/tmp".into(),
+            label: None,
+            agent_name: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            agent_resume: None,
+            launch_argv: None,
+            channel_view: None,
+        };
+
+        let json = serde_json::to_value(&pane).unwrap();
+
+        assert_eq!(json, serde_json::json!({"cwd": "/tmp"}));
+        let old: super::super::snapshot::PaneSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(old.channel_view, None);
+    }
+
+    #[tokio::test]
     async fn restore_carries_persisted_agent_session_metadata() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -1557,6 +1693,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            channel_view: None,
                         },
                     )]),
                     zoomed: false,
@@ -1640,6 +1777,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                channel_view: None,
                             },
                         ),
                         (
@@ -1652,6 +1790,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                channel_view: None,
                             },
                         ),
                     ]),
@@ -1706,6 +1845,7 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    channel_view: None,
                 },
             )
         };
@@ -1722,6 +1862,7 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            channel_view: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1877,6 +2018,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            channel_view: None,
                         },
                     )]),
                     zoomed: false,
@@ -2304,6 +2446,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                channel_view: None,
             },
         );
         let mut history = SessionHistorySnapshot {

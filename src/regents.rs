@@ -10,6 +10,8 @@
 pub(crate) mod adapter;
 pub(crate) mod agents;
 pub(crate) mod channel;
+pub(crate) mod chat;
+pub(crate) mod chat_panes;
 pub(crate) mod folder;
 pub(crate) mod mention;
 pub(crate) mod registry;

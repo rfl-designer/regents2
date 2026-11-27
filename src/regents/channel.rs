@@ -26,6 +26,16 @@ const SCHEMA: store::Schema = store::Schema {
          );",
 };
 
+/// The channel that a chat pane shows: the pane runs the chat view of this
+/// channel (`regents::chat_panes`), and a restart restores it in the same
+/// place of the layout.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ChannelView {
+    /// Stable ID of the workspace folder, from `workspace.toml`.
+    pub(crate) folder_id: String,
+    pub(crate) channel: String,
+}
+
 /// Who wrote a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthorKind {
@@ -174,6 +184,23 @@ pub(crate) fn open(state_dir: &Path, name: &str) -> Result<Channel, ChannelError
         name: name.to_owned(),
         dir,
     })
+}
+
+/// Names of the channels of the workspace whose state directory is
+/// `state_dir`, in name order: the subfolders of `channels/` whose name is a
+/// slug. It reads one directory; keep it out of render and layout paths.
+pub(crate) fn list(state_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(state_dir.join(CHANNELS_DIR)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| is_slug(name))
+        .collect();
+    names.sort();
+    names
 }
 
 /// A channel name: lowercase ASCII letters and digits in groups separated by
@@ -614,5 +641,24 @@ mod tests {
             assert_eq!(err.code(), "invalid_channel_name", "{name:?}");
         }
         assert!(is_slug("code-review2"));
+    }
+
+    #[test]
+    fn list_names_the_channel_folders_in_order() {
+        let folder = Folder::new("list");
+        for name in ["design", "Not-A-Slug", "ops"] {
+            std::fs::create_dir_all(folder.state.join("channels").join(name)).unwrap();
+        }
+        std::fs::write(folder.state.join("channels").join("notes"), "a file").unwrap();
+
+        assert_eq!(list(&folder.state), ["design", "geral", "ops"]);
+    }
+
+    #[test]
+    fn a_state_dir_without_channels_lists_none() {
+        let folder = Folder::new("none");
+        std::fs::remove_dir_all(folder.state.join("channels")).unwrap();
+
+        assert_eq!(list(&folder.state), Vec::<String>::new());
     }
 }

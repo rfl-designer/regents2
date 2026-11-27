@@ -195,6 +195,7 @@ impl App {
             self.disconnected_folders = disconnected;
             self.render_dirty.request_generic();
         }
+        self.refresh_folder_channels();
     }
 
     /// Error response for a request that would open a workspace without a
@@ -532,6 +533,7 @@ impl App {
         // A workspace is open again: a later close starts a new exclusion.
         self.reopen_excluded_folders.clear();
         self.schedule_session_save();
+        self.refresh_folder_channels();
     }
 
     fn workspace_index_for_folder(&self, folder_id: &str) -> Option<usize> {
