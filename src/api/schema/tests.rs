@@ -1471,3 +1471,75 @@ fn read_choices_cover_every_api_value() {
     crate::cli::projection::assert_choices_cover_api_enum(READ_SOURCES);
     crate::cli::projection::assert_choices_cover_api_enum(READ_FORMATS);
 }
+
+#[test]
+fn channel_message_wire_shape_keeps_optional_fields_out_and_tolerates_newer_servers() {
+    let message = ChannelMessageInfo {
+        id: 1,
+        channel: "geral".into(),
+        author: ChannelAuthorInfo {
+            kind: ChannelAuthorKind::Human,
+            id: "rafael".into(),
+        },
+        body: "oi".into(),
+        reply_to: None,
+        origin_thread_id: None,
+        mentions: Vec::new(),
+        created_at: "2026-11-27T18:04:05Z".into(),
+    };
+    let event = EventEnvelope {
+        event: EventKind::ChannelMessagePosted,
+        data: EventData::ChannelMessagePosted {
+            workspace_id: "w1".into(),
+            message,
+        },
+    };
+
+    assert_eq!(
+        serde_json::to_value(&event).unwrap(),
+        serde_json::json!({
+            "event": "channel_message_posted",
+            "data": {
+                "type": "channel_message_posted",
+                "workspace_id": "w1",
+                "message": {
+                    "id": 1, "channel": "geral",
+                    "author": {"kind": "human", "id": "rafael"},
+                    "body": "oi", "created_at": "2026-11-27T18:04:05Z"
+                }
+            }
+        })
+    );
+    let restored: EventEnvelope =
+        serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+    assert_eq!(restored, event);
+    assert_eq!(
+        EventKind::ChannelMessagePosted.dot_name(),
+        "channel.message_posted"
+    );
+
+    let from_newer_server: ChannelMessageInfo = serde_json::from_value(serde_json::json!({
+        "id": 2, "channel": "geral",
+        "author": {"kind": "moderator", "id": "x"},
+        "body": "oi", "created_at": "2026-11-27T18:04:05Z",
+        "reply_to": 1, "origin_thread_id": "t1", "mentions": ["chief-of-staff"],
+        "thread_state": "working"
+    }))
+    .unwrap();
+    assert_eq!(from_newer_server.author.kind, ChannelAuthorKind::Unknown);
+    assert_eq!(from_newer_server.reply_to, Some(1));
+    assert_eq!(from_newer_server.origin_thread_id.as_deref(), Some("t1"));
+    assert_eq!(from_newer_server.mentions, ["chief-of-staff"]);
+
+    let subscribe: Request = serde_json::from_value(serde_json::json!({
+        "id": "s", "method": "events.subscribe",
+        "params": {"subscriptions": [{"type": "channel.message_posted"}]}
+    }))
+    .unwrap();
+    assert_eq!(
+        subscribe.method,
+        Method::EventsSubscribe(EventsSubscribeParams {
+            subscriptions: vec![Subscription::ChannelMessagePosted {}],
+        })
+    );
+}

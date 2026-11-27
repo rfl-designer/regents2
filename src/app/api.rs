@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 mod agent_view;
 mod agents;
+mod channels;
 mod env;
 mod integrations;
 mod layouts;
@@ -1275,6 +1276,12 @@ impl App {
             }
             Method::WorkspaceRemove(params) => {
                 return self.handle_workspace_remove(request.id, params);
+            }
+            Method::ChannelPost(params) => {
+                return self.handle_channel_post(request.id, params);
+            }
+            Method::ChannelRead(params) => {
+                return self.handle_channel_read(request.id, params);
             }
             _ => {
                 return responses::encode_error(

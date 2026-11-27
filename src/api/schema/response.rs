@@ -306,6 +306,15 @@ pub enum ResponseResult {
     WorkspaceRemoved {
         workspace: super::workspaces::RegisteredWorkspaceInfo,
     },
+    ChannelMessagePosted {
+        workspace_id: String,
+        message: super::channels::ChannelMessageInfo,
+    },
+    ChannelMessages {
+        workspace_id: String,
+        channel: String,
+        messages: Vec<super::channels::ChannelMessageInfo>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

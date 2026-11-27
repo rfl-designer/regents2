@@ -50,6 +50,8 @@ portable-pty = "=0.9.0"
 png = "0.17"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
+# Regents channel and thread stores; `bundled` builds SQLite into the binary (ADR-0003).
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"

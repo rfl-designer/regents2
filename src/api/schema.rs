@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod agents;
+pub mod channels;
 pub mod commands;
 pub mod common;
 pub mod events;
@@ -16,6 +17,7 @@ pub mod workspaces;
 pub mod worktrees;
 
 pub use agents::*;
+pub use channels::*;
 pub use commands::*;
 pub use common::*;
 pub use events::*;
@@ -150,6 +152,8 @@ operations::define_operations! {
     WorkspaceLink(WorkspaceLinkParams) => "workspace.link", true, false;
     WorkspaceRelink(WorkspaceRelinkParams) => "workspace.relink", true, false;
     WorkspaceRemove(WorkspaceRemoveParams) => "workspace.remove", false, false;
+    ChannelPost(ChannelPostParams) => "channel.post", false, false;
+    ChannelRead(ChannelReadParams) => "channel.read", false, false;
 }
 
 #[cfg(test)]

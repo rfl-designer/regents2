@@ -147,7 +147,7 @@ fn push_synopses(path: &str, command: &Command, lines: &mut Vec<String>) {
 
 /// The command list a bare group prints, derived from the group's declarations.
 pub(crate) fn group_commands(group: &Command) -> String {
-    let path = format!("herdr {}", group.get_name());
+    let path = format!("{} {}", crate::build_info::product_name(), group.get_name());
     let mut lines = vec![format!("{path} commands:")];
     let mut synopses = Vec::new();
     push_synopses(&path, group, &mut synopses);
@@ -163,7 +163,10 @@ pub(crate) fn group_request(
 ) -> Result<Request, ParseError> {
     let group_name = group.get_name().to_owned();
     parse(
-        group.bin_name(format!("herdr {group_name}")),
+        group.bin_name(format!(
+            "{} {group_name}",
+            crate::build_info::product_name()
+        )),
         args,
         |matches| {
             let (name, matches) = matches

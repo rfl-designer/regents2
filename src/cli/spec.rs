@@ -6,7 +6,7 @@ mod completion;
 mod machine;
 
 pub(super) fn command() -> Command {
-    let command = Command::new("herdr")
+    let command = Command::new(crate::build_info::product_name())
         .about("terminal workspace manager for AI coding agents")
         .disable_help_flag(true)
         .disable_version_flag(true)
@@ -71,6 +71,12 @@ pub(super) fn print_requested_help(args: &[String]) -> std::io::Result<bool> {
     write_requested_help(args, &mut stdout, crate::platform::begin_cli_output)
 }
 
+#[cfg(test)]
+pub(super) fn write_requested_help_for_test(args: &[&str], output: &mut Vec<u8>) -> bool {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    write_requested_help(&args, output, || {}).unwrap()
+}
+
 fn write_requested_help(
     args: &[String],
     output: &mut impl Write,
@@ -92,7 +98,7 @@ fn write_requested_help(
     let mut root = command();
     root.build();
     let mut selected = &mut root;
-    let mut path = vec!["herdr".to_string()];
+    let mut path = vec![crate::build_info::product_name().to_string()];
     for segment in &args[1..help_index] {
         if selected.find_subcommand(segment).is_none() {
             break;
@@ -143,6 +149,9 @@ fn config_command() -> Command {
 }
 
 fn channel_command() -> Command {
+    if crate::build_info::is_regents() {
+        return super::channel_bindings::command();
+    }
     Command::new("channel")
         .about("Manage stable and preview update channels")
         .subcommand(Command::new("show").about("Print the configured update channel"))

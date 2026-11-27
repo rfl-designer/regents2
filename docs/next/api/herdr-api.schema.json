@@ -79,6 +79,94 @@
           ],
           "type": "string"
         },
+        "ChannelAuthorInfo": {
+          "properties": {
+            "id": {
+              "description": "The user name for a human, the agent name for an agent.",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/event/$defs/ChannelAuthorKind"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ],
+          "type": "object"
+        },
+        "ChannelAuthorKind": {
+          "description": "Who wrote a message.",
+          "oneOf": [
+            {
+              "enum": [
+                "human",
+                "agent",
+                "system"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A kind that this client does not know.",
+              "type": "string"
+            }
+          ]
+        },
+        "ChannelMessageInfo": {
+          "properties": {
+            "author": {
+              "$ref": "#/schemas/event/$defs/ChannelAuthorInfo"
+            },
+            "body": {
+              "type": "string"
+            },
+            "channel": {
+              "type": "string"
+            },
+            "created_at": {
+              "description": "RFC 3339 time in UTC, in whole seconds.",
+              "type": "string"
+            },
+            "id": {
+              "description": "Increases with each message of the channel.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mentions": {
+              "description": "Names of the agents that the message mentions. Absent means none.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "origin_thread_id": {
+              "description": "Thread that produced the message (agent messages).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reply_to": {
+              "description": "Message of the same channel that this message replies to.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "channel",
+            "author",
+            "body",
+            "created_at"
+          ],
+          "type": "object"
+        },
         "EventData": {
           "oneOf": [
             {
@@ -723,6 +811,26 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "message": {
+                  "$ref": "#/schemas/event/$defs/ChannelMessageInfo"
+                },
+                "type": {
+                  "const": "channel_message_posted",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "message"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -753,7 +861,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "channel_message_posted"
           ],
           "type": "string"
         },
@@ -1727,6 +1836,75 @@
           },
           "required": [
             "target"
+          ],
+          "type": "object"
+        },
+        "ChannelPostParams": {
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "channel": {
+              "description": "Channel name (slug), for example `geral`.",
+              "type": "string"
+            },
+            "reply_to": {
+              "description": "Message of the same channel that this message replies to.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "description": "Workspace of the channel: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "channel",
+            "body"
+          ],
+          "type": "object"
+        },
+        "ChannelReadParams": {
+          "properties": {
+            "before": {
+              "description": "Only messages older than this message ID.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "channel": {
+              "description": "Channel name (slug), for example `geral`.",
+              "type": "string"
+            },
+            "limit": {
+              "description": "At most this many messages, the most recent ones. Absent means all.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "description": "Workspace of the channel: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "channel"
           ],
           "type": "object"
         },
@@ -4302,6 +4480,18 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "channel.message_posted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -6489,6 +6679,38 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "channel.post",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ChannelPostParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "channel.read",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ChannelReadParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -6952,6 +7174,94 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "ChannelAuthorInfo": {
+          "properties": {
+            "id": {
+              "description": "The user name for a human, the agent name for an agent.",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/ChannelAuthorKind"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ],
+          "type": "object"
+        },
+        "ChannelAuthorKind": {
+          "description": "Who wrote a message.",
+          "oneOf": [
+            {
+              "enum": [
+                "human",
+                "agent",
+                "system"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A kind that this client does not know.",
+              "type": "string"
+            }
+          ]
+        },
+        "ChannelMessageInfo": {
+          "properties": {
+            "author": {
+              "$ref": "#/schemas/success_response/$defs/ChannelAuthorInfo"
+            },
+            "body": {
+              "type": "string"
+            },
+            "channel": {
+              "type": "string"
+            },
+            "created_at": {
+              "description": "RFC 3339 time in UTC, in whole seconds.",
+              "type": "string"
+            },
+            "id": {
+              "description": "Increases with each message of the channel.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mentions": {
+              "description": "Names of the agents that the message mentions. Absent means none.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "origin_thread_id": {
+              "description": "Thread that produced the message (agent messages).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reply_to": {
+              "description": "Message of the same channel that this message replies to.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "channel",
+            "author",
+            "body",
+            "created_at"
+          ],
+          "type": "object"
         },
         "ClientWindowTitleReason": {
           "enum": [
@@ -7613,6 +7923,26 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "message": {
+                  "$ref": "#/schemas/success_response/$defs/ChannelMessageInfo"
+                },
+                "type": {
+                  "const": "channel_message_posted",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "message"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -7658,7 +7988,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "channel_message_posted"
           ],
           "type": "string"
         },
@@ -10754,6 +11085,53 @@
               "required": [
                 "type",
                 "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "message": {
+                  "$ref": "#/schemas/success_response/$defs/ChannelMessageInfo"
+                },
+                "type": {
+                  "const": "channel_message_posted",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "messages": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/ChannelMessageInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "channel_messages",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "channel",
+                "messages"
               ],
               "type": "object"
             }

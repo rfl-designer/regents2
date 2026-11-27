@@ -21,6 +21,7 @@ macro_rules! println {
 
 pub(crate) mod agent;
 mod api;
+pub(crate) mod channel_bindings;
 mod completion;
 mod integration;
 mod machine;
@@ -122,6 +123,9 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "status" => status::run_status_command(&args[2..])?,
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
+        "channel" if crate::build_info::is_regents() => {
+            run_json_request(channel_bindings::request(&args[2..]))?
+        }
         "channel" => run_channel_command(&args[2..])?,
         "machine" => machine::run_machine_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
@@ -150,6 +154,7 @@ fn api_group(name: &str) -> Option<clap::Command> {
         "agent" => agent::command(),
         "pane" => pane::command(),
         "plugin" => plugin::command(),
+        "channel" if crate::build_info::is_regents() => channel_bindings::command(),
         _ => return None,
     })
 }

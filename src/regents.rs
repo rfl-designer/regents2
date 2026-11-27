@@ -7,6 +7,7 @@
 //! module removes that binding at startup, so herdr and Regents never see each
 //! other's servers.
 
+pub(crate) mod channel;
 pub(crate) mod folder;
 pub(crate) mod registry;
 

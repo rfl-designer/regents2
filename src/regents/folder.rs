@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Directory inside the workspace folder that holds the workspace state.
 pub(crate) const STATE_DIR: &str = ".regents";
-const MANIFEST_FILE: &str = "workspace.toml";
+pub(crate) const MANIFEST_FILE: &str = "workspace.toml";
 const DEFAULT_MAX_ACTIVE_THREADS: u32 = 3;
 
 /// Contents of `.regents/workspace.toml`.

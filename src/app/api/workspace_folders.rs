@@ -27,9 +27,6 @@ const FOLDER_CONNECTION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Why a command that needs a workspace folder cannot run on a workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// `Legacy` and `Disconnected` are built only by `App::folder_workspace`; see
-// the note there.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum FolderWorkspaceError {
     NotFound(String),
     /// The workspace has no folder (Regents legacy workspace).
@@ -91,9 +88,6 @@ impl App {
     /// clear error. It checks the folder on disk and updates the disconnected
     /// mark, so the guard and the sidebar agree: call it only from explicit
     /// commands, never from render.
-    // The channel, agent and wiki commands (tickets #6 onward) are the callers;
-    // until they exist only the tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn folder_workspace(
         &mut self,
         workspace_id: &str,

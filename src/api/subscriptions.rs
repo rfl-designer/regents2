@@ -159,6 +159,9 @@ impl ActiveSubscription {
                 Ok(event_subscription(EventKind::PaneAgentDetected))
             }
             Subscription::LayoutUpdated {} => Ok(event_subscription(EventKind::LayoutUpdated)),
+            Subscription::ChannelMessagePosted {} => {
+                Ok(event_subscription(EventKind::ChannelMessagePosted))
+            }
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,
