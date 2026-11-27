@@ -4,7 +4,7 @@ use clap::{Arg, ArgMatches, Command};
 
 use crate::api::schema::workspaces::{
     WorkspaceAddProjection, WorkspaceCloseProjection, WorkspaceCreateProjection,
-    WorkspaceMetadataProjection, WorkspaceRenameProjection,
+    WorkspaceLinkProjection, WorkspaceMetadataProjection, WorkspaceRenameProjection,
 };
 use crate::api::schema::{EmptyParams, Method, Request, WorkspaceTarget};
 
@@ -22,7 +22,12 @@ pub(crate) fn workspace_id() -> Input<String> {
 /// Folder path argument. A local relative path becomes absolute here,
 /// because the server resolves paths from its own cwd.
 pub(crate) fn folder_path() -> Input<String> {
-    Input::positional("path", 0, |slot, value| {
+    folder_path_at(0)
+}
+
+/// Folder path argument at positional `index`.
+pub(crate) fn folder_path_at(index: usize) -> Input<String> {
+    Input::positional("path", index, |slot, value| {
         *slot = super::worktree::normalize_path_arg(value)?;
         Ok(())
     })
@@ -211,7 +216,7 @@ pub(crate) const LEAVES: [Leaf; 7] = [
 
 /// Regents commands for folder workspaces. `list` shows the registered
 /// folders instead of the open layout containers.
-const REGENTS_LEAVES: [Leaf; 2] = [
+const REGENTS_LEAVES: [Leaf; 3] = [
     Leaf {
         name: "add",
         about: "Register a folder as a workspace and open it",
@@ -229,6 +234,14 @@ const REGENTS_LEAVES: [Leaf; 2] = [
         method: |matches| {
             WorkspaceListProjection::from_matches(matches).map(Method::WorkspaceRegistryList)
         },
+    },
+    Leaf {
+        name: "link",
+        about: "Bind a legacy workspace to a folder",
+        id: "cli:workspace:link",
+        quiet: false,
+        arguments: WorkspaceLinkProjection::arguments,
+        method: |matches| WorkspaceLinkProjection::from_matches(matches).map(Method::WorkspaceLink),
     },
 ];
 
@@ -420,13 +433,39 @@ mod tests {
             "workspace.list"
         );
         assert!(product_request(false, "add", &["x"]).is_none());
+        assert!(product_request(false, "link", &["w1", "x"]).is_none());
         let herdr_names: Vec<_> = leaves_for(false).iter().map(|leaf| leaf.name).collect();
         let regents_names: Vec<_> = leaves_for(true).iter().map(|leaf| leaf.name).collect();
         assert_eq!(
             herdr_names,
             LEAVES.iter().map(|leaf| leaf.name).collect::<Vec<_>>()
         );
-        assert_eq!(regents_names.len(), LEAVES.len() + 1);
+        assert_eq!(regents_names.len(), LEAVES.len() + 2);
+    }
+
+    #[test]
+    fn regents_workspace_link_sends_the_workspace_and_an_absolute_folder_path() {
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("projeto")
+            .display()
+            .to_string();
+
+        let request = product_request(true, "link", &["w2", "projeto"])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "id": "cli:workspace:link", "method": "workspace.link",
+                "params": {"workspace_id": "w2", "path": expected}
+            })
+        );
+        assert!(matches!(
+            product_request(true, "link", &["w2"]),
+            Some(Err(ParseError::Clap(_)))
+        ));
     }
 
     #[test]

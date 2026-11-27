@@ -1115,6 +1115,10 @@
             "label": {
               "type": "string"
             },
+            "legacy": {
+              "description": "Regents legacy workspace: it has no folder, so it has no agents,\nchannels or wiki until `workspace.link` binds one. Absent means false.",
+              "type": "boolean"
+            },
             "number": {
               "format": "uint",
               "minimum": 0,
@@ -4457,6 +4461,23 @@
           },
           "type": "object"
         },
+        "WorkspaceLinkParams": {
+          "properties": {
+            "path": {
+              "description": "Absolute path of the folder on the server host.",
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Legacy workspace to bind.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "path"
+          ],
+          "type": "object"
+        },
         "WorkspaceMoveBlockParams": {
           "properties": {
             "before_workspace_id": {
@@ -6387,6 +6408,22 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workspace.link",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceLinkParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -7848,6 +7885,22 @@
               "type": "object"
             }
           ]
+        },
+        "LegacyWorkspaceInfo": {
+          "description": "An open workspace without a folder (Regents legacy workspace).",
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "label"
+          ],
+          "type": "object"
         },
         "NotificationShowReason": {
           "enum": [
@@ -10551,6 +10604,13 @@
             },
             {
               "properties": {
+                "legacy": {
+                  "description": "Open workspaces without a folder; `workspace.link` binds one.",
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/LegacyWorkspaceInfo"
+                  },
+                  "type": "array"
+                },
                 "type": {
                   "const": "registered_workspace_list",
                   "type": "string"
@@ -10565,6 +10625,32 @@
               "required": [
                 "type",
                 "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "already_registered": {
+                  "description": "The folder was already in the registry.",
+                  "type": "boolean"
+                },
+                "initialized": {
+                  "description": "The folder had no `.regents/` and received the initial structure.",
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "workspace_linked",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/success_response/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace",
+                "initialized",
+                "already_registered"
               ],
               "type": "object"
             }
@@ -10765,6 +10851,10 @@
             },
             "label": {
               "type": "string"
+            },
+            "legacy": {
+              "description": "Regents legacy workspace: it has no folder, so it has no agents,\nchannels or wiki until `workspace.link` binds one. Absent means false.",
+              "type": "boolean"
             },
             "number": {
               "format": "uint",

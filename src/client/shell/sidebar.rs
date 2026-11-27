@@ -676,7 +676,7 @@ pub(in crate::client::shell) fn workspace_rows(
         &workspace.label
     };
     let token_values = workspace.tokens.iter().cloned().collect::<HashMap<_, _>>();
-    crate::ui::sidebar_space_rows(
+    let mut rows = crate::ui::sidebar_space_rows(
         config,
         crate::ui::SpaceTokenContext {
             workspace: label,
@@ -686,7 +686,32 @@ pub(in crate::client::shell) fn workspace_rows(
             tokens: &token_values,
             suppress_git_details: indented,
         },
-    )
+    );
+    if workspace.legacy {
+        mark_legacy_workspace(&mut rows);
+    }
+    rows
+}
+
+/// Adds a dim `legacy` token after the workspace name of a Regents workspace
+/// without a folder.
+fn mark_legacy_workspace(rows: &mut [Vec<crate::ui::ResolvedToken>]) {
+    let row = rows
+        .iter()
+        .position(|row| {
+            row.iter()
+                .any(|token| matches!(token.kind, crate::ui::ResolvedTokenKind::Workspace(_)))
+        })
+        .unwrap_or(0);
+    if let Some(row) = rows.get_mut(row) {
+        row.push(crate::ui::ResolvedToken {
+            kind: crate::ui::ResolvedTokenKind::Custom("legacy".to_owned()),
+            style: crate::config::SidebarTokenStyle {
+                dim: Some(true),
+                ..Default::default()
+            },
+        });
+    }
 }
 
 pub(in crate::client::shell) fn render_workspace_rows(

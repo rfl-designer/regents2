@@ -67,6 +67,7 @@ fn test_snapshot(boot_id: &str, revision: u64) -> crate::protocol::ClientShellSn
         panes: Vec::new(),
         agents: Vec::new(),
         commands: Vec::new(),
+        workspace_add_command: None,
     }
 }
 
@@ -149,6 +150,7 @@ fn workspace_focus_success(id: &str, workspace_id: &str) -> Vec<u8> {
                 tokens: Default::default(),
                 worktree: None,
                 folder: None,
+                legacy: false,
             },
         },
     })
@@ -434,6 +436,7 @@ fn activation_requires_an_exact_snapshot_surface_revision_pair() {
         panes: Vec::new(),
         agents: Vec::new(),
         commands: Vec::new(),
+        workspace_add_command: None,
     };
     assert_eq!(
         activation.receive_snapshot(&target, 7, &snapshot),

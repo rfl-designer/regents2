@@ -147,6 +147,7 @@ operations::define_operations! {
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
     WorkspaceAdd(WorkspaceAddParams) => "workspace.add", true, false;
     WorkspaceRegistryList(EmptyParams) => "workspace.registry.list", false, false;
+    WorkspaceLink(WorkspaceLinkParams) => "workspace.link", true, false;
 }
 
 #[cfg(test)]

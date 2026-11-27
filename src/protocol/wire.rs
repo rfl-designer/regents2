@@ -948,6 +948,11 @@ pub struct ClientShellSnapshot {
     pub panes: Vec<ClientShellPane>,
     pub agents: Vec<ClientShellAgent>,
     pub commands: Vec<ClientShellCommand>,
+    /// Endpoint-specific command that opens a workspace, shown when the
+    /// endpoint has no workspace. Absent when the endpoint creates workspaces
+    /// itself (herdr) or is older than this field.
+    #[serde(default)]
+    pub workspace_add_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1032,6 +1037,9 @@ pub struct ClientShellWorkspace {
     pub focused: bool,
     #[serde(deserialize_with = "deserialize_client_shell_agent_status")]
     pub agent_status: crate::api::schema::AgentStatus,
+    /// Regents legacy workspace (no folder). Optional for older servers.
+    #[serde(default)]
+    pub legacy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2830,6 +2838,7 @@ mod tests {
                 worktree: None,
                 focused: true,
                 agent_status: crate::api::schema::AgentStatus::Idle,
+                legacy: false,
             }],
             tabs: vec![ClientShellTab {
                 tab_id: "w1:t1".into(),
@@ -2859,6 +2868,7 @@ mod tests {
                 action: ClientShellCommandAction::Shell,
                 description: Some("deploy".into()),
             }],
+            workspace_add_command: None,
         }));
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =

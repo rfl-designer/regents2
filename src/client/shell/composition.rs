@@ -1,5 +1,15 @@
 use super::*;
 
+/// Lines of the pane area when the server has no workspace open.
+/// `workspace_add_command` comes from the server snapshot.
+fn empty_workspace_lines(workspace_add_command: Option<&str>) -> Vec<String> {
+    let mut lines = vec!["No workspace is open.".to_owned()];
+    if let Some(command) = workspace_add_command {
+        lines.push(format!("Run `{command}` to open one."));
+    }
+    lines
+}
+
 fn restore_mode_bar(
     frame: &mut FrameData,
     bar: Option<Rect>,
@@ -338,12 +348,29 @@ impl ClientShellState {
             self.hits.tab_scroll_left = Rect::default();
             self.hits.tab_scroll_right = Rect::default();
         }
+        // Regents can have zero workspaces; then the pane area says what to do.
+        let no_workspace = snapshot.workspaces.is_empty();
+        if no_workspace {
+            let lines = empty_workspace_lines(snapshot.workspace_add_command.as_deref());
+            for (row, line) in (layout.pane_surface.y..layout.pane_surface.bottom()).zip(&lines) {
+                render::put_text(
+                    &mut buffer,
+                    layout.pane_surface.x,
+                    row,
+                    layout.pane_surface.width,
+                    line,
+                    Style::default().fg(self.config.palette.overlay0),
+                );
+            }
+        }
         let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
         let mode_bar_cells = mode_bar.map(|bar| {
             let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
             frame.cells[start..start + usize::from(bar.width)].to_vec()
         });
-        blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
+        if !no_workspace {
+            blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
+        }
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         let mut occlusion = crate::kitty_graphics::surface::Occlusion::default();
         let has_selection = self

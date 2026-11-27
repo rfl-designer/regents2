@@ -163,6 +163,7 @@ mod tests {
             "workspace.move_block",
             "workspace.report_metadata",
             "workspace.add",
+            "workspace.link",
             "workspace.close",
             "worktree.create",
             "worktree.open",

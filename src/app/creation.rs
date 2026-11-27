@@ -410,6 +410,7 @@ impl App {
                     is_linked_worktree: space.is_linked_worktree,
                 }),
             folder: ws.folder.as_ref().map(super::api::folder_info),
+            legacy: self.is_legacy_workspace(index),
         }
     }
 }

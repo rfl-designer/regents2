@@ -95,6 +95,7 @@ pub(super) fn snapshot_with_completions(
                         is_linked_worktree: worktree.is_linked_worktree,
                     }),
                 agent_status: workspace.agent_status,
+                legacy: workspace.legacy,
             }
         })
         .collect();
@@ -263,6 +264,7 @@ pub(super) fn snapshot_with_completions(
         panes,
         agents,
         commands: app.client_shell_command_manifest(),
+        workspace_add_command: app.workspace_add_command(),
     };
     (shell, completions)
 }

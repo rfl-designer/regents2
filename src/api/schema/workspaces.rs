@@ -97,6 +97,10 @@ pub struct WorkspaceInfo {
     /// Workspace folder that gives this workspace its identity (Regents).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<WorkspaceFolderInfo>,
+    /// Regents legacy workspace: it has no folder, so it has no agents,
+    /// channels or wiki until `workspace.link` binds one. Absent means false.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub legacy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -116,6 +120,24 @@ cli_params! {
             .input(bindings::boolean("focus", true).order(1))
             .input(bindings::boolean("no-focus", false).order(2)),
     }
+}
+
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct WorkspaceLinkParams => WorkspaceLinkProjection {
+        /// Legacy workspace to bind.
+        pub workspace_id: String => Field::new(String::new())
+            .input(bindings::workspace_id().value_name("WORKSPACE_ID")),
+        /// Absolute path of the folder on the server host.
+        pub path: String => Field::new(String::new()).input(bindings::folder_path_at(1)),
+    }
+}
+
+/// An open workspace without a folder (Regents legacy workspace).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LegacyWorkspaceInfo {
+    pub workspace_id: String,
+    pub label: String,
 }
 
 /// A folder in the global workspace registry.

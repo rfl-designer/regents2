@@ -136,6 +136,10 @@ pub struct App {
     /// Global registry of workspace folders. Only the Regents product has
     /// folder workspaces; herdr keeps `None`.
     pub(crate) workspace_registry_path: Option<std::path::PathBuf>,
+    /// Regents: the last reopen found no usable registered folder.
+    folder_reopen_exhausted: bool,
+    /// Regents: folders that the user closed last; the reopen skips them.
+    reopen_excluded_folders: Vec<String>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -659,6 +663,8 @@ impl App {
             pending_worktree_remove_runtime_restores: HashMap::new(),
             next_api_worktree_operation_id: 1,
             workspace_registry_path: crate::regents::workspace_registry_path(),
+            folder_reopen_exhausted: false,
+            reopen_excluded_folders: Vec::new(),
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -783,15 +789,37 @@ impl App {
         self.terminal_runtimes.assume_handoff_ownership();
     }
 
+    /// Opens a workspace when none is open. Herdr creates one in the default
+    /// cwd. Regents never creates a workspace without a folder: it reopens the
+    /// last used registered folder, or keeps zero workspaces. The event loop
+    /// calls this often, so after a failed reopen Regents does not read the
+    /// registry again until a workspace opens or a new client attaches.
     pub(crate) fn ensure_default_workspace(&mut self) -> bool {
         if !self.state.workspaces.is_empty() {
+            self.folder_reopen_exhausted = false;
             return false;
         }
 
-        let cwd = self.resolve_new_terminal_cwd(None);
         let preserve_checkpoint = self.pane_exit_checkpoint_pending && !self.state.session_dirty;
 
-        match self.create_workspace_with_options(cwd, true) {
+        let created = if self.has_folder_workspaces() {
+            if self.folder_reopen_exhausted {
+                return false;
+            }
+            match self.reopen_last_used_folder_workspace() {
+                Some(index) => Ok(index),
+                None => {
+                    self.folder_reopen_exhausted = true;
+                    self.state.mode = Mode::Navigate;
+                    return false;
+                }
+            }
+        } else {
+            let cwd = self.resolve_new_terminal_cwd(None);
+            self.create_workspace_with_options(cwd, true)
+        };
+
+        match created {
             Ok(_) => {
                 if preserve_checkpoint {
                     // Automatic replacement is part of pane removal, not a new user mutation.
@@ -806,6 +834,13 @@ impl App {
                 false
             }
         }
+    }
+
+    /// `ensure_default_workspace` for a client that just attached: Regents
+    /// tries the registry again, because a folder may be back.
+    pub(crate) fn ensure_default_workspace_for_new_client(&mut self) -> bool {
+        self.folder_reopen_exhausted = false;
+        self.ensure_default_workspace()
     }
 
     fn mark_release_notes_seen(&mut self, preview: bool) {

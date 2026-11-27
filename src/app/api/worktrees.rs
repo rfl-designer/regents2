@@ -92,6 +92,17 @@ impl App {
         let canonical_source = crate::worktree::canonical_or_original(&source.source_checkout_path);
         let target_is_source = canonical_path == canonical_source;
         let already_open = self.open_workspace_idx_for_checkout(&canonical_path);
+        // Regents opens no workspace without a folder: it allows the request
+        // only when the target and its parent workspace are already open.
+        let parent_open = source.workspace_idx.is_some()
+            || self
+                .find_parent_workspace_by_key(&source.repo_key)
+                .is_some();
+        if !parent_open || (already_open.is_none() && !target_is_source) {
+            if let Some(refusal) = self.folderless_workspace_refusal(&id) {
+                return refusal;
+            }
+        }
         let defer_source_created_event = target_is_source && already_open.is_none();
         let created_source_workspace =
             match self.ensure_source_parent_membership(&mut source, !defer_source_created_event) {
@@ -1410,6 +1421,86 @@ mod tests {
         let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// A linked worktree of a new repository and a Regents app with the
+    /// repository open as its parent workspace.
+    fn regents_app_with_linked_worktree(name: &str) -> (App, PathBuf, PathBuf) {
+        let repo = create_committed_repo(&format!("regents-{name}-repo"));
+        let checkout = unique_temp_path(&format!("regents-{name}-checkout"));
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/regents",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let mut app = app_with_parent(&repo);
+        app.workspace_registry_path =
+            Some(unique_temp_path(&format!("regents-{name}-config")).join("workspaces.toml"));
+        (app, repo, checkout)
+    }
+
+    fn regents_worktree_open(app: &mut App) -> String {
+        let workspace_id = app.state.workspaces[0].id.clone();
+        run_deferred_api_request(
+            app,
+            Request {
+                id: "req".into(),
+                method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
+                    workspace_id: Some(workspace_id),
+                    branch: Some("worktree/regents".into()),
+                    focus: true,
+                    ..WorktreeOpenParams::default()
+                }),
+            },
+        )
+    }
+
+    fn remove_linked_worktree(repo: PathBuf, checkout: &Path) {
+        let remove = crate::worktree::build_worktree_remove_command(&repo, checkout, false, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn regents_worktree_open_focuses_an_open_checkout() {
+        let (mut app, repo, checkout) = regents_app_with_linked_worktree("open-focus");
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = checkout.clone();
+        app.state.workspaces.push(child);
+        app.state.ensure_test_terminals();
+
+        let response = regents_worktree_open(&mut app);
+
+        let success: SuccessResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|_| panic!("worktree.open failed: {response}"));
+        let ResponseResult::WorktreeOpened { already_open, .. } = success.result else {
+            panic!("expected worktree_opened response");
+        };
+        assert!(already_open);
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.active, Some(1));
+        remove_linked_worktree(repo, &checkout);
+    }
+
+    #[test]
+    fn regents_worktree_open_refuses_a_new_checkout_workspace() {
+        let (mut app, repo, checkout) = regents_app_with_linked_worktree("open-new");
+
+        let response = regents_worktree_open(&mut app);
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|_| panic!("worktree.open must fail: {response}"));
+        assert_eq!(error.error.code, "workspace_folder_required");
+        assert!(error.error.message.contains("workspace add"));
+        assert_eq!(app.state.workspaces.len(), 1);
+        remove_linked_worktree(repo, &checkout);
     }
 
     #[test]

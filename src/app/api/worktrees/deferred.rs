@@ -18,6 +18,19 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
         client_local: bool,
     ) -> bool {
+        // A new worktree workspace has no Regents folder. Regents refuses it
+        // before git runs; `regents workspace add <checkout>` opens a checkout
+        // instead. `worktree.open` is checked later: it may only focus an
+        // open workspace.
+        if matches!(
+            request.method,
+            crate::api::schema::Method::WorktreeCreate(_)
+        ) {
+            if let Some(refusal) = self.folderless_workspace_refusal(&request.id) {
+                Self::send_api_response(respond_to, refusal);
+                return true;
+            }
+        }
         match request.method {
             crate::api::schema::Method::WorktreeList(_)
             | crate::api::schema::Method::WorktreeOpen(_) => {

@@ -20,6 +20,10 @@ pub(crate) struct Registry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistryEntry {
     pub(crate) path: PathBuf,
+    /// Order of the last use (add, link or reopen); a higher value is more
+    /// recent. Absent in registries written before Regents recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_used: Option<u64>,
 }
 
 /// Registry file of the running product, for example
@@ -72,9 +76,50 @@ impl Registry {
         self.workspaces.iter().any(|entry| entry.path == root)
     }
 
-    fn push(&mut self, root: PathBuf) {
-        self.workspaces.push(RegistryEntry { path: root });
+    /// Entries from the most recently used to the least recently used.
+    /// Entries without a use mark come last, in file order.
+    pub(crate) fn by_recent_use(&self) -> Vec<&RegistryEntry> {
+        let mut entries: Vec<&RegistryEntry> = self.workspaces.iter().collect();
+        // A stable sort keeps the file order of entries with equal marks.
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_used));
+        entries
     }
+
+    fn push(&mut self, root: PathBuf) {
+        self.workspaces.push(RegistryEntry {
+            path: root,
+            last_used: None,
+        });
+    }
+
+    /// Marks `root` as the most recently used entry. Returns false when the
+    /// registry does not contain `root`.
+    fn touch(&mut self, root: &Path) -> bool {
+        let next = self
+            .workspaces
+            .iter()
+            .filter_map(|entry| entry.last_used)
+            .max()
+            .map_or(1, |last| last.saturating_add(1));
+        match self.workspaces.iter_mut().find(|entry| entry.path == root) {
+            Some(entry) => {
+                entry.last_used = Some(next);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Records that the registered folder `root` was used now, so that it is the
+/// first candidate when Regents reopens a workspace. Call it only when a
+/// workspace opens (add, link, reopen), never on a focus change.
+pub(crate) fn mark_used(registry_path: &Path, root: &Path) -> io::Result<()> {
+    let mut registry = Registry::load(registry_path)?;
+    if registry.touch(root) {
+        registry.save(registry_path)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -159,8 +204,9 @@ pub(crate) fn add_folder(registry_path: &Path, path: &Path) -> Result<AddedFolde
     let opened = folder::open_or_init(&root)?;
     if !already_registered {
         registry.push(root.clone());
-        registry.save(registry_path)?;
     }
+    registry.touch(&root);
+    registry.save(registry_path)?;
     Ok(AddedFolder {
         root,
         folder: opened,
@@ -234,7 +280,8 @@ mod tests {
         assert_eq!(
             registry.entries(),
             &[RegistryEntry {
-                path: added.root.clone()
+                path: added.root.clone(),
+                last_used: Some(1),
             }]
         );
         let content = std::fs::read_to_string(&registry_path).unwrap();
@@ -285,6 +332,56 @@ mod tests {
         assert!(err.to_string().contains(&added.folder.manifest.id), "{err}");
         assert_eq!(Registry::load(&registry_path).unwrap().entries().len(), 1);
         assert_eq!(tree(&copy), before, "a refused copy must not change");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn reopen_order_starts_with_the_most_recently_used_folder() {
+        let base = temp_dir("recent");
+        let registry_path = base.join("workspaces.toml");
+        let mut roots = Vec::new();
+        for name in ["a", "b", "c"] {
+            let folder = base.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            roots.push(add_folder(&registry_path, &folder).unwrap().root);
+        }
+
+        mark_used(&registry_path, &roots[0]).unwrap();
+
+        let order: Vec<PathBuf> = Registry::load(&registry_path)
+            .unwrap()
+            .by_recent_use()
+            .into_iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec![roots[0].clone(), roots[2].clone(), roots[1].clone()]
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_registry_without_use_marks_keeps_the_file_order() {
+        let base = temp_dir("unmarked");
+        let registry_path = base.join("workspaces.toml");
+        std::fs::write(
+            &registry_path,
+            "[[workspaces]]\npath = \"/work/first\"\n\n[[workspaces]]\npath = \"/work/second\"\n",
+        )
+        .unwrap();
+
+        let registry = Registry::load(&registry_path).unwrap();
+
+        let order: Vec<PathBuf> = registry
+            .by_recent_use()
+            .into_iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec![PathBuf::from("/work/first"), PathBuf::from("/work/second")]
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 

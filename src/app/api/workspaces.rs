@@ -41,6 +41,9 @@ impl App {
         id: String,
         params: WorkspaceCreateParams,
     ) -> String {
+        if let Some(refusal) = self.folderless_workspace_refusal(&id) {
+            return refusal;
+        }
         let source_workspace_index = if params.cwd.is_some() {
             None
         } else {
@@ -343,8 +346,13 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
+        let closed_folders = close_indices
+            .iter()
+            .filter_map(|index| self.state.workspaces[*index].folder.clone())
+            .collect::<Vec<_>>();
         self.state.selected = index;
         self.state.close_workspaces(close_indices);
+        self.record_closed_folder_workspaces(closed_folders);
         self.shutdown_detached_terminal_runtimes();
         for (workspace_id, workspace) in closed_workspaces {
             self.emit_event(EventEnvelope {

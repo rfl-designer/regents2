@@ -1267,6 +1267,9 @@ impl App {
             Method::WorkspaceRegistryList(_) => {
                 return self.handle_workspace_registry_list(request.id);
             }
+            Method::WorkspaceLink(params) => {
+                return self.handle_workspace_link(request.id, params);
+            }
             _ => {
                 return responses::encode_error(
                     request.id,

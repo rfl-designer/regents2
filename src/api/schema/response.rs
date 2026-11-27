@@ -287,6 +287,16 @@ pub enum ResponseResult {
     },
     RegisteredWorkspaceList {
         workspaces: Vec<super::workspaces::RegisteredWorkspaceInfo>,
+        /// Open workspaces without a folder; `workspace.link` binds one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        legacy: Vec<super::workspaces::LegacyWorkspaceInfo>,
+    },
+    WorkspaceLinked {
+        workspace: WorkspaceInfo,
+        /// The folder had no `.regents/` and received the initial structure.
+        initialized: bool,
+        /// The folder was already in the registry.
+        already_registered: bool,
     },
 }
 

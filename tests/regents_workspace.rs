@@ -1,5 +1,6 @@
-//! Folder workspaces of the `regents` binary (ticket #3): `workspace add`,
-//! `workspace list`, the sidebar name and the restore after a restart.
+//! Folder workspaces of the `regents` binary: `workspace add`, `workspace
+//! list`, the sidebar name and the restore after a restart (ticket #3); legacy
+//! workspaces, `workspace link` and the reopen of the last used folder (#4).
 
 #![cfg(unix)]
 
@@ -180,6 +181,37 @@ impl Sandbox {
         response["result"].clone()
     }
 
+    /// Runs a `regents` command that must fail and returns its JSON `error`.
+    fn cli_error(&self, args: &[&str]) -> Value {
+        let output = self.cli_output(args);
+        assert!(
+            !output.status.success(),
+            "regents {args:?} must fail: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let response: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|err| {
+            panic!(
+                "regents {args:?} stderr is not JSON ({err}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        response["error"].clone()
+    }
+
+    fn session_file(&self) -> PathBuf {
+        self.base
+            .join("config")
+            .join(regents_dir_name())
+            .join("session.json")
+    }
+
+    fn open_workspaces(&self) -> Vec<Value> {
+        self.api("workspace.list", serde_json::json!({}))["workspaces"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
     /// Sends one JSON API request and returns its `result`.
     fn api(&self, method: &str, params: Value) -> Value {
         let mut stream = UnixStream::connect(self.api_socket()).unwrap();
@@ -215,6 +247,14 @@ impl Sandbox {
 
     /// Bytes of the first client shell snapshot, the data that the sidebar draws.
     fn client_shell_snapshot(&self) -> Vec<u8> {
+        // The server binds the client socket after the API socket.
+        assert!(
+            wait_until(Duration::from_secs(10), || UnixStream::connect(
+                self.client_socket()
+            )
+            .is_ok()),
+            "regents client socket did not appear"
+        );
         let mut stream = UnixStream::connect(self.client_socket()).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -488,4 +528,192 @@ fn folder_workspace_comes_back_after_a_restart_with_its_id_and_layout() {
     assert_eq!(listed[0]["workspace_id"], workspace_id);
     let again = sandbox.cli(&["workspace", "add", folder.to_str().unwrap()]);
     assert_eq!(again["workspace"]["workspace_id"], workspace_id);
+}
+
+/// A `session.json` from before Regents: two workspaces without a folder, the
+/// first with two panes side by side.
+fn write_old_session(sandbox: &Sandbox, cwd: &Path) {
+    let cwd = cwd.display().to_string();
+    let session = serde_json::json!({
+        "version": 3,
+        "workspaces": [
+            {
+                "id": "wold1",
+                "custom_name": "antigo",
+                "identity_cwd": cwd,
+                "tabs": [{
+                    "custom_name": null,
+                    "layout": {"Split": {
+                        "direction": "Vertical",
+                        "ratio": 0.5,
+                        "first": {"Pane": 1},
+                        "second": {"Pane": 2}
+                    }},
+                    "panes": {"1": {"cwd": cwd}, "2": {"cwd": cwd}},
+                    "zoomed": false,
+                    "focused": 1,
+                    "root_pane": 1
+                }],
+                "active_tab": 0
+            },
+            {
+                "id": "wold2",
+                "custom_name": null,
+                "identity_cwd": cwd,
+                "tabs": [{
+                    "custom_name": null,
+                    "layout": {"Pane": 3},
+                    "panes": {"3": {"cwd": cwd}},
+                    "zoomed": false,
+                    "focused": 3,
+                    "root_pane": 3
+                }],
+                "active_tab": 0
+            }
+        ],
+        "active": 0,
+        "selected": 0
+    });
+    fs::write(
+        sandbox.session_file(),
+        serde_json::to_string_pretty(&session).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn creating_a_workspace_without_a_folder_is_refused() {
+    let sandbox = Sandbox::new();
+    let cwd = sandbox.folder("solto");
+    let _server = sandbox.start_server();
+
+    let error = sandbox.cli_error(&["workspace", "create", "--cwd", cwd.to_str().unwrap()]);
+
+    assert_eq!(error["code"], "workspace_folder_required", "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("regents workspace add"),
+        "{error}"
+    );
+    assert!(sandbox.open_workspaces().is_empty());
+}
+
+#[test]
+fn an_old_session_restores_as_legacy_workspaces_and_link_binds_one() {
+    let sandbox = Sandbox::new();
+    let cwd = sandbox.folder("antigo");
+    let folder = sandbox.folder("projeto");
+    write_old_session(&sandbox, &cwd);
+    let server = sandbox.start_server();
+
+    let restored = sandbox.open_workspaces();
+
+    assert_eq!(restored.len(), 2, "{restored:?}");
+    assert_eq!(restored[0]["workspace_id"], "wold1");
+    assert_eq!(restored[0]["label"], "antigo");
+    assert_eq!(restored[0]["pane_count"], 2);
+    assert_eq!(restored[1]["workspace_id"], "wold2");
+    assert_eq!(restored[1]["pane_count"], 1);
+    for workspace in &restored {
+        assert_eq!(workspace["legacy"], true, "{workspace}");
+        assert!(workspace.get("folder").is_none(), "{workspace}");
+    }
+    let listed = sandbox.cli(&["workspace", "list"]);
+    assert_eq!(listed["workspaces"], serde_json::json!([]));
+    assert_eq!(
+        listed["legacy"],
+        serde_json::json!([
+            {"workspace_id": "wold1", "label": "antigo"},
+            {"workspace_id": "wold2", "label": restored[1]["label"]},
+        ])
+    );
+    assert!(
+        contains(&sandbox.client_shell_snapshot(), b"\"legacy\":true"),
+        "the sidebar data must mark the legacy workspaces"
+    );
+
+    let linked = sandbox.cli(&["workspace", "link", "wold1", folder.to_str().unwrap()]);
+
+    assert_eq!(linked["type"], "workspace_linked", "{linked}");
+    assert_eq!(linked["initialized"], true);
+    let workspace = &linked["workspace"];
+    assert_eq!(workspace["workspace_id"], "wold1");
+    assert_eq!(workspace["label"], "projeto");
+    assert_eq!(workspace["pane_count"], 2);
+    assert!(workspace.get("legacy").is_none(), "{workspace}");
+    let id = workspace["folder"]["id"].clone();
+    assert!(folder.join(".regents/workspace.toml").is_file());
+    assert!(folder.join(".regents/channels/geral").is_dir());
+    let listed = sandbox.cli(&["workspace", "list"]);
+    assert_eq!(listed["workspaces"][0]["workspace_id"], "wold1");
+    assert_eq!(listed["workspaces"][0]["id"], id);
+    assert_eq!(listed["legacy"].as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed["legacy"][0]["workspace_id"], "wold2");
+
+    let error = sandbox.cli_error(&["workspace", "link", "wold2", folder.to_str().unwrap()]);
+    assert_eq!(error["code"], "workspace_folder_in_use", "{error}");
+
+    sandbox.stop_server(server);
+    let _server = sandbox.start_server();
+
+    let after = sandbox.open_workspaces();
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0]["folder"]["id"], id);
+    assert!(after[0].get("legacy").is_none());
+    assert_eq!(after[0]["pane_count"], 2);
+    assert_eq!(after[1]["legacy"], true);
+}
+
+#[test]
+fn without_a_session_regents_reopens_the_last_used_folder() {
+    let sandbox = Sandbox::new();
+    let first = sandbox.folder("primeiro");
+    let second = sandbox.folder("segundo");
+    let server = sandbox.start_server();
+    sandbox.cli(&["workspace", "add", first.to_str().unwrap()]);
+    let last = sandbox.cli(&["workspace", "add", second.to_str().unwrap()]);
+    sandbox.stop_server(server);
+    fs::remove_file(sandbox.session_file()).unwrap();
+
+    let server = sandbox.start_server();
+
+    let open = sandbox.open_workspaces();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0]["folder"], last["workspace"]["folder"]);
+    assert_eq!(open[0]["label"], "segundo");
+
+    sandbox.stop_server(server);
+    fs::remove_file(sandbox.session_file()).unwrap();
+    fs::remove_dir_all(&second).unwrap();
+    let _server = sandbox.start_server();
+
+    let open = sandbox.open_workspaces();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0]["label"], "primeiro");
+}
+
+#[test]
+fn with_no_usable_folder_a_client_attaches_to_zero_workspaces() {
+    let sandbox = Sandbox::new();
+    let _server = sandbox.start_server();
+
+    let snapshot = sandbox.client_shell_snapshot();
+
+    assert!(
+        contains(&snapshot, b"\"workspaces\":[]"),
+        "{}",
+        String::from_utf8_lossy(&snapshot)
+    );
+    assert!(
+        contains(
+            &snapshot,
+            b"\"workspace_add_command\":\"regents workspace add <folder>\""
+        ),
+        "the snapshot must tell clients how to add a workspace: {}",
+        String::from_utf8_lossy(&snapshot)
+    );
+    assert!(sandbox.open_workspaces().is_empty());
+    assert_eq!(sandbox.api("ping", serde_json::json!({}))["type"], "pong");
 }

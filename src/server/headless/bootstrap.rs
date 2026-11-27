@@ -105,7 +105,16 @@ pub fn run_server() -> io::Result<()> {
 }
 
 fn seed_startup_workspace_if_empty(app: &mut app::App) {
-    let Some(cwd) = take_startup_cwd() else {
+    let startup_cwd = take_startup_cwd();
+    if app.has_folder_workspaces() {
+        // Regents never opens a workspace without a folder: it reopens the
+        // last used registered folder, or starts with no workspace.
+        if !app.ensure_default_workspace() && app.state.workspaces.is_empty() {
+            info!("no registered workspace folder can open; starting with no workspace");
+        }
+        return;
+    }
+    let Some(cwd) = startup_cwd else {
         return;
     };
 

@@ -40,6 +40,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
             worktree: None,
             focused: true,
             agent_status: AgentStatus::Idle,
+            legacy: false,
         }],
         tabs: vec![ClientShellTab {
             tab_id: "tab_1".into(),
@@ -63,6 +64,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
         }],
         agents: Vec::new(),
         commands: Vec::new(),
+        workspace_add_command: None,
     }
 }
 
@@ -261,4 +263,5 @@ mod link_hover;
 mod mobile;
 mod mouse_selection;
 mod popup_focus_projection;
+mod regents_workspaces;
 mod startup_overlays;
