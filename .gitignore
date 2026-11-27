@@ -15,6 +15,10 @@ __pycache__/
 !/docs/preview/**
 !/docs/versions/
 !/docs/versions/**
+!/docs/adr/
+!/docs/adr/**
+!/docs/agents/
+!/docs/agents/**
 /.local/
 /backlog
 

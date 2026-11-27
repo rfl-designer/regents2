@@ -1,0 +1,3 @@
+# Os privilégios do Chief of Staff evitam erros, mas não são uma fronteira de segurança
+
+Só o Chief of Staff (e você) pode executar comandos de estrutura (criar ou remover agentes e canais, mudar a configuração do workspace, escrever na wiki). O servidor confere isso com uma credencial por thread, entregue por variável de ambiente. Essa regra protege contra agentes que mudam a estrutura por engano. Ela não protege contra um agente malicioso, porque todos os agentes executam como o seu usuário e podem editar `.regents/` direto no filesystem. Não trate essa verificação como sandbox, e não prometa isolamento entre agentes com base nela.
