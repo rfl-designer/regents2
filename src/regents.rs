@@ -7,12 +7,21 @@
 //! module removes that binding at startup, so herdr and Regents never see each
 //! other's servers.
 
+pub(crate) mod adapter;
+pub(crate) mod agents;
 pub(crate) mod channel;
 pub(crate) mod folder;
+pub(crate) mod mention;
 pub(crate) mod registry;
+pub(crate) mod store;
+pub(crate) mod threads;
 
 use std::ffi::OsStr;
 use std::path::Path;
+
+/// Environment of a thread CLI: its thread ID. `regents channel post` sends
+/// it as the origin thread of the message.
+pub(crate) const THREAD_ID_ENV_VAR: &str = "REGENTS_THREAD_ID";
 
 /// Set by every server for its panes (`integration::apply_pane_base_env`):
 /// the executable of the server that launched the pane.
@@ -60,4 +69,36 @@ pub(crate) fn detach_from_other_product_server() {
     for var in SERVER_PANE_ENV_VARS {
         std::env::remove_var(var);
     }
+}
+
+/// RFC 3339 time in UTC, in whole seconds: the time format of the workspace
+/// databases.
+pub(crate) fn utc_seconds(now: time::OffsetDateTime) -> Result<String, String> {
+    now.to_offset(time::UtcOffset::UTC)
+        .replace_nanosecond(0)
+        .map_err(|err| err.to_string())?
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|err| err.to_string())
+}
+
+/// 128 random bits. `seed` adds caller context to the mix.
+pub(crate) fn random_bytes(seed: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    use std::hash::BuildHasher;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    // `RandomState` has random keys for each process and each instance.
+    let random = std::collections::hash_map::RandomState::new().hash_one(nanos);
+    let mut hasher = Sha256::new();
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(random.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(seed);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes
 }

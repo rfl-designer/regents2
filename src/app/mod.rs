@@ -27,6 +27,7 @@ mod tab_bar_status;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+mod threads;
 mod window_title;
 mod worktrees;
 
@@ -147,6 +148,11 @@ pub struct App {
     /// Regents: next periodic check of the open workspace folders; `None`
     /// until the first check.
     next_folder_connection_check: Option<Instant>,
+    /// Regents: threads whose agent CLI runs, by their background pane.
+    pub(crate) running_threads: HashMap<crate::layout::PaneId, threads::RunningThread>,
+    /// Regents: thread panes whose CLI process the server stopped; their
+    /// exit event is expected.
+    pub(crate) expected_thread_exits: HashSet<crate::layout::PaneId>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -674,6 +680,8 @@ impl App {
             reopen_excluded_folders: Vec::new(),
             disconnected_folders: HashSet::new(),
             next_folder_connection_check: None,
+            running_threads: HashMap::new(),
+            expected_thread_exits: HashSet::new(),
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled

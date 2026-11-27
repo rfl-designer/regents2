@@ -1372,6 +1372,18 @@
     },
     "request": {
       "$defs": {
+        "AgentDefinitionListParams": {
+          "properties": {
+            "workspace_id": {
+              "description": "Workspace of the agents: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1847,6 +1859,13 @@
             "channel": {
               "description": "Channel name (slug), for example `geral`.",
               "type": "string"
+            },
+            "origin_thread_id": {
+              "description": "Thread that posts the message. `regents channel post` sends it\nwhen a thread CLI runs it. A message from a thread opens no new\nthread (delegation comes later).",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "reply_to": {
               "description": "Message of the same channel that this message replies to.",
@@ -4582,6 +4601,18 @@
           ],
           "type": "object"
         },
+        "ThreadListParams": {
+          "properties": {
+            "workspace_id": {
+              "description": "Workspace of the threads: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "ToastHerdrPosition": {
           "enum": [
             "top-left",
@@ -6711,6 +6742,38 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "thread.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ThreadListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.definition.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentDefinitionListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -6939,6 +7002,80 @@
     },
     "success_response": {
       "$defs": {
+        "AgentApproval": {
+          "oneOf": [
+            {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "default",
+              "description": "The CLI asks for permission as it does by default.",
+              "type": "string"
+            },
+            {
+              "const": "auto",
+              "description": "The CLI runs without asking.",
+              "type": "string"
+            }
+          ]
+        },
+        "AgentCliKind": {
+          "oneOf": [
+            {
+              "enum": [
+                "claude",
+                "codex",
+                "agy"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A CLI that this client does not know.",
+              "type": "string"
+            }
+          ]
+        },
+        "AgentDefinitionInfo": {
+          "description": "An agent of the workspace: a definition, not a process.",
+          "properties": {
+            "approval": {
+              "$ref": "#/schemas/success_response/$defs/AgentApproval"
+            },
+            "cli": {
+              "$ref": "#/schemas/success_response/$defs/AgentCliKind"
+            },
+            "isolation": {
+              "$ref": "#/schemas/success_response/$defs/AgentIsolation"
+            },
+            "model": {
+              "description": "Absent means the default model of the CLI.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "description": "The mention target: `@name`.",
+              "type": "string"
+            },
+            "reserved": {
+              "description": "The Chief of Staff, which cannot be removed.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "cli",
+            "isolation",
+            "approval",
+            "reserved"
+          ],
+          "type": "object"
+        },
         "AgentInfo": {
           "properties": {
             "agent": {
@@ -7073,6 +7210,26 @@
             "revision"
           ],
           "type": "object"
+        },
+        "AgentIsolation": {
+          "oneOf": [
+            {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "shared",
+              "description": "Threads run in the workspace folder.",
+              "type": "string"
+            },
+            {
+              "const": "worktree",
+              "description": "Each thread runs in its own git worktree.",
+              "type": "string"
+            }
+          ]
         },
         "AgentManifestInfo": {
           "properties": {
@@ -11134,6 +11291,52 @@
                 "messages"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "threads": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/ThreadInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "thread_list",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "threads"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agents": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentDefinitionInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "agent_definition_list",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "agents"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -11291,6 +11494,163 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "ThreadInfo": {
+          "properties": {
+            "agent": {
+              "description": "Name of the agent that the thread runs.",
+              "type": "string"
+            },
+            "channel": {
+              "description": "Channel of the mention that opened the thread.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cli": {
+              "$ref": "#/schemas/success_response/$defs/AgentCliKind"
+            },
+            "created_at": {
+              "description": "RFC 3339 times in UTC, in whole seconds.",
+              "type": "string"
+            },
+            "depth": {
+              "default": 0,
+              "description": "Length of the delegation chain before this thread: 0 when a human\nopened it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "end_reason": {
+              "description": "Why the thread ended, when it did not end done.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "description": "Unique in the workspace, for example `t1`.",
+              "type": "string"
+            },
+            "isolation": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentIsolation"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Where the thread runs."
+            },
+            "opener_thread_id": {
+              "description": "Thread whose agent mentioned this agent. Absent when a human did.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "origin": {
+              "$ref": "#/schemas/success_response/$defs/ThreadOriginKind",
+              "default": "channel",
+              "description": "What opened the thread."
+            },
+            "origin_message_id": {
+              "description": "Message of the mention that opened the thread.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "description": "Pane that runs the CLI while the thread is active. The pane is in\nno tab.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "description": "Session of the agent CLI, to resume the thread.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/ThreadState"
+            },
+            "updated_at": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "agent",
+            "cli",
+            "state",
+            "created_at",
+            "updated_at"
+          ],
+          "type": "object"
+        },
+        "ThreadOriginKind": {
+          "description": "What opened a thread.",
+          "oneOf": [
+            {
+              "const": "channel",
+              "description": "A mention in a channel.",
+              "type": "string"
+            },
+            {
+              "const": "direct",
+              "description": "A direct conversation.",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "An origin that this client does not know.",
+              "type": "string"
+            }
+          ]
+        },
+        "ThreadState": {
+          "description": "The life cycle state of a thread.",
+          "oneOf": [
+            {
+              "enum": [
+                "queued"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "active",
+              "description": "The agent CLI runs.",
+              "type": "string"
+            },
+            {
+              "const": "done",
+              "description": "The agent finished; its CLI process ended and the session stays.",
+              "type": "string"
+            },
+            {
+              "const": "interrupted",
+              "description": "The server restarted while the thread was active.",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "description": "The CLI ended before it did any work, or did not start.",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "A state that this client does not know.",
+              "type": "string"
+            }
+          ]
         },
         "WorkspaceFolderInfo": {
           "properties": {

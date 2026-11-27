@@ -5,16 +5,26 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
+
+use super::store;
 
 const CHANNELS_DIR: &str = "channels";
 const DATABASE_FILE: &str = "channel.sqlite";
-const SCHEMA_VERSION: i64 = 1;
-/// Time that an access waits for a lock that another connection holds. The
-/// server is the only writer, so a lock is rare and short. The channel I/O runs
-/// on the server loop: keep this small until it moves to a worker, as the
-/// folder check of #5 must too.
-const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+const SCHEMA: store::Schema = store::Schema {
+    version: 1,
+    sql: "CREATE TABLE IF NOT EXISTS messages (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             author_kind TEXT NOT NULL,
+             author_id TEXT NOT NULL,
+             body TEXT NOT NULL,
+             reply_to INTEGER,
+             origin_thread_id TEXT,
+             -- JSON array of the mentioned agent names.
+             mentions TEXT NOT NULL DEFAULT '[]',
+             created_at TEXT NOT NULL
+         );",
+};
 
 /// Who wrote a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,12 +209,7 @@ impl Channel {
             return Err(ChannelError::EmptyBody);
         }
         let reply_to = message.reply_to.map(to_sql_id).transpose()?;
-        let created_at = now
-            .to_offset(time::UtcOffset::UTC)
-            .replace_nanosecond(0)
-            .map_err(|err| ChannelError::Storage(err.to_string()))?
-            .format(&time::format_description::well_known::Rfc3339)
-            .map_err(|err| ChannelError::Storage(err.to_string()))?;
+        let created_at = super::utc_seconds(now).map_err(ChannelError::Storage)?;
         let mentions = serde_json::to_string(&message.mentions)
             .map_err(|err| ChannelError::Storage(err.to_string()))?;
         let path = self.database_path();
@@ -237,9 +242,7 @@ impl Channel {
         mentions: &str,
         created_at: &str,
     ) -> Result<u64, ChannelError> {
-        let mut connection = Connection::open(path)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        migrate(&connection)?;
+        let mut connection = store::open_writable(path, &SCHEMA)?;
         let transaction = connection.transaction()?;
         if let (Some(id), Some(sql_id)) = (message.reply_to, reply_to) {
             let exists = transaction
@@ -289,11 +292,7 @@ impl Channel {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
+        let connection = store::open_read_only(&path)?;
         // The most recent `limit` messages before `before`, oldest first.
         let mut statement = connection.prepare(
             "SELECT id, author_kind, author_id, body, reply_to, origin_thread_id, mentions,
@@ -337,30 +336,6 @@ impl Channel {
     }
 }
 
-fn migrate(connection: &Connection) -> Result<(), ChannelError> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version >= SCHEMA_VERSION {
-        return Ok(());
-    }
-    connection.execute_batch(
-        "BEGIN;
-         CREATE TABLE IF NOT EXISTS messages (
-             id INTEGER PRIMARY KEY AUTOINCREMENT,
-             author_kind TEXT NOT NULL,
-             author_id TEXT NOT NULL,
-             body TEXT NOT NULL,
-             reply_to INTEGER,
-             origin_thread_id TEXT,
-             -- JSON array of the mentioned agent names.
-             mentions TEXT NOT NULL DEFAULT '[]',
-             created_at TEXT NOT NULL
-         );
-         PRAGMA user_version = 1;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
 /// Removes a database that a failed first post created.
 fn remove_database(path: &Path) {
     for file in [path.to_path_buf(), path.with_extension("sqlite-journal")] {
@@ -385,31 +360,18 @@ fn from_sql_id(id: i64) -> Result<u64, ChannelError> {
 mod tests {
     use super::*;
 
-    struct Folder(PathBuf);
-
-    impl Folder {
-        /// A workspace state directory with the channel `geral`.
-        fn new(name: &str) -> Self {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let state = std::env::temp_dir()
-                .join(format!(
-                    "regents-channel-{name}-{}-{stamp}",
-                    std::process::id()
-                ))
-                .join(".regents");
-            std::fs::create_dir_all(state.join("channels").join("geral")).unwrap();
-            Self(state)
-        }
+    /// A workspace state directory with the channel `geral`.
+    struct Folder {
+        _root: store::TempFolder,
+        state: PathBuf,
     }
 
-    impl Drop for Folder {
-        fn drop(&mut self) {
-            if let Some(parent) = self.0.parent() {
-                let _ = std::fs::remove_dir_all(parent);
-            }
+    impl Folder {
+        fn new(name: &str) -> Self {
+            let root = store::TempFolder::new(&format!("channel-{name}"));
+            let state = root.0.join(".regents");
+            std::fs::create_dir_all(state.join("channels").join("geral")).unwrap();
+            Self { _root: root, state }
         }
     }
 
@@ -436,7 +398,7 @@ mod tests {
     #[test]
     fn a_posted_message_reads_back_with_its_author_and_time() {
         let folder = Folder::new("post");
-        let channel = open(&folder.0, "geral").unwrap();
+        let channel = open(&folder.state, "geral").unwrap();
 
         let posted = channel.post(human("oi"), afternoon_in_sao_paulo()).unwrap();
 
@@ -460,8 +422,8 @@ mod tests {
     #[test]
     fn the_database_appears_only_with_the_first_message() {
         let folder = Folder::new("lazy");
-        let channel = open(&folder.0, "geral").unwrap();
-        let database = folder.0.join("channels/geral/channel.sqlite");
+        let channel = open(&folder.state, "geral").unwrap();
+        let database = folder.state.join("channels/geral/channel.sqlite");
 
         assert_eq!(channel.read(ReadRange::default()).unwrap(), vec![]);
         assert!(!database.exists());
@@ -475,11 +437,11 @@ mod tests {
     fn messages_survive_a_new_open_in_posting_order() {
         let folder = Folder::new("reopen");
         let now = afternoon_in_sao_paulo();
-        let first = open(&folder.0, "geral").unwrap();
+        let first = open(&folder.state, "geral").unwrap();
         first.post(human("um"), now).unwrap();
         first.post(human("dois"), now).unwrap();
 
-        let bodies: Vec<String> = open(&folder.0, "geral")
+        let bodies: Vec<String> = open(&folder.state, "geral")
             .unwrap()
             .read(ReadRange::default())
             .unwrap()
@@ -493,7 +455,7 @@ mod tests {
     #[test]
     fn read_returns_the_most_recent_messages_before_an_id() {
         let folder = Folder::new("range");
-        let channel = open(&folder.0, "geral").unwrap();
+        let channel = open(&folder.state, "geral").unwrap();
         for body in ["1", "2", "3", "4", "5"] {
             channel.post(human(body), afternoon_in_sao_paulo()).unwrap();
         }
@@ -532,7 +494,7 @@ mod tests {
     #[test]
     fn the_model_keeps_the_author_kind_reply_and_origin_thread() {
         let folder = Folder::new("model");
-        let channel = open(&folder.0, "geral").unwrap();
+        let channel = open(&folder.state, "geral").unwrap();
         let now = afternoon_in_sao_paulo();
         let question = channel.post(human("pergunta"), now).unwrap();
 
@@ -576,7 +538,7 @@ mod tests {
     #[test]
     fn a_reply_to_a_missing_message_is_refused() {
         let folder = Folder::new("reply");
-        let channel = open(&folder.0, "geral").unwrap();
+        let channel = open(&folder.state, "geral").unwrap();
 
         let err = channel
             .post(
@@ -590,13 +552,13 @@ mod tests {
 
         assert_eq!(err.code(), "message_not_found");
         assert_eq!(channel.read(ReadRange::default()).unwrap(), vec![]);
-        assert!(!folder.0.join("channels/geral/channel.sqlite").exists());
+        assert!(!folder.state.join("channels/geral/channel.sqlite").exists());
     }
 
     #[test]
     fn a_message_id_beyond_the_storage_range_is_invalid_input() {
         let folder = Folder::new("overflow");
-        let channel = open(&folder.0, "geral").unwrap();
+        let channel = open(&folder.state, "geral").unwrap();
         channel.post(human("oi"), afternoon_in_sao_paulo()).unwrap();
 
         let reply = channel
@@ -622,25 +584,25 @@ mod tests {
     #[test]
     fn an_empty_message_is_refused() {
         let folder = Folder::new("empty");
-        let channel = open(&folder.0, "geral").unwrap();
+        let channel = open(&folder.state, "geral").unwrap();
 
         let err = channel
             .post(human("  \n"), afternoon_in_sao_paulo())
             .unwrap_err();
 
         assert_eq!(err.code(), "invalid_message");
-        assert!(!folder.0.join("channels/geral/channel.sqlite").exists());
+        assert!(!folder.state.join("channels/geral/channel.sqlite").exists());
     }
 
     #[test]
     fn a_missing_channel_is_not_found_and_creates_nothing() {
         let folder = Folder::new("missing");
 
-        let err = open(&folder.0, "outro").unwrap_err();
+        let err = open(&folder.state, "outro").unwrap_err();
 
         assert_eq!(err.code(), "channel_not_found");
         assert!(err.to_string().contains("#outro"), "{err}");
-        assert!(!folder.0.join("channels/outro").exists());
+        assert!(!folder.state.join("channels/outro").exists());
     }
 
     #[test]
@@ -648,7 +610,7 @@ mod tests {
         let folder = Folder::new("slug");
 
         for name in ["", "Geral", "a b", "../geral", "a--b", "-a", "a-", "ã"] {
-            let err = open(&folder.0, name).unwrap_err();
+            let err = open(&folder.state, name).unwrap_err();
             assert_eq!(err.code(), "invalid_channel_name", "{name:?}");
         }
         assert!(is_slug("code-review2"));

@@ -1543,3 +1543,54 @@ fn channel_message_wire_shape_keeps_optional_fields_out_and_tolerates_newer_serv
         })
     );
 }
+
+#[test]
+fn thread_info_keeps_optional_fields_out_and_tolerates_newer_servers() {
+    let thread = ThreadInfo {
+        id: "t1".into(),
+        agent: "chief".into(),
+        cli: AgentCliKind::Claude,
+        origin: ThreadOriginKind::Channel,
+        channel: None,
+        origin_message_id: None,
+        opener_thread_id: None,
+        depth: 0,
+        isolation: None,
+        state: ThreadState::Done,
+        end_reason: None,
+        session_id: None,
+        pane_id: None,
+        created_at: "2026-11-27T18:04:05Z".into(),
+        updated_at: "2026-11-27T18:04:06Z".into(),
+    };
+
+    assert_eq!(
+        serde_json::to_value(&thread).unwrap(),
+        serde_json::json!({
+            "id": "t1",
+            "agent": "chief",
+            "cli": "claude",
+            "origin": "channel",
+            "depth": 0,
+            "state": "done",
+            "created_at": "2026-11-27T18:04:05Z",
+            "updated_at": "2026-11-27T18:04:06Z",
+        })
+    );
+    let from_newer_server: ThreadInfo = serde_json::from_value(serde_json::json!({
+        "id": "t2", "agent": "chief", "cli": "gemini", "state": "paused",
+        "created_at": "x", "updated_at": "x", "future_field": 1,
+    }))
+    .unwrap();
+    assert_eq!(from_newer_server.state, ThreadState::Unknown);
+    assert_eq!(from_newer_server.cli, AgentCliKind::Unknown);
+    assert_eq!(from_newer_server.origin, ThreadOriginKind::Channel);
+    assert_eq!(from_newer_server.depth, 0);
+    let agent: AgentDefinitionInfo = serde_json::from_value(serde_json::json!({
+        "name": "a", "cli": "gemini", "isolation": "vm", "approval": "ask", "reserved": false,
+    }))
+    .unwrap();
+    assert_eq!(agent.cli, AgentCliKind::Unknown);
+    assert_eq!(agent.isolation, AgentIsolation::Unknown);
+    assert_eq!(agent.approval, AgentApproval::Unknown);
+}

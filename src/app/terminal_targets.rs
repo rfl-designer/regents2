@@ -3,7 +3,8 @@ use super::{api_helpers::pane_agent_status, App};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalTarget {
     pub ws_idx: usize,
-    pub tab_idx: usize,
+    /// `None` for a background pane (a Regents thread), which is in no tab.
+    pub tab_idx: Option<usize>,
     pub pane_id: crate::layout::PaneId,
     pub terminal_id: String,
 }
@@ -26,6 +27,11 @@ pub(crate) enum TerminalTargetError {
     Ambiguous {
         target: String,
         candidates: Vec<TerminalTargetCandidate>,
+    },
+    /// The target is a background pane (a Regents thread), and the operation
+    /// needs a tab.
+    NotInTab {
+        target: String,
     },
 }
 
@@ -136,19 +142,29 @@ impl App {
             .iter()
             .enumerate()
             .flat_map(|(ws_idx, ws)| {
-                ws.tabs.iter().enumerate().flat_map(move |(tab_idx, tab)| {
+                let tab_targets = ws.tabs.iter().enumerate().flat_map(move |(tab_idx, tab)| {
                     tab.layout
                         .pane_ids()
                         .into_iter()
                         .filter_map(move |pane_id| {
                             tab.terminal_id(pane_id).map(|terminal_id| TerminalTarget {
                                 ws_idx,
-                                tab_idx,
+                                tab_idx: Some(tab_idx),
                                 pane_id,
                                 terminal_id: terminal_id.to_string(),
                             })
                         })
-                })
+                });
+                let background_targets =
+                    ws.background_panes
+                        .iter()
+                        .map(move |(&pane_id, pane)| TerminalTarget {
+                            ws_idx,
+                            tab_idx: None,
+                            pane_id,
+                            terminal_id: pane.attached_terminal_id.to_string(),
+                        });
+                tab_targets.chain(background_targets)
             })
             .collect()
     }
@@ -159,7 +175,7 @@ impl App {
         pane_id: crate::layout::PaneId,
     ) -> Option<TerminalTarget> {
         let ws = self.state.workspaces.get(ws_idx)?;
-        let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
+        let tab_idx = ws.find_tab_index_for_pane(pane_id);
         let terminal_id = ws.terminal_id(pane_id)?.to_string();
         Some(TerminalTarget {
             ws_idx,
@@ -174,19 +190,16 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<TerminalTargetCandidate> {
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
-        let pane = ws.pane_state(pane_id)?;
-        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        let pane = self.pane_metadata(ws_idx, pane_id)?;
+        let seen = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?.seen;
+        let terminal = self.state.terminals.get(pane.terminal_id.as_str())?;
         Some(TerminalTargetCandidate {
-            terminal_id: terminal.id.to_string(),
-            pane_id: self.public_pane_id(ws_idx, pane_id)?,
-            workspace_id: self.public_workspace_id(ws_idx),
-            tab_id: self.public_tab_id(ws_idx, tab_idx)?,
-            cwd: ws.tabs[tab_idx]
-                .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
-                .map(|cwd| cwd.display().to_string()),
-            agent_status: pane_agent_status(terminal.state, pane.seen),
+            terminal_id: pane.terminal_id,
+            pane_id: pane.pane_id,
+            workspace_id: pane.workspace_id,
+            tab_id: pane.tab_id,
+            cwd: pane.cwd,
+            agent_status: pane_agent_status(terminal.state, seen),
         })
     }
 }

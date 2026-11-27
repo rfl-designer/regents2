@@ -330,24 +330,34 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
-        let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
+        // A background pane (a Regents thread) is in no tab: its tab ID is
+        // empty, because the required field stays in the wire shape.
+        let tab_idx = ws.find_tab_index_for_pane(pane_id);
+        let tab_id = match tab_idx {
+            Some(tab_idx) => self.public_tab_id(ws_idx, tab_idx)?,
+            None => String::new(),
+        };
         let focused = self.state.active == Some(ws_idx)
-            && ws.active_tab == tab_idx
+            && tab_idx == Some(ws.active_tab)
             && ws
                 .focused_pane_id()
                 .is_some_and(|focused| focused == pane_id);
         let presentation = terminal.effective_presentation();
+        let runtime = self.terminal_runtimes.get(&pane.attached_terminal_id);
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             terminal_id: terminal.id.to_string(),
             workspace_id: self.public_workspace_id(ws_idx),
-            tab_id: self.public_tab_id(ws_idx, tab_idx)?,
+            tab_id,
             focused,
-            cwd: ws.tabs[tab_idx]
-                .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
-                .map(|cwd| cwd.display().to_string()),
-            foreground_cwd: ws.tabs[tab_idx]
-                .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
+            cwd: runtime
+                .and_then(|runtime| runtime.cwd())
+                .unwrap_or_else(|| terminal.cwd.clone())
+                .display()
+                .to_string()
+                .into(),
+            foreground_cwd: runtime
+                .and_then(|runtime| runtime.foreground_cwd())
                 .map(|cwd| cwd.display().to_string()),
             restore_error: terminal.restore_error.clone(),
             label: terminal.manual_label.clone(),

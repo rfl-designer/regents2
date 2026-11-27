@@ -4535,6 +4535,45 @@ fn terminal_observe_allows_multiple_clients_without_attach_ownership() {
 }
 
 #[test]
+fn background_pane_output_never_requests_presentation_work() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("test");
+    let visible_pane = workspace.tabs[0].root_pane;
+    let background_pane = crate::layout::PaneId::alloc();
+    let background_terminal = crate::terminal::TerminalId::alloc();
+    let reserved = workspace.reserve_background_pane_number();
+    workspace.insert_background_pane(
+        reserved,
+        background_pane,
+        crate::pane::PaneState::new(background_terminal.clone()),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.ensure_test_terminals();
+    let (shell_writer, _shell_control_rx, _shell_render_rx) = test_client_writer();
+    server.clients.insert(
+        1,
+        ClientConnection::new(
+            (120, 40),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(shell_writer),
+        ),
+    );
+
+    assert!(!server.pty_sources_visible_to_any_render_target(&HashSet::from([background_pane])));
+    assert!(server.pty_sources_visible_to_any_render_target(&HashSet::from([visible_pane])));
+    server.sync_immediate_pty_sources();
+    server.app.render_dirty.take();
+    server.app.render_dirty.request_pty(background_pane);
+    assert!(!server.has_pending_presentation_work(false, false));
+    let request = server.app.render_dirty.take();
+    assert!(!server.pty_sources_visible_to_any_render_target(&request.pty_sources));
+}
+
+#[test]
 fn direct_terminal_observer_keeps_hidden_pty_source_renderable_with_client_shell() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("test");

@@ -296,9 +296,11 @@ impl App {
                         .public_pane_id(resolved.ws_idx, resolved.pane_id)
                         .unwrap_or_else(|| params.target.clone()),
                     workspace_id,
-                    tab_id: self
-                        .public_tab_id(resolved.ws_idx, resolved.tab_idx)
-                        .unwrap(),
+                    // Empty for a thread pane, which is in no tab.
+                    tab_id: resolved
+                        .tab_idx
+                        .and_then(|tab_idx| self.public_tab_id(resolved.ws_idx, tab_idx))
+                        .unwrap_or_default(),
                     source: params.source,
                     format: params.format,
                     text: snapshot.text,

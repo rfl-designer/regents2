@@ -110,6 +110,12 @@ impl Sandbox {
     }
 
     pub fn start_server(&self) -> SpawnedServer {
+        self.start_server_with_env(&[])
+    }
+
+    /// Starts the server with extra environment, for example a `PATH` with
+    /// fake agent CLIs. Panes inherit it.
+    pub fn start_server_with_env(&self, extra: &[(&str, String)]) -> SpawnedServer {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -126,6 +132,9 @@ impl Sandbox {
             cmd.env(key, value);
         }
         cmd.env("SHELL", "/bin/sh");
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
         cmd.cwd(&self.base);
         cmd.arg("server");
         let child = pair.slave.spawn_command(cmd).unwrap();

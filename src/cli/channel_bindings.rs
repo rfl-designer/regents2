@@ -77,7 +77,20 @@ pub(crate) fn command() -> Command {
 
 pub(crate) fn request(args: &[String]) -> Result<Request, ParseError> {
     let cwd = std::env::current_dir().map_err(ParseError::Io)?;
-    request_in(args, &cwd)
+    let mut request = request_in(args, &cwd)?;
+    if let Method::ChannelPost(params) = &mut request.method {
+        params.origin_thread_id = thread_id_from_env();
+    }
+    Ok(request)
+}
+
+/// The thread of a command that a thread CLI runs: the server sets
+/// `REGENTS_THREAD_ID` in the environment of each thread.
+fn thread_id_from_env() -> Option<String> {
+    std::env::var(crate::regents::THREAD_ID_ENV_VAR)
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
 }
 
 /// Builds the request of a command run in `cwd`. Without `--workspace`, the
@@ -100,7 +113,7 @@ fn request_in(args: &[String], cwd: &Path) -> Result<Request, ParseError> {
 /// Stable ID of the workspace folder that holds `dir`: the nearest ancestor
 /// with `.regents/workspace.toml`. `None` when there is none or it cannot be
 /// read.
-fn folder_workspace_id(dir: &Path) -> Option<String> {
+pub(crate) fn folder_workspace_id(dir: &Path) -> Option<String> {
     let root = dir.ancestors().find(|ancestor| {
         ancestor
             .join(crate::regents::folder::STATE_DIR)

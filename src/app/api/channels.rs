@@ -8,8 +8,9 @@ use crate::api::schema::{
 };
 use crate::app::App;
 use crate::regents::channel::{
-    self, Author, AuthorKind, Channel, ChannelError, Message, NewMessage, ReadRange,
+    self, Author, AuthorKind, ChannelError, Message, NewMessage, ReadRange,
 };
+use crate::regents::{agents, mention};
 
 use super::responses::{encode_error_body, encode_success};
 use super::workspace_folders::FolderWorkspaceError;
@@ -41,8 +42,16 @@ impl App {
             channel,
             body,
             reply_to,
+            origin_thread_id,
         } = params;
-        let (workspace_id, channel) = self.open_channel(workspace_id, &channel)?;
+        let origin_thread_id = origin_thread_id
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty());
+        let (index, state_dir) = self.folder_state_dir(workspace_id)?;
+        let channel = channel::open(&state_dir, &channel)?;
+        let workspace_id = self.public_workspace_id(index);
+        let agents = agents::list(&state_dir);
+        let mentions = mention::resolve(&body, agents.iter().map(|agent| agent.name.as_str()));
         let posted = channel.post(
             NewMessage {
                 author: Author {
@@ -51,12 +60,12 @@ impl App {
                 },
                 body,
                 reply_to,
-                origin_thread_id: None,
-                // Mention resolution comes with the threads (#9).
-                mentions: Vec::new(),
+                origin_thread_id,
+                mentions,
             },
             time::OffsetDateTime::now_utc(),
         )?;
+        self.open_mention_threads(index, &state_dir, &channel, &posted, &agents);
         let message = message_info(posted);
         self.emit_event(EventEnvelope {
             event: EventKind::ChannelMessagePosted,
@@ -81,7 +90,9 @@ impl App {
             before,
             limit,
         } = params;
-        let (workspace_id, channel) = self.open_channel(workspace_id, &channel)?;
+        let (index, state_dir) = self.folder_state_dir(workspace_id)?;
+        let channel = channel::open(&state_dir, &channel)?;
+        let workspace_id = self.public_workspace_id(index);
         let messages = channel.read(ReadRange { before, limit })?;
         Ok(ResponseResult::ChannelMessages {
             workspace_id,
@@ -90,18 +101,17 @@ impl App {
         })
     }
 
-    /// The channel `name` of a folder workspace, with the public ID of the
+    /// The index and the state directory (`<folder>/.regents`) of a folder
     /// workspace. `workspace_id` is a public workspace ID or the stable ID of
     /// an open folder; absent means the active workspace.
-    fn open_channel(
+    pub(super) fn folder_state_dir(
         &mut self,
         workspace_id: Option<String>,
-        name: &str,
-    ) -> Result<(String, Channel), ErrorBody> {
+    ) -> Result<(usize, std::path::PathBuf), ErrorBody> {
         if !self.has_folder_workspaces() {
             return Err(error_body(
                 "unsupported",
-                "channels are available only in regents",
+                "channels, agents and threads are available only in regents",
             ));
         }
         let workspace_id = match workspace_id {
@@ -115,8 +125,7 @@ impl App {
         };
         let (index, binding) = self.folder_workspace(&workspace_id)?;
         let state_dir = binding.root.join(crate::regents::folder::STATE_DIR);
-        let channel = channel::open(&state_dir, name)?;
-        Ok((self.public_workspace_id(index), channel))
+        Ok((index, state_dir))
     }
 
     /// Public ID of the open workspace whose folder has the stable ID `id`.
@@ -131,7 +140,7 @@ impl App {
     }
 }
 
-fn error_body(code: &str, message: impl Into<String>) -> ErrorBody {
+pub(super) fn error_body(code: &str, message: impl Into<String>) -> ErrorBody {
     ErrorBody {
         code: code.into(),
         message: message.into(),

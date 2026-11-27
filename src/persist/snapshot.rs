@@ -312,9 +312,11 @@ fn capture_workspace(
         identity_cwd,
         worktree_space: ws.worktree_space.clone(),
         folder: ws.folder.clone(),
+        // Background panes (Regents threads) are not part of the session.
         public_pane_numbers: ws
             .public_pane_numbers
             .iter()
+            .filter(|(pane_id, _)| !ws.is_background_pane(**pane_id))
             .map(|(pane_id, number)| (pane_id.raw(), *number))
             .collect(),
         next_public_pane_number: ws.next_public_pane_number,

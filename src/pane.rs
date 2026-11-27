@@ -151,6 +151,12 @@ enum PaneLaunchIdentity {
         pane_id: String,
     },
     OmitPane,
+    /// A pane outside every tab (a Regents thread): it has a workspace and a
+    /// pane identity, but no tab.
+    Background {
+        workspace_id: String,
+        pane_id: String,
+    },
 }
 
 impl PaneLaunchEnv {
@@ -170,6 +176,18 @@ impl PaneLaunchEnv {
         self.identity = PaneLaunchIdentity::Managed {
             workspace_id,
             tab_id,
+            pane_id,
+        };
+        self
+    }
+
+    pub(crate) fn with_background_identity(
+        mut self,
+        workspace_id: String,
+        pane_id: String,
+    ) -> Self {
+        self.identity = PaneLaunchIdentity::Background {
+            workspace_id,
             pane_id,
         };
         self
@@ -215,6 +233,14 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         }
         PaneLaunchIdentity::OmitPane => {
             cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
+        }
+        PaneLaunchIdentity::Background {
+            workspace_id,
+            pane_id,
+        } => {
+            cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
+            cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
+            cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
         }
     }
 }

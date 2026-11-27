@@ -172,6 +172,14 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     }
 }
 
+/// A public pane number reserved for a background pane
+/// (`Workspace::reserve_background_pane_number`).
+#[derive(Debug)]
+pub(crate) struct ReservedPaneNumber {
+    number: usize,
+    pub(crate) public_id: String,
+}
+
 /// A named workspace containing tabs.
 pub struct Workspace {
     /// Stable public workspace identity, independent of display order.
@@ -205,6 +213,11 @@ pub struct Workspace {
     pub(crate) next_public_tab_number: usize,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// Panes that run outside every tab layout: Regents threads (ADR-0001).
+    /// Pane lookups find them, so detection, `pane.report_agent` and
+    /// `agent.*` work, but no tab draws them, so their output never triggers
+    /// presentation work. They are not saved in the session.
+    pub(crate) background_panes: HashMap<PaneId, PaneState>,
     #[cfg(test)]
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
 }
@@ -271,6 +284,7 @@ impl Workspace {
             next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
+            background_panes: HashMap::new(),
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         }
@@ -424,6 +438,7 @@ impl Workspace {
                 next_public_tab_number: 2,
                 tabs: vec![tab],
                 active_tab: 0,
+                background_panes: HashMap::new(),
                 #[cfg(test)]
                 test_runtimes: HashMap::new(),
             },
@@ -1095,18 +1110,64 @@ impl Workspace {
             .position(|tab| tab.panes.contains_key(&pane_id))
     }
 
+    /// A pane of a tab or a background pane.
     pub fn pane_state(&self, pane_id: PaneId) -> Option<&PaneState> {
-        self.tabs.iter().find_map(|tab| tab.panes.get(&pane_id))
+        self.tabs
+            .iter()
+            .find_map(|tab| tab.panes.get(&pane_id))
+            .or_else(|| self.background_panes.get(&pane_id))
     }
 
     pub fn pane_state_mut(&mut self, pane_id: PaneId) -> Option<&mut PaneState> {
-        self.tabs
-            .iter_mut()
-            .find_map(|tab| tab.panes.get_mut(&pane_id))
+        if let Some(index) = self.find_tab_index_for_pane(pane_id) {
+            return self.tabs[index].panes.get_mut(&pane_id);
+        }
+        self.background_panes.get_mut(&pane_id)
     }
 
     pub fn terminal_id(&self, pane_id: PaneId) -> Option<&TerminalId> {
-        self.tabs.iter().find_map(|tab| tab.terminal_id(pane_id))
+        self.tabs
+            .iter()
+            .find_map(|tab| tab.terminal_id(pane_id))
+            .or_else(|| {
+                self.background_panes
+                    .get(&pane_id)
+                    .map(|pane| &pane.attached_terminal_id)
+            })
+    }
+
+    pub(crate) fn is_background_pane(&self, pane_id: PaneId) -> bool {
+        self.background_panes.contains_key(&pane_id)
+    }
+
+    /// Reserves a public pane number for a new background pane. The launch
+    /// environment takes `public_id` before the pane exists, and
+    /// `insert_background_pane` registers the same number. A number of a
+    /// pane that fails to start is not reused, as for closed panes.
+    pub(crate) fn reserve_background_pane_number(&mut self) -> ReservedPaneNumber {
+        let number = self.next_public_pane_number;
+        self.next_public_pane_number += 1;
+        ReservedPaneNumber {
+            number,
+            public_id: public_pane_id_for_number(&self.id, number),
+        }
+    }
+
+    /// Adds a pane outside every tab layout with its reserved public number.
+    pub(crate) fn insert_background_pane(
+        &mut self,
+        reserved: ReservedPaneNumber,
+        pane_id: PaneId,
+        pane: PaneState,
+    ) {
+        self.register_new_pane_with_number(pane_id, reserved.number);
+        self.background_panes.insert(pane_id, pane);
+    }
+
+    pub(crate) fn remove_background_pane(&mut self, pane_id: PaneId) -> Option<PaneState> {
+        let pane = self.background_panes.remove(&pane_id)?;
+        self.unregister_pane(pane_id);
+        Some(pane)
     }
 
     pub fn focused_pane_id(&self) -> Option<PaneId> {
@@ -1214,6 +1275,7 @@ impl Workspace {
             next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
+            background_panes: HashMap::new(),
             test_runtimes: HashMap::new(),
         }
     }
@@ -1389,6 +1451,27 @@ impl Workspace {
             max_tab_number
         );
 
+        for (pane_id, pane) in &self.background_panes {
+            assert!(
+                live_panes.insert(*pane_id),
+                "workspace {} background pane {:?} is also in a tab",
+                self.id,
+                pane_id
+            );
+            assert!(
+                self.public_pane_numbers.contains_key(pane_id),
+                "workspace {} background pane {:?} has no public pane number",
+                self.id,
+                pane_id
+            );
+            assert!(
+                terminal_ids.insert(pane.attached_terminal_id.clone()),
+                "workspace {} terminal {} is attached to multiple panes",
+                self.id,
+                pane.attached_terminal_id
+            );
+        }
+
         let public_pane_keys: std::collections::HashSet<_> =
             self.public_pane_numbers.keys().copied().collect();
         assert_eq!(
@@ -1433,6 +1516,37 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_background_pane_is_found_but_belongs_to_no_tab() {
+        let mut ws = Workspace::test_adversarial_identity_state();
+        let tab_count = ws.tabs.len();
+        let reserved = ws.reserve_background_pane_number();
+        let public_id = reserved.public_id.clone();
+        let pane_id = PaneId::alloc();
+        let terminal_id = TerminalId::alloc();
+
+        ws.insert_background_pane(reserved, pane_id, PaneState::new(terminal_id.clone()));
+
+        ws.assert_invariants_for_test();
+        assert_eq!(ws.tabs.len(), tab_count);
+        assert!(ws.tabs.iter().all(|tab| !tab.panes.contains_key(&pane_id)));
+        assert_eq!(ws.find_tab_index_for_pane(pane_id), None);
+        assert!(ws.pane_state(pane_id).is_some());
+        assert!(ws.pane_state_mut(pane_id).is_some());
+        assert_eq!(ws.terminal_id(pane_id), Some(&terminal_id));
+        assert_eq!(
+            public_pane_id_for_number(&ws.id, ws.public_pane_number(pane_id).unwrap()),
+            public_id
+        );
+        assert_ne!(ws.reserve_background_pane_number().public_id, public_id);
+
+        assert!(ws.remove_background_pane(pane_id).is_some());
+
+        ws.assert_invariants_for_test();
+        assert!(ws.pane_state(pane_id).is_none());
+        assert_eq!(ws.public_pane_number(pane_id), None);
+    }
 
     #[test]
     fn generated_workspace_ids_are_short_base32_handles() {

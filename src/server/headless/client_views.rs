@@ -878,11 +878,10 @@ impl HeadlessServer {
         let successful_agent_focus_target = proxied_request_succeeded
             .then(|| {
                 agent_focus_target.as_deref().and_then(|target| {
-                    self.app.resolve_agent_target(target).ok().map(|resolved| {
-                        crate::ui::TabSurfaceTarget {
-                            workspace_index: resolved.ws_idx,
-                            tab_index: resolved.tab_idx,
-                        }
+                    let resolved = self.app.resolve_agent_target(target).ok()?;
+                    Some(crate::ui::TabSurfaceTarget {
+                        workspace_index: resolved.ws_idx,
+                        tab_index: resolved.tab_idx?,
                     })
                 })
             })

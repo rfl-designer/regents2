@@ -13,6 +13,7 @@ pub mod response;
 pub mod server;
 pub mod session;
 pub mod tabs;
+pub mod threads;
 pub mod workspaces;
 pub mod worktrees;
 
@@ -28,6 +29,7 @@ pub use response::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
+pub use threads::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
@@ -154,6 +156,8 @@ operations::define_operations! {
     WorkspaceRemove(WorkspaceRemoveParams) => "workspace.remove", false, false;
     ChannelPost(ChannelPostParams) => "channel.post", false, false;
     ChannelRead(ChannelReadParams) => "channel.read", false, false;
+    ThreadList(ThreadListParams) => "thread.list", false, false;
+    AgentDefinitionList(AgentDefinitionListParams) => "agent.definition.list", false, false;
 }
 
 #[cfg(test)]

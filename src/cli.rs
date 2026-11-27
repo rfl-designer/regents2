@@ -36,6 +36,7 @@ mod spec;
 mod status;
 pub(crate) mod tab;
 mod target;
+pub(crate) mod thread_bindings;
 mod title;
 mod workspace;
 pub(crate) mod workspace_bindings;
@@ -132,7 +133,16 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,
+        "agent"
+            if crate::build_info::is_regents()
+                && thread_bindings::is_regents_agent_command(&args[2..]) =>
+        {
+            run_json_request(thread_bindings::agent_request(&args[2..]))?
+        }
         "agent" => agent::run_agent_command(&args[2..])?,
+        "thread" if crate::build_info::is_regents() => {
+            run_json_request(thread_bindings::thread_request(&args[2..]))?
+        }
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "plugin" => plugin::run_plugin_command(&args[2..])?,
@@ -155,6 +165,7 @@ fn api_group(name: &str) -> Option<clap::Command> {
         "pane" => pane::command(),
         "plugin" => plugin::command(),
         "channel" if crate::build_info::is_regents() => channel_bindings::command(),
+        "thread" if crate::build_info::is_regents() => thread_bindings::command(),
         _ => return None,
     })
 }

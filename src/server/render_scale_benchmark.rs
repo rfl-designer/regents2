@@ -164,6 +164,26 @@ fn active_panes(pane_count: usize) -> Vec<Workspace> {
     vec![workspace]
 }
 
+/// One visible pane plus `thread_count` hidden Regents thread panes, each
+/// with a full scrollback, in no tab.
+fn background_threads(thread_count: usize) -> Vec<Workspace> {
+    let history = history();
+    let mut workspace = Workspace::test_new("bench");
+    let root_pane = workspace.tabs[0].root_pane;
+    workspace.insert_test_runtime(root_pane, runtime(&history));
+    for _ in 0..thread_count {
+        let pane_id = crate::layout::PaneId::alloc();
+        let reserved = workspace.reserve_background_pane_number();
+        workspace.insert_background_pane(
+            reserved,
+            pane_id,
+            crate::pane::PaneState::new(crate::terminal::TerminalId::alloc()),
+        );
+        workspace.insert_test_runtime(pane_id, runtime(&history));
+    }
+    vec![workspace]
+}
+
 fn summarize(mut samples: Vec<Duration>) -> StageStats {
     samples.sort_unstable();
     StageStats {
@@ -610,9 +630,20 @@ async fn render_scale_profile() {
     print_snapshot_encoding_profiles("background workspaces", workspaces);
     print_profiles("active panes (one workspace)", active_panes);
     print_snapshot_encoding_profiles("active panes", active_panes);
+    print_profiles("hidden thread panes (one visible pane)", background_threads);
+    print_snapshot_encoding_profiles("hidden thread panes", background_threads);
     print_token_rule_profiles();
     print_surface_reuse_profiles();
     print_surface_damage_profiles();
+}
+
+/// Render cost of hidden Regents thread panes: 1, 15 and 50 threads next to
+/// one visible pane. The hidden panes are in no tab, so the cost must stay flat.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual hidden thread pane scaling profile"]
+async fn thread_render_scale_profile() {
+    print_profiles("hidden thread panes (one visible pane)", background_threads);
+    print_snapshot_encoding_profiles("hidden thread panes", background_threads);
 }
 
 /// Dirty-row collection while output scrolls a large pane, the host's hot path

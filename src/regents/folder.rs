@@ -124,24 +124,8 @@ fn default_name(root: &Path) -> String {
 
 /// A random 128-bit ID as 32 lowercase hex characters.
 fn new_workspace_id(root: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    use std::hash::BuildHasher;
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    // `RandomState` has random keys for each process and each instance.
-    let random = std::collections::hash_map::RandomState::new().hash_one(nanos);
-    let mut hasher = Sha256::new();
-    hasher.update(nanos.to_le_bytes());
-    hasher.update(random.to_le_bytes());
-    hasher.update(std::process::id().to_le_bytes());
-    hasher.update(root.as_os_str().as_encoded_bytes());
-    hasher
-        .finalize()
+    super::random_bytes(root.as_os_str().as_encoded_bytes())
         .iter()
-        .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }

@@ -315,6 +315,14 @@ pub enum ResponseResult {
         channel: String,
         messages: Vec<super::channels::ChannelMessageInfo>,
     },
+    ThreadList {
+        workspace_id: String,
+        threads: Vec<super::threads::ThreadInfo>,
+    },
+    AgentDefinitionList {
+        workspace_id: String,
+        agents: Vec<super::threads::AgentDefinitionInfo>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

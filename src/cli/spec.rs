@@ -47,6 +47,11 @@ pub(super) fn command() -> Command {
         .subcommand(session_command())
         .subcommand(integration_command())
         .subcommand(plugin_command());
+    let command = if crate::build_info::is_regents() {
+        command.subcommand(super::thread_bindings::command())
+    } else {
+        command
+    };
     configure_help(command, 0)
 }
 

@@ -77,6 +77,11 @@ impl App {
         target: &str,
     ) -> Result<crate::api::schema::AgentInfo, TerminalTargetError> {
         let resolved = self.resolve_agent_target(target)?;
+        if resolved.tab_idx.is_none() {
+            return Err(TerminalTargetError::NotInTab {
+                target: target.to_string(),
+            });
+        }
         self.state
             .focus_pane_in_workspace(resolved.ws_idx, resolved.pane_id);
         self.state.mark_active_tab_seen();
@@ -302,6 +307,12 @@ impl App {
             TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
                 code: "agent_not_found".into(),
                 message: format!("agent target {target} not found"),
+            },
+            TerminalTargetError::NotInTab { target } => crate::api::schema::ErrorBody {
+                code: "agent_not_in_tab".into(),
+                message: format!(
+                    "agent target {target} is a thread pane outside every tab; it cannot take focus"
+                ),
             },
             TerminalTargetError::Ambiguous { target, candidates } => {
                 crate::api::schema::ErrorBody {

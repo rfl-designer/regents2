@@ -21,6 +21,11 @@ cli_params! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reply_to: Option<u64> => Field::new(None)
             .input(bindings::reply_to().order(1)),
+        /// Thread that posts the message. `regents channel post` sends it
+        /// when a thread CLI runs it. A message from a thread opens no new
+        /// thread (delegation comes later).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub origin_thread_id: Option<String> => Field::new(Option::<String>::None),
     }
 }
 

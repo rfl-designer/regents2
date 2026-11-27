@@ -11,6 +11,7 @@ pub(crate) mod plugins;
 pub(super) mod responses;
 mod session;
 mod tabs;
+mod threads;
 mod workspace_folders;
 pub(super) use workspace_folders::folder_info;
 mod workspaces;
@@ -220,6 +221,9 @@ impl App {
                 self.close_popup_pane();
                 return Vec::new();
             }
+            if self.end_exited_thread(*pane_id) {
+                return Vec::new();
+            }
             if worktree_restore_failed {
                 worktree_restore_updates
                     .extend(self.publish_worktree_runtime_agent_release(*pane_id));
@@ -412,6 +416,7 @@ impl App {
         self.sync_toast_deadline(previous_toast);
         self.shutdown_detached_terminal_runtimes();
         pane_updates.extend(worktree_restore_updates);
+        self.observe_thread_states(&pane_updates);
         pane_updates
     }
 
@@ -483,21 +488,18 @@ impl App {
 
     fn sync_full_lifecycle_authority_detection_pauses(&self) {
         for workspace in &self.state.workspaces {
-            for tab in &workspace.tabs {
-                for pane in tab.panes.values() {
-                    let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id)
-                    else {
-                        continue;
-                    };
-                    let Some(runtime) = self.terminal_runtimes.get(&pane.attached_terminal_id)
-                    else {
-                        continue;
-                    };
-                    runtime.set_full_lifecycle_authority_active(
-                        terminal.full_lifecycle_hook_authority_active(),
-                    );
-                    runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
-                }
+            let tab_panes = workspace.tabs.iter().flat_map(|tab| tab.panes.values());
+            for pane in tab_panes.chain(workspace.background_panes.values()) {
+                let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id) else {
+                    continue;
+                };
+                let Some(runtime) = self.terminal_runtimes.get(&pane.attached_terminal_id) else {
+                    continue;
+                };
+                runtime.set_full_lifecycle_authority_active(
+                    terminal.full_lifecycle_hook_authority_active(),
+                );
+                runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
             }
         }
     }
@@ -1282,6 +1284,12 @@ impl App {
             }
             Method::ChannelRead(params) => {
                 return self.handle_channel_read(request.id, params);
+            }
+            Method::ThreadList(params) => {
+                return self.handle_thread_list(request.id, params);
+            }
+            Method::AgentDefinitionList(params) => {
+                return self.handle_agent_definition_list(request.id, params);
             }
             _ => {
                 return responses::encode_error(

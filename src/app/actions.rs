@@ -574,11 +574,16 @@ impl AppState {
         &self,
         ws_idx: usize,
     ) -> Vec<crate::terminal::TerminalId> {
+        // Background panes (Regents threads) close with their workspace.
         self.workspaces
             .get(ws_idx)
             .into_iter()
-            .flat_map(|ws| &ws.tabs)
-            .flat_map(|tab| tab.panes.values())
+            .flat_map(|ws| {
+                ws.tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.values())
+                    .chain(ws.background_panes.values())
+            })
             .map(|pane| pane.attached_terminal_id.clone())
             .collect()
     }
@@ -631,11 +636,11 @@ impl AppState {
     ) {
         for terminal_id in terminal_ids {
             let still_attached = self.workspaces.iter().any(|ws| {
-                ws.tabs.iter().any(|tab| {
-                    tab.panes
-                        .values()
-                        .any(|pane| pane.attached_terminal_id == terminal_id)
-                })
+                ws.tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.values())
+                    .chain(ws.background_panes.values())
+                    .any(|pane| pane.attached_terminal_id == terminal_id)
             });
             if !still_attached
                 && self.terminals.remove(&terminal_id).is_some()
@@ -1836,10 +1841,8 @@ impl AppState {
         let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
         let suppress_active_tab_notifications =
             active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
-        let pane = self.workspaces[ws_idx]
-            .tabs
-            .iter_mut()
-            .find_map(|tab| tab.panes.get_mut(&pane_id))?;
+        let background = self.workspaces[ws_idx].is_background_pane(pane_id);
+        let pane = self.workspaces[ws_idx].pane_state_mut(pane_id)?;
 
         if change.state != AgentState::Idle {
             pane.seen = true;
@@ -1848,7 +1851,9 @@ impl AppState {
         }
         let seen = pane.seen;
 
-        if !suppress_completion {
+        // A background pane (Regents thread) has no tab to point a
+        // notification at; the thread registry reports its progress.
+        if !suppress_completion && !background {
             if let Some(delivery) =
                 self.record_or_deliver_agent_notification(ws_idx, pane_id, change)
             {

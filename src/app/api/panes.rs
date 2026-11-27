@@ -1977,6 +1977,17 @@ impl App {
             return Err(pane_not_found(id, &target.pane_id));
         };
         let workspace_id = self.public_workspace_id(ws_idx);
+        // A thread pane is in no tab: closing it ends its thread.
+        if self.close_thread_pane(pane_id) {
+            self.emit_event(EventEnvelope {
+                event: EventKind::PaneClosed,
+                data: EventData::PaneClosed {
+                    pane_id: public_pane_id,
+                    workspace_id,
+                },
+            });
+            return Ok(());
+        }
         let layout_update_target = self.layout_update_target_after_pane_removal(ws_idx, pane_id);
         if self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
             self.require_restored_group_close_ready(

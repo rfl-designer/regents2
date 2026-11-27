@@ -45,6 +45,10 @@ impl HeadlessServer {
             }
         };
 
+        // Only tab panes move to the new server. Background panes (Regents
+        // threads) do not: after the commit their runtimes drop with the
+        // other unlisted runtimes, which stops their CLI processes, and their
+        // threads become interrupted. Carrying threads across a handoff is #19.
         let mut pane_by_terminal = HashMap::new();
         for ws in &self.app.state.workspaces {
             for tab in &ws.tabs {
@@ -212,6 +216,7 @@ impl HeadlessServer {
             return Err(err);
         }
 
+        self.app.interrupt_running_threads();
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
             if !pane_by_terminal.contains_key(&terminal_id) {
                 continue;
