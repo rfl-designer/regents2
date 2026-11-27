@@ -33,7 +33,7 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
 
 fn server_stop(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: herdr server stop");
+        eprintln!("{}", server_usage("stop"));
         return Ok(2);
     }
 
@@ -52,7 +52,7 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
 
 fn server_reload_config(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: herdr server reload-config");
+        eprintln!("{}", server_usage("reload-config"));
         return Ok(2);
     }
 
@@ -67,7 +67,7 @@ fn server_agent_manifests(args: &[String]) -> std::io::Result<i32> {
         [] => false,
         [flag] if flag == "--json" => true,
         _ => {
-            eprintln!("usage: herdr server agent-manifests [--json]");
+            eprintln!("{}", server_usage("agent-manifests [--json]"));
             return Ok(2);
         }
     };
@@ -86,7 +86,7 @@ fn server_agent_manifests(args: &[String]) -> std::io::Result<i32> {
 
 fn server_reload_agent_manifests(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: herdr server reload-agent-manifests");
+        eprintln!("{}", server_usage("reload-agent-manifests"));
         return Ok(2);
     }
 
@@ -101,7 +101,7 @@ fn server_update_agent_manifests(args: &[String]) -> std::io::Result<i32> {
         [] => false,
         [flag] if flag == "--json" => true,
         _ => {
-            eprintln!("usage: herdr server update-agent-manifests [--json]");
+            eprintln!("{}", server_usage("update-agent-manifests [--json]"));
             return Ok(2);
         }
     };
@@ -254,22 +254,78 @@ fn parse_live_handoff_params(args: &[String]) -> Result<ServerLiveHandoffParams,
     )
 }
 
+/// Usage line for `<binary> server <args>`.
+fn server_usage(args: &str) -> String {
+    format!(
+        "usage: {}",
+        crate::build_info::product_command(&format!("server {args}"))
+    )
+}
+
 fn print_server_help() {
-    eprintln!("herdr server commands:");
-    eprintln!("  herdr server                run as headless server");
+    eprint!("{}", server_help_text());
+}
+
+fn server_help_text() -> String {
+    let p = crate::build_info::product_name();
+    let mut text = format!("{p} server commands:\n");
+    text.push_str(&format!(
+        "  {p} server                run as headless server\n"
+    ));
     #[cfg(windows)]
-    eprintln!("  herdr server --allow-unelevated-clients  allow ordinary same-account clients to control an elevated server");
-    eprintln!("  herdr server stop           stop the running server via the API socket");
-    eprintln!("  herdr server live-handoff   hand off live panes to a new local server");
-    eprintln!("  herdr server reload-config  reload config.toml in the running server");
-    eprintln!("  herdr server agent-manifests [--json]  show agent detection manifest status");
-    eprintln!("  herdr server update-agent-manifests [--json]  fetch and reload agent detection manifests");
-    eprintln!("  herdr server reload-agent-manifests  reload agent detection manifests in the running server");
+    text.push_str(&format!("  {p} server --allow-unelevated-clients  allow ordinary same-account clients to control an elevated server\n"));
+    text.push_str(&format!(
+        "  {p} server stop           stop the running server via the API socket\n"
+    ));
+    text.push_str(&format!(
+        "  {p} server live-handoff   hand off live panes to a new local server\n"
+    ));
+    text.push_str(&format!(
+        "  {p} server reload-config  reload config.toml in the running server\n"
+    ));
+    text.push_str(&format!(
+        "  {p} server agent-manifests [--json]  show agent detection manifest status\n"
+    ));
+    text.push_str(&format!(
+        "  {p} server update-agent-manifests [--json]  fetch and reload agent detection manifests\n"
+    ));
+    text.push_str(&format!(
+        "  {p} server reload-agent-manifests  reload agent detection manifests in the running server\n"
+    ));
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn herdr_server_help_names_herdr() {
+        assert_eq!(server_usage("stop"), "usage: herdr server stop");
+        assert_eq!(
+            server_help_text(),
+            "herdr server commands:\n\
+             \x20 herdr server                run as headless server\n\
+             \x20 herdr server stop           stop the running server via the API socket\n\
+             \x20 herdr server live-handoff   hand off live panes to a new local server\n\
+             \x20 herdr server reload-config  reload config.toml in the running server\n\
+             \x20 herdr server agent-manifests [--json]  show agent detection manifest status\n\
+             \x20 herdr server update-agent-manifests [--json]  fetch and reload agent detection manifests\n\
+             \x20 herdr server reload-agent-manifests  reload agent detection manifests in the running server\n"
+        );
+    }
+
+    #[test]
+    fn regents_server_usage_and_help_name_regents() {
+        let (usage, help) =
+            crate::build_info::as_regents_for_test(|| (server_usage("stop"), server_help_text()));
+
+        assert_eq!(usage, "usage: regents server stop");
+        assert!(help.starts_with("regents server commands:\n  regents server  "));
+        assert!(help.contains("\n  regents server stop  "), "{help}");
+        assert!(!help.contains("herdr"), "{help}");
+    }
 
     #[test]
     fn update_agent_manifest_status_fetches_reloads_then_reads_status() {

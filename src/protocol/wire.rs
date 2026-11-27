@@ -1769,11 +1769,13 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
         VersionCheck::Compatible
     } else if client_version < PROTOCOL_VERSION {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is older than server version {PROTOCOL_VERSION}; please upgrade your herdr client"
+            "client version {client_version} is older than server version {PROTOCOL_VERSION}; please upgrade your {} client",
+            crate::build_info::product_name()
         ))
     } else {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is newer than server version {PROTOCOL_VERSION}; please upgrade the herdr server"
+            "client version {client_version} is newer than server version {PROTOCOL_VERSION}; please upgrade the {} server",
+            crate::build_info::product_name()
         ))
     }
 }
@@ -3291,6 +3293,31 @@ mod tests {
         if let VersionCheck::Incompatible(msg) = result {
             assert!(msg.contains("newer"), "error should mention newer version");
         }
+    }
+
+    #[test]
+    fn regents_version_mismatch_asks_to_upgrade_regents() {
+        let (older, newer) = crate::build_info::as_regents_for_test(|| {
+            (
+                check_client_version(PROTOCOL_VERSION - 1),
+                check_client_version(PROTOCOL_VERSION + 1),
+            )
+        });
+
+        let VersionCheck::Incompatible(older) = older else {
+            panic!("older client must be rejected");
+        };
+        let VersionCheck::Incompatible(newer) = newer else {
+            panic!("newer client must be rejected");
+        };
+        assert!(
+            older.ends_with("please upgrade your regents client"),
+            "{older}"
+        );
+        assert!(
+            newer.ends_with("please upgrade the regents server"),
+            "{newer}"
+        );
     }
 
     // ---- Pre-persistence client rejection ----

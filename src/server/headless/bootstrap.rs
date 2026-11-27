@@ -48,7 +48,10 @@ pub fn run_server() -> io::Result<()> {
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: herdr server is already running");
+            eprintln!(
+                "error: {}",
+                crate::server::socket_paths::server_already_running_message()
+            );
             eprintln!("api socket: {}", api::socket_path().display());
             std::process::exit(1);
         }
@@ -81,7 +84,10 @@ pub fn run_server() -> io::Result<()> {
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: herdr server is already running");
+                eprintln!(
+                    "error: {}",
+                    crate::server::socket_paths::server_already_running_message()
+                );
                 eprintln!("client socket: {}", client_socket_path().display());
                 std::process::exit(1);
             }
@@ -231,23 +237,67 @@ fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<()
 }
 
 fn print_ready_message(api_socket: &Path, client_socket: &Path) {
-    let message = format!(
-        "herdr server running; you can use any herdr CLI command in another terminal.\n\
+    let log_path = crate::session::data_dir().join("herdr-server.log");
+    let message = ready_message(api_socket, client_socket, &log_path);
+    // The launching terminal may already be gone; the server keeps running.
+    let _ = io::Write::write_all(&mut io::stderr(), message.as_bytes());
+}
+
+fn ready_message(api_socket: &Path, client_socket: &Path, log_path: &Path) -> String {
+    let product = crate::build_info::product_name();
+    format!(
+        "{product} server running; you can use any {product} CLI command in another terminal.\n\
          api socket: {}\n\
          client socket: {}\n\
          logs: {}\n\
-         did you mean to open the Herdr TUI? run `herdr`; you do not need `herdr server`.\n",
+         did you mean to open the {} TUI? run `{}`; you do not need `{}`.\n",
         api_socket.display(),
         client_socket.display(),
-        crate::session::data_dir()
-            .join("herdr-server.log")
-            .display()
-    );
-    // The launching terminal may already be gone; the server keeps running.
-    let _ = io::Write::write_all(&mut io::stderr(), message.as_bytes());
+        log_path.display(),
+        crate::build_info::product_display_name(),
+        crate::build_info::product_name(),
+        crate::build_info::product_command("server"),
+    )
 }
 
 /// Initialize logging for the server process.
 fn init_logging() {
     crate::logging::init_file_logging("herdr-server.log");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    fn ready_message() -> String {
+        super::ready_message(
+            Path::new("/tmp/s/herdr.sock"),
+            Path::new("/tmp/s/herdr-client.sock"),
+            Path::new("/tmp/s/herdr-server.log"),
+        )
+    }
+
+    #[test]
+    fn herdr_ready_message_names_herdr() {
+        assert_eq!(
+            ready_message(),
+            "herdr server running; you can use any herdr CLI command in another terminal.\n\
+             api socket: /tmp/s/herdr.sock\n\
+             client socket: /tmp/s/herdr-client.sock\n\
+             logs: /tmp/s/herdr-server.log\n\
+             did you mean to open the Herdr TUI? run `herdr`; you do not need `herdr server`.\n"
+        );
+    }
+
+    #[test]
+    fn regents_ready_message_names_regents() {
+        assert_eq!(
+            crate::build_info::as_regents_for_test(ready_message),
+            "regents server running; you can use any regents CLI command in another terminal.\n\
+             api socket: /tmp/s/herdr.sock\n\
+             client socket: /tmp/s/herdr-client.sock\n\
+             logs: /tmp/s/herdr-server.log\n\
+             did you mean to open the Regents TUI? run `regents`; you do not need `regents server`.\n"
+        );
+    }
 }

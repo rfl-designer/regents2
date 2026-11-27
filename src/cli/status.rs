@@ -401,10 +401,11 @@ fn current_exe_label() -> String {
 }
 
 fn print_status_help() {
-    eprintln!("herdr status commands:");
-    eprintln!("  herdr status [--json]         show local client and running server status");
-    eprintln!("  herdr status server [--json]  show running server status");
-    eprintln!("  herdr status client [--json]  show local client binary status");
+    let p = crate::build_info::product_name();
+    eprintln!("{p} status commands:");
+    eprintln!("  {p} status [--json]         show local client and running server status");
+    eprintln!("  {p} status server [--json]  show running server status");
+    eprintln!("  {p} status client [--json]  show local client binary status");
 }
 
 #[cfg(test)]

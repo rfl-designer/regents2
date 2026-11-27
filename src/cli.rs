@@ -397,8 +397,15 @@ fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
         "Removed [keys], [keys.indexed], and [[keys.command]] from {}.",
         path.display()
     );
-    println!("Built-in v2 keybindings will apply after Herdr restarts or reloads config.");
-    println!("If a Herdr server is running, run `herdr server reload-config` to apply this now.");
+    println!(
+        "Built-in v2 keybindings will apply after {} restarts or reloads config.",
+        crate::build_info::product_display_name()
+    );
+    println!(
+        "If a {} server is running, run `{}` to apply this now.",
+        crate::build_info::product_display_name(),
+        crate::build_info::product_command("server reload-config")
+    );
     println!(
         "To restore: cp {} {}",
         backup_path.display(),
@@ -467,15 +474,23 @@ fn session_attach_help(args: &[String]) -> std::io::Result<i32> {
         args.first().map(String::as_str),
         Some("help" | "--help" | "-h")
     ) {
-        eprintln!("usage: herdr session attach <name>");
+        eprintln!("{}", session_usage("attach <name>"));
         return Ok(0);
     }
-    eprintln!("usage: herdr session attach <name>");
+    eprintln!("{}", session_usage("attach <name>"));
     Ok(2)
 }
 
+/// Usage line for `<binary> session <args>`.
+fn session_usage(args: &str) -> String {
+    format!(
+        "usage: {}",
+        crate::build_info::product_command(&format!("session {args}"))
+    )
+}
+
 fn session_list(args: &[String]) -> std::io::Result<i32> {
-    let json = match parse_session_json_only(args, "usage: herdr session list [--json]") {
+    let json = match parse_session_json_only(args, &session_usage("list [--json]")) {
         Ok(json) => json,
         Err(code) => return Ok(code),
     };
@@ -493,7 +508,7 @@ fn session_list(args: &[String]) -> std::io::Result<i32> {
 
 fn session_stop(args: &[String]) -> std::io::Result<i32> {
     let (name, json) =
-        match parse_session_name_and_json(args, "usage: herdr session stop <name> [--json]") {
+        match parse_session_name_and_json(args, &session_usage("stop <name> [--json]")) {
             Ok(parsed) => parsed,
             Err(code) => return Ok(code),
         };
@@ -526,7 +541,7 @@ fn session_stop(args: &[String]) -> std::io::Result<i32> {
 
 fn session_delete(args: &[String]) -> std::io::Result<i32> {
     let (name, json) =
-        match parse_session_name_and_json(args, "usage: herdr session delete <name> [--json]") {
+        match parse_session_name_and_json(args, &session_usage("delete <name> [--json]")) {
             Ok(parsed) => parsed,
             Err(code) => return Ok(code),
         };
@@ -993,12 +1008,19 @@ fn print_terminal_help() {
 }
 
 fn print_session_help() {
-    eprintln!("herdr session commands:");
-    eprintln!("  herdr session list [--json]");
-    eprintln!("  herdr session attach <name>");
-    eprintln!("  herdr session stop <name> [--json]");
-    eprintln!("  herdr session delete <name> [--json]");
-    eprintln!("  use 'default' as <name> to target the default session for stop");
+    eprint!("{}", session_help_text());
+}
+
+fn session_help_text() -> String {
+    let p = crate::build_info::product_name();
+    format!(
+        "{p} session commands:\n  \
+         {p} session list [--json]\n  \
+         {p} session attach <name>\n  \
+         {p} session stop <name> [--json]\n  \
+         {p} session delete <name> [--json]\n  \
+         use 'default' as <name> to target the default session for stop\n"
+    )
 }
 
 fn _print_json<T: Serialize>(value: &T) {
@@ -1007,6 +1029,43 @@ fn _print_json<T: Serialize>(value: &T) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn herdr_session_help_names_herdr() {
+        assert_eq!(
+            super::session_help_text(),
+            "herdr session commands:\n  herdr session list [--json]\n  herdr session attach <name>\n  herdr session stop <name> [--json]\n  herdr session delete <name> [--json]\n  use 'default' as <name> to target the default session for stop\n"
+        );
+    }
+
+    #[test]
+    fn regents_session_help_and_usage_name_regents() {
+        let (help, usages) = crate::build_info::as_regents_for_test(|| {
+            (
+                super::session_help_text(),
+                [
+                    super::session_usage("attach <name>"),
+                    super::session_usage("list [--json]"),
+                    super::session_usage("stop <name> [--json]"),
+                    super::session_usage("delete <name> [--json]"),
+                ],
+            )
+        });
+
+        assert_eq!(
+            help,
+            "regents session commands:\n  regents session list [--json]\n  regents session attach <name>\n  regents session stop <name> [--json]\n  regents session delete <name> [--json]\n  use 'default' as <name> to target the default session for stop\n"
+        );
+        assert_eq!(
+            usages,
+            [
+                "usage: regents session attach <name>",
+                "usage: regents session list [--json]",
+                "usage: regents session stop <name> [--json]",
+                "usage: regents session delete <name> [--json]",
+            ]
+        );
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(

@@ -28,6 +28,13 @@ pub struct SessionInfo {
     pub session_dir: String,
 }
 
+fn session_attach_usage() -> String {
+    format!(
+        "usage: {}",
+        crate::build_info::product_command("session attach <name>")
+    )
+}
+
 pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     let mut cleaned = Vec::with_capacity(args.len());
     if let Some(program) = args.first() {
@@ -44,10 +51,10 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
             return Ok(args.to_vec());
         }
         let Some(name) = args.get(3) else {
-            return Err("usage: herdr session attach <name>".to_string());
+            return Err(session_attach_usage());
         };
         if args.len() != 4 {
-            return Err("usage: herdr session attach <name>".to_string());
+            return Err(session_attach_usage());
         }
         apply_explicit_name(name)?;
         return Ok(cleaned);
@@ -104,8 +111,8 @@ pub fn active_name() -> Option<String> {
 
 pub fn local_attach_command() -> String {
     match active_name() {
-        Some(name) => format!("herdr session attach {name}"),
-        None => "herdr".to_string(),
+        Some(name) => crate::build_info::product_command(&format!("session attach {name}")),
+        None => crate::build_info::product_name().to_string(),
     }
 }
 
@@ -115,15 +122,18 @@ pub fn local_stop_command() -> String {
 
 pub fn stop_command_for(name: Option<&str>) -> String {
     match name {
-        Some(name) => format!("herdr session stop {name}"),
-        None => "herdr server stop".to_string(),
+        Some(name) => crate::build_info::product_command(&format!("session stop {name}")),
+        None => crate::build_info::product_command("server stop"),
     }
 }
 
 pub fn restart_after_update_guidance(stop_command: &str, attach_command: Option<&str>) -> String {
     let restart = match attach_command {
         Some(command) => format!("Run `{stop_command}`, then run `{command}` again."),
-        None => format!("Run `{stop_command}`, then restart Herdr with the same socket override."),
+        None => format!(
+            "Run `{stop_command}`, then restart {} with the same socket override.",
+            crate::build_info::product_display_name()
+        ),
     };
     format!(
         "Stop the old server to use the new version.\nStopping exits pane processes.\n{restart}"
@@ -135,9 +145,10 @@ pub fn active_restart_after_update_guidance() -> String {
         if let Ok(socket_path) = std::env::var(crate::api::SOCKET_PATH_ENV_VAR) {
             return restart_after_update_guidance(
                 &format!(
-                    "{}={} herdr server stop",
+                    "{}={} {}",
                     crate::api::SOCKET_PATH_ENV_VAR,
-                    socket_path
+                    socket_path,
+                    crate::build_info::product_command("server stop")
                 ),
                 None,
             );
@@ -345,7 +356,8 @@ fn exact_session_dir_for_delete(name: &str) -> Result<Option<PathBuf>, String> {
     // filesystems. Never probe its socket or delete it without an exact entry.
     match std::fs::symlink_metadata(sessions_dir.join(name)) {
         Ok(_) => Err(format!(
-            "session {name} does not match an exact session name; use the spelling shown by `herdr session list`"
+            "session {name} does not match an exact session name; use the spelling shown by `{}`",
+            crate::build_info::product_command("session list")
         )),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.to_string()),
@@ -503,6 +515,7 @@ fn normalize_name(name: &str) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{EnvVarGuard, EnvVarsRemovedGuard};
     #[cfg(unix)]
     use interprocess::local_socket::traits::Listener as _;
     use std::sync::Mutex;
@@ -995,6 +1008,98 @@ mod tests {
         );
 
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    }
+
+    #[test]
+    fn regents_named_session_hints_suggest_regents_session_commands() {
+        let _guard = env_lock().lock().unwrap();
+        let _session = EnvVarGuard::set(SESSION_ENV_VAR, "work");
+        let _socket = EnvVarsRemovedGuard::new(&[crate::api::SOCKET_PATH_ENV_VAR]);
+        clear_explicit_session_for_test();
+
+        let (attach, stop, guidance) = crate::build_info::as_regents_for_test(|| {
+            (
+                local_attach_command(),
+                local_stop_command(),
+                active_restart_after_update_guidance(),
+            )
+        });
+
+        assert_eq!(attach, "regents session attach work");
+        assert_eq!(stop, "regents session stop work");
+        assert_eq!(
+            guidance,
+            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `regents session stop work`, then run `regents session attach work` again."
+        );
+    }
+
+    #[test]
+    fn regents_default_session_hints_suggest_regents_server_stop() {
+        let _guard = env_lock().lock().unwrap();
+        let _session = EnvVarsRemovedGuard::new(&[SESSION_ENV_VAR]);
+
+        let (attach, stop) = crate::build_info::as_regents_for_test(|| {
+            (local_attach_command(), local_stop_command())
+        });
+
+        assert_eq!(attach, "regents");
+        assert_eq!(stop, "regents server stop");
+    }
+
+    #[test]
+    fn regents_restart_guidance_with_socket_override_names_regents() {
+        let _guard = env_lock().lock().unwrap();
+        let _socket = EnvVarGuard::set(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/custom-herdr.sock");
+        let _session = EnvVarsRemovedGuard::new(&[SESSION_ENV_VAR]);
+        clear_explicit_session_for_test();
+
+        let guidance = crate::build_info::as_regents_for_test(active_restart_after_update_guidance);
+
+        assert_eq!(
+            guidance,
+            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `HERDR_SOCKET_PATH=/tmp/custom-herdr.sock regents server stop`, then restart Regents with the same socket override."
+        );
+    }
+
+    #[test]
+    fn regents_session_attach_usage_names_regents() {
+        let _guard = env_lock().lock().unwrap();
+        let args: Vec<String> = ["regents", "session", "attach"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+
+        let err = crate::build_info::as_regents_for_test(|| configure_from_args(&args))
+            .expect_err("attach without a name is a usage error");
+
+        clear_explicit_session_for_test();
+        assert_eq!(err, "usage: regents session attach <name>");
+    }
+
+    #[test]
+    fn regents_inexact_session_name_points_to_regents_session_list() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("regents-session-inexact-{}", std::process::id()));
+        let config_home_str = config_home.to_str().expect("utf-8 temp path");
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_home_str);
+
+        let err = crate::build_info::as_regents_for_test(|| {
+            let sessions_dir = crate::config::config_dir().join("sessions");
+            std::fs::create_dir_all(sessions_dir.join("Work")).unwrap();
+            exact_session_dir_for_delete("work")
+        });
+
+        let _ = std::fs::remove_dir_all(&config_home);
+        match err {
+            // Case-insensitive file systems resolve `work` to `Work`.
+            Err(message) => assert_eq!(
+                message,
+                "session work does not match an exact session name; use the spelling shown by `regents session list`"
+            ),
+            // Case-sensitive file systems have no entry to confuse.
+            Ok(dir) => assert_eq!(dir, None),
+        }
     }
 
     #[test]

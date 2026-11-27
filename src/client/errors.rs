@@ -26,7 +26,9 @@ impl std::fmt::Display for ClientError {
                 let path = client_socket_path();
                 write!(
                     f,
-                    "\nIs herdr server running? Start it with `herdr server`."
+                    "\nIs {} server running? Start it with `{}`.",
+                    crate::build_info::product_name(),
+                    crate::build_info::product_command("server")
                 )?;
                 write!(f, "\nSocket path: {}", path.display())
             }

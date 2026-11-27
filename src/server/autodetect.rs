@@ -155,7 +155,8 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
 fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<()> {
     let Some(status) = read_server_status()? else {
         return Err(io::Error::other(format!(
-            "a herdr server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
+            "a {} server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
+            crate::build_info::product_name(),
             crate::session::active_restart_after_update_guidance()
         )));
     };
@@ -176,7 +177,8 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
         "the stable endpoint generation is incompatible"
     };
     Err(io::Error::other(format!(
-        "This session needs one final server update before Herdr can attach ({requirement}).\n\nserver: v{} endpoint generation {}\nclient: v{} endpoint generation {}\n\n{}",
+        "This session needs one final server update before {} can attach ({requirement}).\n\nserver: v{} endpoint generation {}\nclient: v{} endpoint generation {}\n\n{}",
+        crate::build_info::product_display_name(),
         status.version.as_deref().unwrap_or("unknown"),
         endpoint_generation
             .map(|value| value.to_string())
@@ -280,9 +282,10 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
-            "server did not become ready within {}s (socket: {}). The background server may still be starting; try `herdr` again, or check {}",
+            "server did not become ready within {}s (socket: {}). The background server may still be starting; try `{}` again, or check {}",
             timeout.as_secs(),
             socket_path.display(),
+            crate::build_info::product_name(),
             crate::session::data_dir().join("herdr-server.log").display()
         ),
     ))

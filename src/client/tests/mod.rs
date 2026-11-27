@@ -1,5 +1,5 @@
 use super::*;
-use std::ffi::OsString;
+use crate::test_env::{EnvVarGuard, EnvVarsRemovedGuard};
 use std::sync::{Mutex, OnceLock};
 
 fn env_lock() -> &'static Mutex<()> {
@@ -167,33 +167,6 @@ fn server_graphics_files_require_local_filesystem_not_just_local_terminal() {
     assert!(!server_graphics_files_allowed(&ssh, true));
 }
 
-fn restore_env_var(key: &str, value: Option<OsString>) {
-    if let Some(value) = value {
-        std::env::set_var(key, value);
-    } else {
-        std::env::remove_var(key);
-    }
-}
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        restore_env_var(self.key, self.previous.clone());
-    }
-}
-
 #[test]
 fn windows_virtual_terminal_input_mode_sets_only_vti_bit() {
     assert_eq!(windows_virtual_terminal_input_mode(0x01f0), 0x03f0);
@@ -221,31 +194,6 @@ fn windows_win32_input_mode_defaults_to_win32_and_honors_probe() {
     }
     let _probe = EnvVarGuard::set("HERDR_WINDOWS_INPUT_PROBE", "win32");
     assert!(windows_win32_input_mode_enabled());
-}
-
-struct EnvVarsRemovedGuard {
-    previous: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl EnvVarsRemovedGuard {
-    fn new(keys: &[&'static str]) -> Self {
-        let previous: Vec<_> = keys
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        for key in keys {
-            std::env::remove_var(key);
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for EnvVarsRemovedGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.clone() {
-            restore_env_var(key, value);
-        }
-    }
 }
 
 #[test]
@@ -613,6 +561,38 @@ fn client_error_display_connection_failed() {
     assert!(
         msg.contains("herdr server"),
         "should suggest starting server: {msg}"
+    );
+}
+
+#[test]
+fn regents_client_error_display_connection_failed_suggests_regents_server() {
+    let err = ClientError::ConnectionFailed(io::Error::new(
+        io::ErrorKind::ConnectionRefused,
+        "connection refused",
+    ));
+
+    let msg = crate::build_info::as_regents_for_test(|| err.to_string());
+
+    assert!(
+        msg.contains("Is regents server running? Start it with `regents server`."),
+        "{msg}"
+    );
+}
+
+#[test]
+fn regents_client_error_display_detached_named_session_reattach_hint() {
+    let _guard = env_lock().lock().unwrap();
+    let _remote_env = EnvVarsRemovedGuard::new(&[crate::remote::REATTACH_COMMAND_ENV_VAR]);
+    let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
+    let err = ClientError::ServerShutdown {
+        reason: Some("detached".into()),
+    };
+
+    let msg = crate::build_info::as_regents_for_test(|| err.to_string());
+
+    assert!(
+        msg.contains("Run `regents session attach work` to reattach"),
+        "{msg}"
     );
 }
 

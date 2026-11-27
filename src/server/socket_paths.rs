@@ -63,10 +63,19 @@ pub(crate) fn derive_client_socket_from_api_socket(api_socket_path: &Path) -> Pa
 pub(crate) fn prepare_socket_path(path: &Path) -> io::Result<()> {
     crate::ipc::prepare_socket_path(path, |path| {
         format!(
-            "herdr server is already running (socket busy at {})",
+            "{} (socket busy at {})",
+            server_already_running_message(),
             path.display()
         )
     })
+}
+
+/// `herdr server is already running`, with the running binary's name.
+pub(crate) fn server_already_running_message() -> String {
+    format!(
+        "{} server is already running",
+        crate::build_info::product_name()
+    )
 }
 
 /// Restricts socket file permissions to owner-only (0o600).
@@ -168,5 +177,37 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AddrInUse);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regents_live_socket_error_names_regents_server() {
+        let dir = PathBuf::from(format!(
+            "/tmp/hr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let socket_path = dir.join("live.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let (err, message) = crate::build_info::as_regents_for_test(|| {
+            (
+                prepare_socket_path(&socket_path).expect_err("live socket is busy"),
+                server_already_running_message(),
+            )
+        });
+
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "regents server is already running (socket busy at {})",
+                socket_path.display()
+            )
+        );
+        assert_eq!(message, "regents server is already running");
     }
 }

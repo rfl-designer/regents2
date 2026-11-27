@@ -370,8 +370,11 @@ pub(crate) fn integration_update_instructions(
         .iter()
         .map(|target| {
             format!(
-                "`herdr integration install {}`",
-                integration_target_label(*target)
+                "`{}`",
+                crate::build_info::product_command(&format!(
+                    "integration install {}",
+                    integration_target_label(*target)
+                ))
             )
         })
         .collect();

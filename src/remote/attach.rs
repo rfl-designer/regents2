@@ -1595,9 +1595,10 @@ pub(super) fn find_installed_remote_herdr(ssh: &RemoteSsh) -> io::Result<RemoteH
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         format!(
-            "matching Herdr is not ready on {}; run `herdr --remote {}` interactively to install or update it",
+            "matching {} is not ready on {}; run `{}` interactively to install or update it",
+            crate::build_info::product_display_name(),
             ssh.target(),
-            ssh.target()
+            crate::build_info::product_command(&format!("--remote {}", ssh.target()))
         ),
     ))
 }

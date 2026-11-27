@@ -345,3 +345,72 @@ fn regents_refuses_to_self_update_from_herdr_releases() {
         "{stderr}"
     );
 }
+
+/// Runs `regents workspace add` with no server running and returns its output.
+fn regents_workspace_add_without_server(sandbox: &Sandbox, extra: &[(&str, &str)]) -> String {
+    let folder = sandbox.base.join("home").join("ws");
+    fs::create_dir_all(&folder).unwrap();
+    let output = sandbox
+        .command(REGENTS_BIN)
+        .envs(extra.iter().copied())
+        .args(["workspace", "add"])
+        .arg(&folder)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn regents_server_not_running_error_names_regents() {
+    let sandbox = Sandbox::new();
+
+    let output = regents_workspace_add_without_server(&sandbox, &[]);
+
+    assert!(output.contains("server_not_running"), "{output}");
+    assert!(output.contains("no regents server is running"), "{output}");
+    assert!(
+        output.contains("run `regents` to start or attach it"),
+        "{output}"
+    );
+    assert!(!output.contains("herdr server"), "{output}");
+}
+
+#[test]
+fn regents_server_not_running_error_suggests_regents_session_attach() {
+    let sandbox = Sandbox::new();
+
+    let output = regents_workspace_add_without_server(&sandbox, &[("HERDR_SESSION", "work")]);
+
+    assert!(
+        output.contains("run `regents session attach work` to start or attach it"),
+        "{output}"
+    );
+}
+
+#[test]
+fn regents_server_not_running_error_with_socket_override_suggests_regents() {
+    let sandbox = Sandbox::new();
+    let custom_socket = sandbox.base.join("custom.sock");
+
+    let output = regents_workspace_add_without_server(
+        &sandbox,
+        &[
+            ("HERDR_SESSION", "work"),
+            ("HERDR_SOCKET_PATH", custom_socket.to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        output.contains(&format!(
+            "no regents server is running at {}; run `regents` to start or attach it",
+            custom_socket.display()
+        )),
+        "{output}"
+    );
+}
