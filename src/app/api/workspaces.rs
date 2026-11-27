@@ -12,6 +12,7 @@ use super::responses::{encode_error, encode_success};
 
 impl App {
     pub(super) fn handle_workspace_list(&mut self, id: String) -> String {
+        self.refresh_folder_connections();
         encode_success(
             id,
             ResponseResult::WorkspaceList {

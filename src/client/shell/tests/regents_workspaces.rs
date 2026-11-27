@@ -1,5 +1,5 @@
-//! Regents workspaces in the client shell: the legacy mark in the sidebar and
-//! the screen when no workspace is open.
+//! Regents workspaces in the client shell: the legacy and disconnected marks
+//! in the sidebar and the screen when no workspace is open.
 
 use super::*;
 
@@ -40,6 +40,24 @@ fn a_legacy_workspace_is_marked_in_the_sidebar() {
         .unwrap_or_else(|| panic!("no workspace row:\n{marked}"));
     assert!(row.contains("legacy"), "{marked}");
     assert!(!unmarked.contains("legacy"), "{unmarked}");
+}
+
+#[test]
+fn a_disconnected_workspace_is_marked_in_the_sidebar() {
+    let mut plain = snapshot();
+    plain.workspaces[0].label = "moved".into();
+    let mut disconnected = plain.clone();
+    disconnected.workspaces[0].disconnected = true;
+
+    let marked = composed_text(disconnected);
+    let unmarked = composed_text(plain);
+
+    let row = marked
+        .lines()
+        .find(|line| line.contains("moved"))
+        .unwrap_or_else(|| panic!("no workspace row:\n{marked}"));
+    assert!(row.contains("disconnected"), "{marked}");
+    assert!(!unmarked.contains("disconnected"), "{unmarked}");
 }
 
 /// Composed text of a server snapshot with no workspace.

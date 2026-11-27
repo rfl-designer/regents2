@@ -61,6 +61,12 @@ pub(crate) fn read_manifest(root: &Path) -> io::Result<WorkspaceManifest> {
     Ok(manifest)
 }
 
+/// True when `root` holds the workspace `id`. False when the folder or its
+/// `workspace.toml` is gone, unreadable or names another workspace.
+pub(crate) fn holds_workspace(root: &Path, id: &str) -> bool {
+    read_manifest(root).is_ok_and(|manifest| manifest.id == id)
+}
+
 /// Opens the workspace in `root`. A folder without `.regents/` receives the
 /// initial structure. A folder that has `.regents/` keeps its files: this
 /// function only creates the items that are missing and never overwrites one.

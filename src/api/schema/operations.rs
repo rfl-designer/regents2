@@ -164,6 +164,7 @@ mod tests {
             "workspace.report_metadata",
             "workspace.add",
             "workspace.link",
+            "workspace.relink",
             "workspace.close",
             "worktree.create",
             "worktree.open",

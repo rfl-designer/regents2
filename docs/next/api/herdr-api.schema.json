@@ -1098,6 +1098,10 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "disconnected": {
+              "description": "Regents disconnected workspace: its folder is no longer at the known\npath. `workspace.relink` binds it to the new path. Absent means false.",
+              "type": "boolean"
+            },
             "focused": {
               "type": "boolean"
             },
@@ -4515,6 +4519,35 @@
           ],
           "type": "object"
         },
+        "WorkspaceRelinkParams": {
+          "properties": {
+            "id": {
+              "description": "Stable ID of the disconnected workspace, from `workspace.toml`.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Absolute path of the new folder on the server host. Its\n`workspace.toml` must have the same ID.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "path"
+          ],
+          "type": "object"
+        },
+        "WorkspaceRemoveParams": {
+          "properties": {
+            "id": {
+              "description": "Stable ID of the registered workspace, from `workspace.toml`. The\nfolder stays on disk.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
         "WorkspaceRenameParams": {
           "properties": {
             "label": {
@@ -6417,6 +6450,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorkspaceLinkParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workspace.relink",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceRelinkParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workspace.remove",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceRemoveParams"
             }
           },
           "required": [
@@ -9296,6 +9361,10 @@
         "RegisteredWorkspaceInfo": {
           "description": "A folder in the global workspace registry.",
           "properties": {
+            "disconnected": {
+              "description": "The folder is no longer at `path`; `id` is the last known ID.\nAbsent means false.",
+              "type": "boolean"
+            },
             "id": {
               "description": "ID from `.regents/workspace.toml`; absent when the file cannot be read.",
               "type": [
@@ -10653,6 +10722,40 @@
                 "already_registered"
               ],
               "type": "object"
+            },
+            {
+              "description": "A disconnected workspace is registered at its new folder.",
+              "properties": {
+                "type": {
+                  "const": "workspace_relinked",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/success_response/$defs/RegisteredWorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The workspace left the registry; its folder is unchanged.",
+              "properties": {
+                "type": {
+                  "const": "workspace_removed",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/success_response/$defs/RegisteredWorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -10834,6 +10937,10 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "disconnected": {
+              "description": "Regents disconnected workspace: its folder is no longer at the known\npath. `workspace.relink` binds it to the new path. Absent means false.",
+              "type": "boolean"
             },
             "focused": {
               "type": "boolean"

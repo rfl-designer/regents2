@@ -298,6 +298,14 @@ pub enum ResponseResult {
         /// The folder was already in the registry.
         already_registered: bool,
     },
+    /// A disconnected workspace is registered at its new folder.
+    WorkspaceRelinked {
+        workspace: super::workspaces::RegisteredWorkspaceInfo,
+    },
+    /// The workspace left the registry; its folder is unchanged.
+    WorkspaceRemoved {
+        workspace: super::workspaces::RegisteredWorkspaceInfo,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

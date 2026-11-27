@@ -1040,6 +1040,10 @@ pub struct ClientShellWorkspace {
     /// Regents legacy workspace (no folder). Optional for older servers.
     #[serde(default)]
     pub legacy: bool,
+    /// Regents disconnected workspace (its folder moved). Optional for older
+    /// servers.
+    #[serde(default)]
+    pub disconnected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2839,6 +2843,7 @@ mod tests {
                 focused: true,
                 agent_status: crate::api::schema::AgentStatus::Idle,
                 legacy: false,
+                disconnected: false,
             }],
             tabs: vec![ClientShellTab {
                 tab_id: "w1:t1".into(),

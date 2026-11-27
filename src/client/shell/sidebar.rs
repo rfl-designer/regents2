@@ -688,14 +688,17 @@ pub(in crate::client::shell) fn workspace_rows(
         },
     );
     if workspace.legacy {
-        mark_legacy_workspace(&mut rows);
+        mark_workspace(&mut rows, "legacy");
+    }
+    if workspace.disconnected {
+        mark_workspace(&mut rows, "disconnected");
     }
     rows
 }
 
-/// Adds a dim `legacy` token after the workspace name of a Regents workspace
-/// without a folder.
-fn mark_legacy_workspace(rows: &mut [Vec<crate::ui::ResolvedToken>]) {
+/// Adds a dim `mark` token after the workspace name: `legacy` for a Regents
+/// workspace without a folder, `disconnected` for one whose folder moved.
+fn mark_workspace(rows: &mut [Vec<crate::ui::ResolvedToken>], mark: &str) {
     let row = rows
         .iter()
         .position(|row| {
@@ -705,7 +708,7 @@ fn mark_legacy_workspace(rows: &mut [Vec<crate::ui::ResolvedToken>]) {
         .unwrap_or(0);
     if let Some(row) = rows.get_mut(row) {
         row.push(crate::ui::ResolvedToken {
-            kind: crate::ui::ResolvedTokenKind::Custom("legacy".to_owned()),
+            kind: crate::ui::ResolvedTokenKind::Custom(mark.to_owned()),
             style: crate::config::SidebarTokenStyle {
                 dim: Some(true),
                 ..Default::default()

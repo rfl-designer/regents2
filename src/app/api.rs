@@ -1270,6 +1270,12 @@ impl App {
             Method::WorkspaceLink(params) => {
                 return self.handle_workspace_link(request.id, params);
             }
+            Method::WorkspaceRelink(params) => {
+                return self.handle_workspace_relink(request.id, params);
+            }
+            Method::WorkspaceRemove(params) => {
+                return self.handle_workspace_remove(request.id, params);
+            }
             _ => {
                 return responses::encode_error(
                     request.id,

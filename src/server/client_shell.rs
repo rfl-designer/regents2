@@ -96,6 +96,7 @@ pub(super) fn snapshot_with_completions(
                     }),
                 agent_status: workspace.agent_status,
                 legacy: workspace.legacy,
+                disconnected: workspace.disconnected,
             }
         })
         .collect();

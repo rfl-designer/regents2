@@ -1,6 +1,7 @@
 //! Folder workspaces of the `regents` binary: `workspace add`, `workspace
 //! list`, the sidebar name and the restore after a restart (ticket #3); legacy
-//! workspaces, `workspace link` and the reopen of the last used folder (#4).
+//! workspaces, `workspace link` and the reopen of the last used folder (#4);
+//! disconnected workspaces, `workspace relink` and `workspace remove` (#5).
 
 #![cfg(unix)]
 
@@ -716,4 +717,116 @@ fn with_no_usable_folder_a_client_attaches_to_zero_workspaces() {
     );
     assert!(sandbox.open_workspaces().is_empty());
     assert_eq!(sandbox.api("ping", serde_json::json!({}))["type"], "pong");
+}
+
+#[test]
+fn a_folder_moved_while_the_server_runs_becomes_disconnected_without_a_list() {
+    let sandbox = Sandbox::new();
+    let folder = sandbox.folder("projeto");
+    let _server = sandbox.start_server();
+    let added = sandbox.cli(&["workspace", "add", folder.to_str().unwrap()]);
+    let workspace_id = added["workspace"]["workspace_id"].clone();
+    let get = || {
+        sandbox.api(
+            "workspace.get",
+            serde_json::json!({"workspace_id": workspace_id}),
+        )["workspace"]
+            .clone()
+    };
+    assert!(get().get("disconnected").is_none());
+
+    let moved = folder.with_file_name("movido");
+    fs::rename(&folder, &moved).unwrap();
+
+    // `workspace.get` reads no folder: only the periodic check of the
+    // server loop can mark the workspace.
+    assert!(
+        wait_until(Duration::from_secs(30), || get()["disconnected"] == true),
+        "the server must mark the moved folder: {}",
+        get()
+    );
+    assert!(
+        contains(&sandbox.client_shell_snapshot(), b"\"disconnected\":true"),
+        "the sidebar data must mark the disconnected workspace"
+    );
+
+    fs::rename(&moved, &folder).unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(30), || get()
+            .get("disconnected")
+            .is_none()),
+        "the server must clear the mark when the folder is back: {}",
+        get()
+    );
+}
+
+#[test]
+fn a_moved_folder_is_disconnected_until_relink_and_remove_keeps_the_folder() {
+    let sandbox = Sandbox::new();
+    let folder = sandbox.folder("projeto");
+    let other = sandbox.folder("outro");
+    let server = sandbox.start_server();
+    let added = sandbox.cli(&["workspace", "add", folder.to_str().unwrap()]);
+    let id = added["workspace"]["folder"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let workspace_id = added["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    sandbox.cli(&["workspace", "add", other.to_str().unwrap()]);
+    sandbox.stop_server(server);
+    let moved = folder.with_file_name("movido");
+    fs::rename(&folder, &moved).unwrap();
+    let _server = sandbox.start_server();
+
+    let listed = sandbox.cli(&["workspace", "list"]);
+
+    let entry = &listed["workspaces"][0];
+    assert_eq!(entry["path"], folder.to_str().unwrap(), "{listed}");
+    assert_eq!(entry["id"], id);
+    assert_eq!(entry["disconnected"], true, "{listed}");
+    assert!(listed["workspaces"][1].get("disconnected").is_none());
+    let open = sandbox.open_workspaces();
+    let restored = open
+        .iter()
+        .find(|workspace| workspace["workspace_id"] == workspace_id.as_str())
+        .unwrap_or_else(|| panic!("the disconnected workspace must stay open: {open:?}"));
+    assert_eq!(restored["disconnected"], true, "{restored}");
+    assert!(
+        contains(&sandbox.client_shell_snapshot(), b"\"disconnected\":true"),
+        "the sidebar data must mark the disconnected workspace"
+    );
+
+    let error = sandbox.cli_error(&["workspace", "relink", &id, other.to_str().unwrap()]);
+    assert_eq!(error["code"], "workspace_id_mismatch", "{error}");
+
+    let relinked = sandbox.cli(&["workspace", "relink", &id, moved.to_str().unwrap()]);
+
+    assert_eq!(relinked["type"], "workspace_relinked", "{relinked}");
+    let listed = sandbox.cli(&["workspace", "list"]);
+    assert_eq!(listed["workspaces"][0]["path"], moved.to_str().unwrap());
+    assert!(listed["workspaces"][0].get("disconnected").is_none());
+    let open = sandbox.open_workspaces();
+    let relinked = open
+        .iter()
+        .find(|workspace| workspace["workspace_id"] == workspace_id.as_str())
+        .unwrap();
+    assert!(relinked.get("disconnected").is_none(), "{relinked}");
+    assert_eq!(relinked["folder"]["path"], moved.to_str().unwrap());
+
+    let error = sandbox.cli_error(&["workspace", "remove", &id]);
+    assert_eq!(error["code"], "workspace_open", "{error}");
+    sandbox.cli(&["workspace", "close", &workspace_id]);
+    let before = tree(&moved);
+
+    let removed = sandbox.cli(&["workspace", "remove", &id]);
+
+    assert_eq!(removed["type"], "workspace_removed", "{removed}");
+    let listed = sandbox.cli(&["workspace", "list"])["workspaces"].clone();
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["path"], other.to_str().unwrap());
+    assert_eq!(tree(&moved), before, "remove must not change the folder");
 }

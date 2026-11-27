@@ -101,6 +101,10 @@ pub struct WorkspaceInfo {
     /// channels or wiki until `workspace.link` binds one. Absent means false.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub legacy: bool,
+    /// Regents disconnected workspace: its folder is no longer at the known
+    /// path. `workspace.relink` binds it to the new path. Absent means false.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub disconnected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -133,6 +137,26 @@ cli_params! {
     }
 }
 
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct WorkspaceRelinkParams => WorkspaceRelinkProjection {
+        /// Stable ID of the disconnected workspace, from `workspace.toml`.
+        pub id: String => Field::new(String::new()).input(bindings::stable_workspace_id()),
+        /// Absolute path of the new folder on the server host. Its
+        /// `workspace.toml` must have the same ID.
+        pub path: String => Field::new(String::new()).input(bindings::folder_path_at(1)),
+    }
+}
+
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct WorkspaceRemoveParams => WorkspaceRemoveProjection {
+        /// Stable ID of the registered workspace, from `workspace.toml`. The
+        /// folder stays on disk.
+        pub id: String => Field::new(String::new()).input(bindings::stable_workspace_id()),
+    }
+}
+
 /// An open workspace without a folder (Regents legacy workspace).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LegacyWorkspaceInfo {
@@ -152,6 +176,10 @@ pub struct RegisteredWorkspaceInfo {
     /// Open workspace bound to this folder, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// The folder is no longer at `path`; `id` is the last known ID.
+    /// Absent means false.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub disconnected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

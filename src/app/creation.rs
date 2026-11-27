@@ -411,6 +411,7 @@ impl App {
                 }),
             folder: ws.folder.as_ref().map(super::api::folder_info),
             legacy: self.is_legacy_workspace(index),
+            disconnected: self.is_disconnected_workspace(index),
         }
     }
 }

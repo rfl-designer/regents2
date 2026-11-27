@@ -3340,6 +3340,9 @@ impl HeadlessServer {
             self.app.run_auto_update_check();
         }
 
+        // Regents: a folder moved while the server runs becomes disconnected.
+        self.app.run_folder_connection_check_if_due(now);
+
         if self
             .app
             .next_agent_manifest_update_check

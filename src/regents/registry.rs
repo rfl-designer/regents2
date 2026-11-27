@@ -1,6 +1,8 @@
 //! Global registry of workspace folders (`<config dir>/workspaces.toml`).
-//! It keeps only the path of each workspace; the workspace state stays in the
-//! folder (ADR-0003).
+//! It keeps the path of each workspace and the last known ID; the workspace
+//! state stays in the folder (ADR-0003). The ID in the folder is the source of
+//! truth: the registry copy only names a workspace whose folder is gone
+//! (disconnected workspace), so that `relink` can find it again.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -20,10 +22,27 @@ pub(crate) struct Registry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistryEntry {
     pub(crate) path: PathBuf,
+    /// Last known ID from `workspace.toml` of `path`. Absent in registries
+    /// written before Regents recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
     /// Order of the last use (add, link or reopen); a higher value is more
     /// recent. Absent in registries written before Regents recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_used: Option<u64>,
+}
+
+impl RegistryEntry {
+    /// ID of the registered workspace: the last known ID, or the ID in the
+    /// folder for an entry written before Regents recorded it. That case
+    /// reads the folder manifest.
+    pub(crate) fn resolve_workspace_id(&self) -> Option<String> {
+        self.id.clone().or_else(|| {
+            folder::read_manifest(&self.path)
+                .ok()
+                .map(|manifest| manifest.id)
+        })
+    }
 }
 
 /// Registry file of the running product, for example
@@ -85,16 +104,17 @@ impl Registry {
         entries
     }
 
-    fn push(&mut self, root: PathBuf) {
+    fn push(&mut self, root: PathBuf, id: String) {
         self.workspaces.push(RegistryEntry {
             path: root,
+            id: Some(id),
             last_used: None,
         });
     }
 
-    /// Marks `root` as the most recently used entry. Returns false when the
-    /// registry does not contain `root`.
-    fn touch(&mut self, root: &Path) -> bool {
+    /// Marks `root` as the most recently used entry and records its ID.
+    /// Returns false when the registry does not contain `root`.
+    fn touch(&mut self, root: &Path, id: &str) -> bool {
         let next = self
             .workspaces
             .iter()
@@ -104,6 +124,7 @@ impl Registry {
         match self.workspaces.iter_mut().find(|entry| entry.path == root) {
             Some(entry) => {
                 entry.last_used = Some(next);
+                entry.id = Some(id.to_owned());
                 true
             }
             None => false,
@@ -114,9 +135,9 @@ impl Registry {
 /// Records that the registered folder `root` was used now, so that it is the
 /// first candidate when Regents reopens a workspace. Call it only when a
 /// workspace opens (add, link, reopen), never on a focus change.
-pub(crate) fn mark_used(registry_path: &Path, root: &Path) -> io::Result<()> {
+pub(crate) fn mark_used(registry_path: &Path, root: &Path, id: &str) -> io::Result<()> {
     let mut registry = Registry::load(registry_path)?;
-    if registry.touch(root) {
+    if registry.touch(root, id) {
         registry.save(registry_path)?;
     }
     Ok(())
@@ -160,7 +181,8 @@ impl std::fmt::Display for AddFolderError {
                 registered_path,
             } => write!(
                 f,
-                "workspace id {id} is already registered at {}",
+                "workspace id {id} is already registered at {}; if the folder moved, \
+                 use `regents workspace relink {id} <folder>`",
                 registered_path.display()
             ),
             Self::Io(err) => write!(f, "{err}"),
@@ -192,9 +214,11 @@ pub(crate) fn add_folder(registry_path: &Path, path: &Path) -> Result<AddedFolde
         Err(err) => return Err(err.into()),
     };
     if let (false, Some(id)) = (already_registered, existing_id) {
-        if let Some(entry) = registry.entries().iter().find(|entry| {
-            folder::read_manifest(&entry.path).is_ok_and(|manifest| manifest.id == id)
-        }) {
+        if let Some(entry) = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.resolve_workspace_id().as_deref() == Some(id.as_str()))
+        {
             return Err(AddFolderError::IdConflict {
                 id,
                 registered_path: entry.path.clone(),
@@ -203,15 +227,167 @@ pub(crate) fn add_folder(registry_path: &Path, path: &Path) -> Result<AddedFolde
     }
     let opened = folder::open_or_init(&root)?;
     if !already_registered {
-        registry.push(root.clone());
+        registry.push(root.clone(), opened.manifest.id.clone());
     }
-    registry.touch(&root);
+    registry.touch(&root, &opened.manifest.id);
     registry.save(registry_path)?;
     Ok(AddedFolder {
         root,
         folder: opened,
         already_registered,
     })
+}
+
+/// Why `relink` or `remove` cannot change the registry.
+#[derive(Debug)]
+pub(crate) enum RegistryChangeError {
+    /// No registered workspace has this ID.
+    NotFound(String),
+    /// The folder is still at the registered path.
+    NotDisconnected {
+        id: String,
+        path: PathBuf,
+    },
+    NotADirectory(PathBuf),
+    /// The new folder does not hold the workspace: `found` is the ID in its
+    /// `workspace.toml`, or `None` when it has no such file.
+    IdMismatch {
+        id: String,
+        path: PathBuf,
+        found: Option<String>,
+    },
+    /// Another registered workspace uses the new folder.
+    FolderInUse(PathBuf),
+    Io(io::Error),
+}
+
+impl RegistryChangeError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "workspace_not_found",
+            Self::NotDisconnected { .. } => "workspace_not_disconnected",
+            Self::NotADirectory(_) => "workspace_folder_not_found",
+            Self::IdMismatch { .. } => "workspace_id_mismatch",
+            Self::FolderInUse(_) => "workspace_folder_in_use",
+            Self::Io(_) => "workspace_registry_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for RegistryChangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(f, "no registered workspace has the id {id}"),
+            Self::NotDisconnected { id, path } => write!(
+                f,
+                "workspace {id} is not disconnected: its folder is still at {}",
+                path.display()
+            ),
+            Self::NotADirectory(path) => write!(f, "{} is not a directory", path.display()),
+            Self::IdMismatch {
+                id,
+                path,
+                found: Some(found),
+            } => write!(
+                f,
+                "{} does not hold workspace {id}: its workspace.toml has the id {found}",
+                path.display()
+            ),
+            Self::IdMismatch {
+                id,
+                path,
+                found: None,
+            } => write!(
+                f,
+                "{} does not hold workspace {id}: it has no .regents/workspace.toml",
+                path.display()
+            ),
+            Self::FolderInUse(path) => write!(
+                f,
+                "{} is already registered as another workspace",
+                path.display()
+            ),
+            Self::Io(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl From<io::Error> for RegistryChangeError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl Registry {
+    fn position_of(&self, id: &str) -> Result<usize, RegistryChangeError> {
+        self.workspaces
+            .iter()
+            .position(|entry| entry.resolve_workspace_id().as_deref() == Some(id))
+            .ok_or_else(|| RegistryChangeError::NotFound(id.to_owned()))
+    }
+}
+
+/// Registers the disconnected workspace `id` at `path` and returns the
+/// updated entry. The folder in `path` must hold the same ID in its
+/// `workspace.toml`; this function never writes in a folder.
+pub(crate) fn relink(
+    registry_path: &Path,
+    id: &str,
+    path: &Path,
+) -> Result<RegistryEntry, RegistryChangeError> {
+    let mut registry = Registry::load(registry_path)?;
+    let index = registry.position_of(id)?;
+    let old_path = &registry.workspaces[index].path;
+    if folder::holds_workspace(old_path, id) {
+        return Err(RegistryChangeError::NotDisconnected {
+            id: id.to_owned(),
+            path: old_path.clone(),
+        });
+    }
+    if !path.is_dir() {
+        return Err(RegistryChangeError::NotADirectory(path.to_path_buf()));
+    }
+    let root = crate::platform::canonical_path(path)?;
+    match folder::read_manifest(&root) {
+        Ok(manifest) if manifest.id == id => {}
+        Ok(manifest) => {
+            return Err(RegistryChangeError::IdMismatch {
+                id: id.to_owned(),
+                path: root,
+                found: Some(manifest.id),
+            })
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(RegistryChangeError::IdMismatch {
+                id: id.to_owned(),
+                path: root,
+                found: None,
+            })
+        }
+        Err(err) => return Err(err.into()),
+    }
+    if registry
+        .workspaces
+        .iter()
+        .enumerate()
+        .any(|(other, entry)| other != index && entry.path == root)
+    {
+        return Err(RegistryChangeError::FolderInUse(root));
+    }
+    registry.workspaces[index].path = root.clone();
+    registry.touch(&root, id);
+    registry.save(registry_path)?;
+    Ok(registry.workspaces[index].clone())
+}
+
+/// Removes the workspace `id` from the registry and returns its entry. The
+/// folder and its `.regents/` stay unchanged.
+pub(crate) fn remove(registry_path: &Path, id: &str) -> Result<RegistryEntry, RegistryChangeError> {
+    let mut registry = Registry::load(registry_path)?;
+    let index = registry.position_of(id)?;
+    let removed = registry.workspaces.remove(index);
+    registry.save(registry_path)?;
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -262,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn added_folder_is_registered_by_path_only() {
+    fn added_folder_is_registered_by_path_and_last_known_id() {
         let base = temp_dir("add");
         let folder = base.join("project");
         std::fs::create_dir_all(&folder).unwrap();
@@ -281,14 +457,66 @@ mod tests {
             registry.entries(),
             &[RegistryEntry {
                 path: added.root.clone(),
+                id: Some(added.folder.manifest.id.clone()),
                 last_used: Some(1),
             }]
         );
-        let content = std::fs::read_to_string(&registry_path).unwrap();
-        assert!(
-            !content.contains(&added.folder.manifest.id),
-            "the registry keeps only paths: {content}"
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// ADR-0003: the registry keeps the path, a copy of the ID and the use
+    /// order of each workspace, and no other workspace state.
+    #[test]
+    fn the_registry_file_keeps_only_the_path_the_id_copy_and_the_use_order() {
+        let base = temp_dir("only-path");
+        let registry_path = base.join("workspaces.toml");
+        for name in ["first", "second"] {
+            let folder = base.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            add_folder(&registry_path, &folder).unwrap();
+        }
+        let first = crate::platform::canonical_path(&base.join("first")).unwrap();
+        let id = folder::read_manifest(&first).unwrap().id;
+        mark_used(&registry_path, &first, &id).unwrap();
+
+        let file: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&registry_path).unwrap()).unwrap();
+
+        assert_eq!(file.keys().collect::<Vec<_>>(), vec!["workspaces"]);
+        let entries = file["workspaces"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let mut keys: Vec<&str> = entry
+                .as_table()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["id", "last_used", "path"], "{entry}");
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn relink_returns_the_updated_registry_entry() {
+        let base = temp_dir("relink-entry");
+        let registry_path = base.join("workspaces.toml");
+        let folder = base.join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let added = add_folder(&registry_path, &folder).unwrap();
+        let moved = base.join("moved");
+        std::fs::rename(&added.root, &moved).unwrap();
+
+        let entry = relink(&registry_path, &added.folder.manifest.id, &moved).unwrap();
+
+        assert_eq!(
+            Registry::load(&registry_path).unwrap().entries(),
+            std::slice::from_ref(&entry)
         );
+        assert_eq!(entry.path, crate::platform::canonical_path(&moved).unwrap());
+        assert_eq!(entry.id.as_deref(), Some(added.folder.manifest.id.as_str()));
+        assert_eq!(entry.last_used, Some(2));
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -346,7 +574,8 @@ mod tests {
             roots.push(add_folder(&registry_path, &folder).unwrap().root);
         }
 
-        mark_used(&registry_path, &roots[0]).unwrap();
+        let id = folder::read_manifest(&roots[0]).unwrap().id;
+        mark_used(&registry_path, &roots[0], &id).unwrap();
 
         let order: Vec<PathBuf> = Registry::load(&registry_path)
             .unwrap()

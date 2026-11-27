@@ -4,7 +4,8 @@ use clap::{Arg, ArgMatches, Command};
 
 use crate::api::schema::workspaces::{
     WorkspaceAddProjection, WorkspaceCloseProjection, WorkspaceCreateProjection,
-    WorkspaceLinkProjection, WorkspaceMetadataProjection, WorkspaceRenameProjection,
+    WorkspaceLinkProjection, WorkspaceMetadataProjection, WorkspaceRelinkProjection,
+    WorkspaceRemoveProjection, WorkspaceRenameProjection,
 };
 use crate::api::schema::{EmptyParams, Method, Request, WorkspaceTarget};
 
@@ -17,6 +18,16 @@ pub(crate) fn workspace_id() -> Input<String> {
         *slot = super::normalize_workspace_id(value);
         Ok(())
     })
+}
+
+/// Stable workspace ID from `workspace.toml` (Regents), as the first
+/// positional argument.
+pub(crate) fn stable_workspace_id() -> Input<String> {
+    Input::positional("id", 0, |slot, value| {
+        *slot = value.to_owned();
+        Ok(())
+    })
+    .value_name("ID")
 }
 
 /// Folder path argument. A local relative path becomes absolute here,
@@ -216,7 +227,7 @@ pub(crate) const LEAVES: [Leaf; 7] = [
 
 /// Regents commands for folder workspaces. `list` shows the registered
 /// folders instead of the open layout containers.
-const REGENTS_LEAVES: [Leaf; 3] = [
+const REGENTS_LEAVES: [Leaf; 5] = [
     Leaf {
         name: "add",
         about: "Register a folder as a workspace and open it",
@@ -242,6 +253,26 @@ const REGENTS_LEAVES: [Leaf; 3] = [
         quiet: false,
         arguments: WorkspaceLinkProjection::arguments,
         method: |matches| WorkspaceLinkProjection::from_matches(matches).map(Method::WorkspaceLink),
+    },
+    Leaf {
+        name: "relink",
+        about: "Bind a disconnected workspace to its new folder (same ID)",
+        id: "cli:workspace:relink",
+        quiet: false,
+        arguments: WorkspaceRelinkProjection::arguments,
+        method: |matches| {
+            WorkspaceRelinkProjection::from_matches(matches).map(Method::WorkspaceRelink)
+        },
+    },
+    Leaf {
+        name: "remove",
+        about: "Remove a workspace from the registry; the folder stays on disk",
+        id: "cli:workspace:remove",
+        quiet: false,
+        arguments: WorkspaceRemoveProjection::arguments,
+        method: |matches| {
+            WorkspaceRemoveProjection::from_matches(matches).map(Method::WorkspaceRemove)
+        },
     },
 ];
 
@@ -440,7 +471,49 @@ mod tests {
             herdr_names,
             LEAVES.iter().map(|leaf| leaf.name).collect::<Vec<_>>()
         );
-        assert_eq!(regents_names.len(), LEAVES.len() + 2);
+        assert_eq!(regents_names.len(), LEAVES.len() + 4);
+    }
+
+    #[test]
+    fn regents_workspace_relink_sends_the_id_and_an_absolute_folder_path() {
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("novo")
+            .display()
+            .to_string();
+
+        let request = product_request(true, "relink", &["abc123", "novo"])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "id": "cli:workspace:relink", "method": "workspace.relink",
+                "params": {"id": "abc123", "path": expected}
+            })
+        );
+        assert!(matches!(
+            product_request(true, "relink", &["abc123"]),
+            Some(Err(ParseError::Clap(_)))
+        ));
+        assert!(product_request(false, "relink", &["abc123", "novo"]).is_none());
+    }
+
+    #[test]
+    fn regents_workspace_remove_sends_the_id() {
+        let request = product_request(true, "remove", &["abc123"])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "id": "cli:workspace:remove", "method": "workspace.remove",
+                "params": {"id": "abc123"}
+            })
+        );
+        assert!(product_request(false, "remove", &["abc123"]).is_none());
     }
 
     #[test]

@@ -1,32 +1,44 @@
 //! Folder workspaces (Regents): `workspace.add`, `workspace.link`,
-//! `workspace.registry.list`, the reopen of the last used folder and the
-//! guard for commands that need a folder. The domain rules live in
+//! `workspace.registry.list`, `workspace.relink`, `workspace.remove`, the
+//! disconnected state, the reopen of the last used folder and the guard for
+//! commands that need a folder. The domain rules live in
 //! `crate::regents`; this module binds a folder to the herdr workspace that
 //! holds its layout.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, LegacyWorkspaceInfo, RegisteredWorkspaceInfo,
-    ResponseResult, WorkspaceAddParams, WorkspaceLinkParams,
+    ResponseResult, WorkspaceAddParams, WorkspaceLinkParams, WorkspaceRelinkParams,
+    WorkspaceRemoveParams,
 };
 use crate::app::App;
 use crate::regents::folder::{self, FolderBinding, OpenedFolder};
-use crate::regents::registry::{self, AddedFolder, Registry};
+use crate::regents::registry::{self, AddedFolder, Registry, RegistryEntry};
 
 use super::responses::{encode_error, encode_success};
 
 /// Command that opens a folder workspace.
 const WORKSPACE_ADD_COMMAND: &str = "regents workspace add <folder>";
 
+/// Time between two checks of the folders of the open workspaces.
+const FOLDER_CONNECTION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Why a command that needs a workspace folder cannot run on a workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// `Legacy` is built only by `App::folder_workspace`; see the note there.
+// `Legacy` and `Disconnected` are built only by `App::folder_workspace`; see
+// the note there.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum FolderWorkspaceError {
     NotFound(String),
     /// The workspace has no folder (Regents legacy workspace).
     Legacy(String),
+    /// The folder is no longer at the known path (disconnected workspace).
+    Disconnected {
+        id: String,
+        path: PathBuf,
+    },
 }
 
 impl FolderWorkspaceError {
@@ -34,6 +46,7 @@ impl FolderWorkspaceError {
         match self {
             Self::NotFound(_) => "workspace_not_found",
             Self::Legacy(_) => "workspace_legacy",
+            Self::Disconnected { .. } => "workspace_disconnected",
         }
     }
 }
@@ -46,6 +59,13 @@ impl std::fmt::Display for FolderWorkspaceError {
                 f,
                 "workspace {id} is a legacy workspace; link it to a folder with \
                  `regents workspace link {id} <folder>`"
+            ),
+            Self::Disconnected { id, path } => write!(
+                f,
+                "workspace {id} is disconnected: its folder is no longer at {}; \
+                 reconnect it with `regents workspace relink {id} <folder>` or \
+                 remove it with `regents workspace remove {id}`",
+                path.display()
             ),
         }
     }
@@ -66,21 +86,73 @@ impl App {
     }
 
     /// Resolves `workspace_id` to a workspace that has a folder. Commands that
-    /// use the workspace folder (channels, agents, wiki) call this first, so a
-    /// legacy workspace fails with one clear error.
+    /// use the workspace folder (channels, agents, wiki, messages, threads)
+    /// call this first, so a legacy or disconnected workspace fails with one
+    /// clear error. It checks the folder on disk and updates the disconnected
+    /// mark, so the guard and the sidebar agree: call it only from explicit
+    /// commands, never from render.
     // The channel, agent and wiki commands (tickets #6 onward) are the callers;
     // until they exist only the tests call it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn folder_workspace(
-        &self,
+        &mut self,
         workspace_id: &str,
     ) -> Result<(usize, &FolderBinding), FolderWorkspaceError> {
         let index = self.resolve_workspace(workspace_id)?;
+        let Some(binding) = self.state.workspaces[index].folder.as_ref() else {
+            return Err(FolderWorkspaceError::Legacy(
+                self.public_workspace_id(index),
+            ));
+        };
+        let connected = folder::holds_workspace(&binding.root, &binding.id);
+        let id = binding.id.clone();
+        self.mark_folder_connection(&id, connected);
         match &self.state.workspaces[index].folder {
-            Some(binding) => Ok((index, binding)),
+            Some(binding) if connected => Ok((index, binding)),
+            Some(binding) => Err(FolderWorkspaceError::Disconnected {
+                id: binding.id.clone(),
+                path: binding.root.clone(),
+            }),
             None => Err(FolderWorkspaceError::Legacy(
                 self.public_workspace_id(index),
             )),
+        }
+    }
+
+    /// When the event loop must check the folders of the open workspaces
+    /// again, so that a folder moved while the server runs becomes
+    /// disconnected without a `list` call. `None` for herdr. It reads no
+    /// file; the loop calls it on every iteration.
+    pub(crate) fn folder_connection_check_deadline(&self, now: Instant) -> Option<Instant> {
+        self.has_folder_workspaces()
+            .then(|| self.next_folder_connection_check.unwrap_or(now))
+    }
+
+    /// Checks the folders of the open workspaces when the deadline is due,
+    /// then schedules the next check. The event loop calls it, outside the
+    /// render, layout and frame paths; it reads one small file per open
+    /// folder workspace every `FOLDER_CONNECTION_CHECK_INTERVAL`.
+    pub(crate) fn run_folder_connection_check_if_due(&mut self, now: Instant) {
+        if self
+            .folder_connection_check_deadline(now)
+            .is_none_or(|deadline| deadline > now)
+        {
+            return;
+        }
+        self.refresh_folder_connections();
+        self.next_folder_connection_check = Some(now + FOLDER_CONNECTION_CHECK_INTERVAL);
+    }
+
+    /// Records whether the folder of workspace `id` is at its known path.
+    /// A change asks clients for a new frame, so the sidebar shows it.
+    fn mark_folder_connection(&mut self, id: &str, connected: bool) {
+        let changed = if connected {
+            self.disconnected_folders.remove(id)
+        } else {
+            self.disconnected_folders.insert(id.to_owned())
+        };
+        if changed {
+            self.render_dirty.request_generic();
         }
     }
 
@@ -98,6 +170,37 @@ impl App {
                 .workspaces
                 .get(index)
                 .is_some_and(|workspace| workspace.folder.is_none())
+    }
+
+    /// A Regents folder workspace whose folder is no longer at the known path,
+    /// as of the last refresh. It reads no file, so render can call it.
+    pub(crate) fn is_disconnected_workspace(&self, index: usize) -> bool {
+        self.state
+            .workspaces
+            .get(index)
+            .and_then(|workspace| workspace.folder.as_ref())
+            .is_some_and(|folder| self.disconnected_folders.contains(&folder.id))
+    }
+
+    /// Checks the folder of each open folder workspace. Call it at load,
+    /// list and relink time only: it reads one file per folder workspace, so
+    /// it must stay out of the render and layout paths.
+    pub(crate) fn refresh_folder_connections(&mut self) {
+        if !self.has_folder_workspaces() {
+            return;
+        }
+        let disconnected: std::collections::HashSet<String> = self
+            .state
+            .workspaces
+            .iter()
+            .filter_map(|workspace| workspace.folder.as_ref())
+            .filter(|binding| !folder::holds_workspace(&binding.root, &binding.id))
+            .map(|binding| binding.id.clone())
+            .collect();
+        if disconnected != self.disconnected_folders {
+            self.disconnected_folders = disconnected;
+            self.render_dirty.request_generic();
+        }
     }
 
     /// Error response for a request that would open a workspace without a
@@ -123,7 +226,7 @@ impl App {
         }
         if let Some(registry_path) = self.workspace_registry_path.clone() {
             for binding in &closed {
-                if let Err(err) = registry::mark_used(&registry_path, &binding.root) {
+                if let Err(err) = registry::mark_used(&registry_path, &binding.root, &binding.id) {
                     tracing::warn!(err = %err, "cannot record the last used workspace");
                 }
             }
@@ -173,7 +276,11 @@ impl App {
                         already_registered: true,
                     };
                     self.bind_folder(index, &reopened);
-                    if let Err(err) = registry::mark_used(&registry_path, &entry.path) {
+                    if let Err(err) = registry::mark_used(
+                        &registry_path,
+                        &entry.path,
+                        &reopened.folder.manifest.id,
+                    ) {
                         tracing::warn!(err = %err, "cannot record the last used workspace");
                     }
                     self.emit_workspace_open_events(index);
@@ -307,22 +414,11 @@ impl App {
             Ok(registry) => registry,
             Err(err) => return encode_error(id, "workspace_registry_unreadable", err.to_string()),
         };
+        self.refresh_folder_connections();
         let workspaces = registry
             .entries()
             .iter()
-            .map(|entry| {
-                let manifest = folder::read_manifest(&entry.path).ok();
-                let workspace_id = manifest
-                    .as_ref()
-                    .and_then(|manifest| self.workspace_index_for_folder(&manifest.id))
-                    .map(|index| self.public_workspace_id(index));
-                RegisteredWorkspaceInfo {
-                    path: entry.path.display().to_string(),
-                    id: manifest.as_ref().map(|manifest| manifest.id.clone()),
-                    name: manifest.map(|manifest| manifest.name),
-                    workspace_id,
-                }
-            })
+            .map(|entry| self.registered_workspace_info(entry))
             .collect();
         let legacy = (0..self.state.workspaces.len())
             .filter(|index| self.is_legacy_workspace(*index))
@@ -338,6 +434,96 @@ impl App {
             id,
             ResponseResult::RegisteredWorkspaceList { workspaces, legacy },
         )
+    }
+
+    /// Registers a disconnected workspace at its new folder. The new folder
+    /// must hold the same ID; an open workspace keeps its panes and layout.
+    pub(super) fn handle_workspace_relink(
+        &mut self,
+        id: String,
+        params: WorkspaceRelinkParams,
+    ) -> String {
+        let Some(registry_path) = self.workspace_registry_path.clone() else {
+            return folder_workspaces_unsupported(id);
+        };
+        let path = match absolute_folder_path(&params.path) {
+            Ok(path) => path,
+            Err(message) => return encode_error(id, "invalid_params", message),
+        };
+        let entry = match registry::relink(&registry_path, &params.id, &path) {
+            Ok(entry) => entry,
+            Err(err) => return encode_error(id, err.code(), err.to_string()),
+        };
+        if let Some(index) = self.workspace_index_for_folder(&params.id) {
+            if let Some(binding) = self.state.workspaces[index].folder.as_mut() {
+                binding.root = entry.path.clone();
+            }
+            self.schedule_session_save();
+        }
+        self.refresh_folder_connections();
+        encode_success(
+            id,
+            ResponseResult::WorkspaceRelinked {
+                workspace: self.registered_workspace_info(&entry),
+            },
+        )
+    }
+
+    /// Removes a workspace from the registry. The folder stays on disk. An
+    /// open workspace must close first, so that no open layout loses its
+    /// registry entry.
+    pub(super) fn handle_workspace_remove(
+        &mut self,
+        id: String,
+        params: WorkspaceRemoveParams,
+    ) -> String {
+        let Some(registry_path) = self.workspace_registry_path.clone() else {
+            return folder_workspaces_unsupported(id);
+        };
+        if let Some(index) = self.workspace_index_for_folder(&params.id) {
+            let workspace_id = self.public_workspace_id(index);
+            return encode_error(
+                id,
+                "workspace_open",
+                format!(
+                    "workspace {} is open as {workspace_id}; close it with \
+                     `regents workspace close {workspace_id}` first",
+                    params.id
+                ),
+            );
+        }
+        match registry::remove(&registry_path, &params.id) {
+            Ok(entry) => encode_success(
+                id,
+                ResponseResult::WorkspaceRemoved {
+                    workspace: self.registered_workspace_info(&entry),
+                },
+            ),
+            Err(err) => encode_error(id, err.code(), err.to_string()),
+        }
+    }
+
+    /// Registry entry as the API shows it. It reads the folder manifest.
+    fn registered_workspace_info(&self, entry: &RegistryEntry) -> RegisteredWorkspaceInfo {
+        // One manifest read: it gives the ID of an entry without an ID copy
+        // and tells whether the folder still holds the workspace.
+        let manifest = folder::read_manifest(&entry.path).ok();
+        let id = entry
+            .id
+            .clone()
+            .or_else(|| manifest.as_ref().map(|manifest| manifest.id.clone()));
+        let manifest = manifest.filter(|manifest| id.as_deref() == Some(manifest.id.as_str()));
+        let workspace_id = id
+            .as_deref()
+            .and_then(|id| self.workspace_index_for_folder(id))
+            .map(|index| self.public_workspace_id(index));
+        RegisteredWorkspaceInfo {
+            path: entry.path.display().to_string(),
+            disconnected: manifest.is_none(),
+            id,
+            name: manifest.map(|manifest| manifest.name),
+            workspace_id,
+        }
     }
 
     /// Gives the workspace at `index` the identity and name of `added`.
@@ -538,6 +724,7 @@ mod tests {
                 id: Some(manifest.id),
                 name: Some("projeto".into()),
                 workspace_id: Some(workspace.workspace_id),
+                disconnected: false,
             }]
         );
         fixture.app.state.assert_invariants_for_test();
@@ -1018,8 +1205,9 @@ mod tests {
         assert!(message.contains("regents workspace link"), "{message}");
 
         let (index, binding) = fixture.app.folder_workspace(&bound.workspace_id).unwrap();
+        let root = binding.root.clone();
         assert_eq!(fixture.app.public_workspace_id(index), bound.workspace_id);
-        assert_eq!(binding.root, folder);
+        assert_eq!(root, folder);
 
         let missing = fixture.app.folder_workspace("w99").unwrap_err();
         assert_eq!(missing.code(), "workspace_not_found");
@@ -1043,6 +1231,376 @@ mod tests {
         assert_eq!(error.error.code, "unsupported");
         assert!(!folder.join(".regents").exists());
         assert!(fixture.app.state.workspaces.is_empty());
+    }
+
+    /// Moves `from` to a new folder `to` under the fixture base.
+    fn move_folder(fixture: &Fixture, from: &Path, to: &str) -> PathBuf {
+        let target = fixture.base.join(to);
+        std::fs::rename(from, &target).unwrap();
+        crate::platform::canonical_path(&target).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_moved_folder_is_listed_as_disconnected() {
+        let mut fixture = Fixture::new("disconnected");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.clone().unwrap().id;
+        move_folder(&fixture, &folder, "moved");
+
+        let registered = fixture.registered();
+
+        assert_eq!(
+            registered,
+            vec![RegisteredWorkspaceInfo {
+                path: folder.display().to_string(),
+                id: Some(id),
+                name: None,
+                workspace_id: Some(workspace.workspace_id.clone()),
+                disconnected: true,
+            }]
+        );
+        let listed = fixture.request("workspace.list", serde_json::json!({}));
+        assert_eq!(listed["result"]["workspaces"][0]["disconnected"], true);
+        assert!(fixture.app.workspace_info(0).disconnected);
+    }
+
+    #[tokio::test]
+    async fn a_closed_workspace_with_a_moved_folder_keeps_its_id_in_the_list() {
+        let mut fixture = Fixture::new("disconnected-closed");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.unwrap().id;
+        fixture.close(&workspace.workspace_id);
+        move_folder(&fixture, &folder, "moved");
+
+        let registered = fixture.registered();
+
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].id.as_deref(), Some(id.as_str()));
+        assert!(registered[0].disconnected);
+        assert_eq!(registered[0].workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_connected_folder_is_not_disconnected() {
+        let mut fixture = Fixture::new("connected");
+        let folder = fixture.folder("projeto");
+        fixture.add(&folder);
+
+        let listed = fixture.request("workspace.list", serde_json::json!({}));
+
+        assert!(!fixture.registered()[0].disconnected);
+        assert_eq!(listed["result"]["workspaces"][0].get("disconnected"), None);
+    }
+
+    #[tokio::test]
+    async fn the_folder_guard_refuses_a_disconnected_workspace() {
+        let mut fixture = Fixture::new("guard-disconnected");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.unwrap().id;
+        move_folder(&fixture, &folder, "moved");
+
+        let err = fixture
+            .app
+            .folder_workspace(&workspace.workspace_id)
+            .expect_err("a disconnected workspace has no usable folder");
+
+        assert_eq!(err.code(), "workspace_disconnected");
+        let message = err.to_string();
+        assert!(message.contains(&folder.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("regents workspace relink {id}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("regents workspace remove {id}")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_folder_guard_and_the_disconnected_mark_agree() {
+        let mut fixture = Fixture::new("guard-mark");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let moved = move_folder(&fixture, &folder, "moved");
+
+        assert!(fixture
+            .app
+            .folder_workspace(&workspace.workspace_id)
+            .is_err());
+
+        assert!(fixture.app.workspace_info(0).disconnected);
+
+        std::fs::rename(&moved, &folder).unwrap();
+
+        assert!(fixture
+            .app
+            .folder_workspace(&workspace.workspace_id)
+            .is_ok());
+
+        assert!(!fixture.app.workspace_info(0).disconnected);
+    }
+
+    #[tokio::test]
+    async fn the_periodic_check_marks_a_folder_moved_while_the_server_runs() {
+        let mut fixture = Fixture::new("periodic");
+        let folder = fixture.folder("projeto");
+        fixture.add(&folder);
+        let start = std::time::Instant::now();
+        fixture.app.run_folder_connection_check_if_due(start);
+        let moved = move_folder(&fixture, &folder, "moved");
+        let due = fixture
+            .app
+            .folder_connection_check_deadline(start)
+            .expect("regents checks the folders periodically");
+        assert!(due > start);
+
+        fixture.app.run_folder_connection_check_if_due(due);
+
+        assert!(fixture.app.workspace_info(0).disconnected);
+        std::fs::rename(&moved, &folder).unwrap();
+        fixture.app.run_folder_connection_check_if_due(due);
+        assert!(
+            fixture.app.workspace_info(0).disconnected,
+            "the check must not run again before its deadline"
+        );
+        let next = fixture.app.folder_connection_check_deadline(due).unwrap();
+        fixture.app.run_folder_connection_check_if_due(next);
+        assert!(!fixture.app.workspace_info(0).disconnected);
+    }
+
+    #[tokio::test]
+    async fn herdr_has_no_periodic_folder_check() {
+        let mut fixture = Fixture::new("herdr-periodic");
+        fixture.app.workspace_registry_path = None;
+
+        assert_eq!(
+            fixture
+                .app
+                .folder_connection_check_deadline(std::time::Instant::now()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn relink_reconnects_a_moved_folder_with_the_same_id() {
+        let mut fixture = Fixture::new("relink");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.clone().unwrap().id;
+        let moved = move_folder(&fixture, &folder, "moved");
+        assert!(fixture.registered()[0].disconnected);
+
+        let response = fixture.request(
+            "workspace.relink",
+            serde_json::json!({"id": id, "path": moved}),
+        );
+
+        let result = &response["result"];
+        assert_eq!(result["type"], "workspace_relinked", "{response}");
+        assert_eq!(result["workspace"]["path"], moved.display().to_string());
+        assert_eq!(result["workspace"]["id"], id);
+        assert_eq!(result["workspace"].get("disconnected"), None);
+        assert_eq!(
+            fixture.registered(),
+            vec![RegisteredWorkspaceInfo {
+                path: moved.display().to_string(),
+                id: Some(id.clone()),
+                name: Some("projeto".into()),
+                workspace_id: Some(workspace.workspace_id.clone()),
+                disconnected: false,
+            }]
+        );
+        let info = fixture.app.workspace_info(0);
+        assert!(!info.disconnected);
+        assert_eq!(info.folder.unwrap().path, moved.display().to_string());
+        let (_, binding) = fixture
+            .app
+            .folder_workspace(&workspace.workspace_id)
+            .unwrap();
+        assert_eq!(binding.root, moved);
+        fixture.app.state.assert_invariants_for_test();
+    }
+
+    #[tokio::test]
+    async fn relink_reconnects_a_closed_workspace() {
+        let mut fixture = Fixture::new("relink-closed");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.unwrap().id;
+        fixture.close(&workspace.workspace_id);
+        let moved = move_folder(&fixture, &folder, "moved");
+
+        let response = fixture.request(
+            "workspace.relink",
+            serde_json::json!({"id": id, "path": moved}),
+        );
+
+        assert_eq!(
+            response["result"]["type"], "workspace_relinked",
+            "{response}"
+        );
+        let registered = fixture.registered();
+        assert_eq!(registered[0].path, moved.display().to_string());
+        assert!(!registered[0].disconnected);
+    }
+
+    #[tokio::test]
+    async fn relink_refuses_a_folder_with_another_id() {
+        let mut fixture = Fixture::new("relink-other");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.unwrap().id;
+        move_folder(&fixture, &folder, "moved");
+        let other = fixture.folder("other");
+        folder::open_or_init(&other).unwrap();
+        let empty = fixture.folder("empty");
+        let registry_path = fixture.app.workspace_registry_path.clone().unwrap();
+        let registry_before = std::fs::read(&registry_path).unwrap();
+
+        for path in [&other, &empty] {
+            let response = fixture.request(
+                "workspace.relink",
+                serde_json::json!({"id": id, "path": path}),
+            );
+
+            assert_eq!(error_code(&response), "workspace_id_mismatch", "{path:?}");
+            let message = response["error"]["message"].as_str().unwrap();
+            assert!(message.contains(&id), "{message}");
+        }
+        assert_eq!(std::fs::read(&registry_path).unwrap(), registry_before);
+        assert!(!empty.join(".regents").exists());
+        assert!(fixture.registered()[0].disconnected);
+    }
+
+    #[tokio::test]
+    async fn relink_refuses_a_connected_workspace() {
+        let mut fixture = Fixture::new("relink-connected");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.unwrap().id;
+        let copy = fixture.folder("copy");
+        std::fs::create_dir_all(copy.join(".regents")).unwrap();
+        std::fs::copy(
+            folder.join(".regents/workspace.toml"),
+            copy.join(".regents/workspace.toml"),
+        )
+        .unwrap();
+
+        let response = fixture.request(
+            "workspace.relink",
+            serde_json::json!({"id": id, "path": copy}),
+        );
+
+        assert_eq!(error_code(&response), "workspace_not_disconnected");
+        assert_eq!(fixture.registered()[0].path, folder.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn relink_refuses_an_unknown_id() {
+        let mut fixture = Fixture::new("relink-unknown");
+        let folder = fixture.folder("projeto");
+        folder::open_or_init(&folder).unwrap();
+
+        let response = fixture.request(
+            "workspace.relink",
+            serde_json::json!({"id": "nope", "path": folder}),
+        );
+
+        assert_eq!(error_code(&response), "workspace_not_found");
+    }
+
+    #[tokio::test]
+    async fn remove_drops_the_registry_entry_and_keeps_the_folder() {
+        let mut fixture = Fixture::new("remove");
+        let folder = fixture.folder("projeto");
+        let kept = fixture.folder("kept");
+        let (workspace, _, _) = fixture.add(&folder);
+        fixture.add(&kept);
+        let id = workspace.folder.unwrap().id;
+        fixture.close(&workspace.workspace_id);
+        let moved = move_folder(&fixture, &folder, "moved");
+        let before = std::fs::read(moved.join(".regents/workspace.toml")).unwrap();
+
+        let response = fixture.request("workspace.remove", serde_json::json!({"id": id}));
+
+        let result = &response["result"];
+        assert_eq!(result["type"], "workspace_removed", "{response}");
+        assert_eq!(result["workspace"]["id"], id);
+        assert_eq!(result["workspace"]["path"], folder.display().to_string());
+        let registered = fixture.registered();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].path, kept.display().to_string());
+        assert_eq!(
+            std::fs::read(moved.join(".regents/workspace.toml")).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_keeps_a_connected_folder_on_disk() {
+        let mut fixture = Fixture::new("remove-connected");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.unwrap().id;
+        fixture.close(&workspace.workspace_id);
+
+        let response = fixture.request("workspace.remove", serde_json::json!({"id": id}));
+
+        assert_eq!(
+            response["result"]["type"], "workspace_removed",
+            "{response}"
+        );
+        assert!(fixture.registered().is_empty());
+        assert_eq!(folder::read_manifest(&folder).unwrap().id, id);
+        assert!(folder.join(".regents/channels/geral").is_dir());
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_an_open_workspace() {
+        let mut fixture = Fixture::new("remove-open");
+        let folder = fixture.folder("projeto");
+        let (workspace, _, _) = fixture.add(&folder);
+        let id = workspace.folder.unwrap().id;
+
+        let response = fixture.request("workspace.remove", serde_json::json!({"id": id}));
+
+        assert_eq!(error_code(&response), "workspace_open");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!(
+                "regents workspace close {}",
+                workspace.workspace_id
+            )),
+            "{message}"
+        );
+        assert_eq!(fixture.registered().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_an_unknown_id() {
+        let mut fixture = Fixture::new("remove-unknown");
+
+        let response = fixture.request("workspace.remove", serde_json::json!({"id": "nope"}));
+
+        assert_eq!(error_code(&response), "workspace_not_found");
+    }
+
+    #[tokio::test]
+    async fn herdr_has_no_workspace_relink() {
+        let mut fixture = Fixture::new("herdr-relink");
+        fixture.app.workspace_registry_path = None;
+        let folder = fixture.folder("projeto");
+
+        let response = fixture.request(
+            "workspace.relink",
+            serde_json::json!({"id": "x", "path": folder}),
+        );
+
+        assert_eq!(error_code(&response), "unsupported");
     }
 
     #[tokio::test]

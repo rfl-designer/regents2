@@ -148,6 +148,8 @@ operations::define_operations! {
     WorkspaceAdd(WorkspaceAddParams) => "workspace.add", true, false;
     WorkspaceRegistryList(EmptyParams) => "workspace.registry.list", false, false;
     WorkspaceLink(WorkspaceLinkParams) => "workspace.link", true, false;
+    WorkspaceRelink(WorkspaceRelinkParams) => "workspace.relink", true, false;
+    WorkspaceRemove(WorkspaceRemoveParams) => "workspace.remove", false, false;
 }
 
 #[cfg(test)]

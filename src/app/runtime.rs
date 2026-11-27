@@ -164,6 +164,7 @@ impl App {
                 .flatten(),
             self.restored_worktree_validation_retry_at,
             self.next_auto_update_check,
+            self.folder_connection_check_deadline(now),
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
             self.pending_agent_resume_deadline,

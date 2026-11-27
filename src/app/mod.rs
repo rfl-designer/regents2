@@ -30,7 +30,7 @@ mod theme_sync;
 mod window_title;
 mod worktrees;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::io;
 use std::sync::Arc;
@@ -140,6 +140,13 @@ pub struct App {
     folder_reopen_exhausted: bool,
     /// Regents: folders that the user closed last; the reopen skips them.
     reopen_excluded_folders: Vec<String>,
+    /// Regents: IDs of open folder workspaces whose folder is no longer at
+    /// the known path. Refreshed at load, list, relink and guard time and by
+    /// the periodic check of the event loop, never during render.
+    disconnected_folders: HashSet<String>,
+    /// Regents: next periodic check of the open workspace folders; `None`
+    /// until the first check.
+    next_folder_connection_check: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -665,6 +672,8 @@ impl App {
             workspace_registry_path: crate::regents::workspace_registry_path(),
             folder_reopen_exhausted: false,
             reopen_excluded_folders: Vec::new(),
+            disconnected_folders: HashSet::new(),
+            next_folder_connection_check: None,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -713,6 +722,7 @@ impl App {
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
         app.refresh_restored_workspace_git_metadata();
+        app.refresh_folder_connections();
         Ok(app)
     }
 
@@ -776,6 +786,7 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
         app.refresh_restored_workspace_git_metadata();
+        app.refresh_folder_connections();
         Ok(app)
     }
 
