@@ -75,8 +75,12 @@ Thread que você abre com um agente, fora de um canal, num pane visível em que 
 _Avoid_: DM, chat privado
 
 **Thread ativa**:
-Thread cuja CLI executa agora, também quando ela espera uma aprovação. Uma thread na fila não é ativa. Cada thread ativa de canal ocupa uma vaga do limite de threads ativas (`max_active_threads` em `workspace.toml`). Quando o mesmo agente recebe uma nova menção no mesmo canal, a thread ativa decide se absorve a menção ou se o Regents abre uma thread nova.
+Thread cuja CLI executa agora, também quando ela espera uma aprovação ou decide sobre uma menção pendente. Uma thread na fila não é ativa. Cada thread ativa de canal ocupa uma vaga do limite de threads ativas (`max_active_threads` em `workspace.toml`). Quando o mesmo agente recebe uma nova menção no mesmo canal, a menção fica pendente na thread ativa, e a thread decide se absorve a menção ou se o Regents abre uma thread nova. Uma thread ativa termina no primeiro idle depois do trabalho, exceto quando uma menção pendente a espera: nesse idle, a thread recebe a menção.
 _Avoid_: Thread aberta, thread viva
+
+**Menção pendente**:
+Menção a um agente que tem uma thread ativa no mesmo canal. Cada thread ativa tem no máximo uma menção pendente. O Regents entrega a menção inteira no próximo idle da thread, nunca durante uma aprovação. A thread responde `regents thread accept` (a menção começa o próximo turno da thread) ou `regents thread fork` (o Regents abre uma thread nova para a menção). Sem resposta até o prazo (`mention_decision_timeout_seconds` em `workspace.toml`), ou quando a thread termina, o Regents abre uma thread nova. Uma menção em outro canal nunca fica pendente.
+_Avoid_: Menção na fila, segunda menção
 
 **Thread interrompida**:
 Thread ativa que parou porque o Regents reiniciou. Ela só continua quando alguém retoma a thread.

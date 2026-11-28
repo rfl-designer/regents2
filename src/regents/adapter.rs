@@ -244,6 +244,35 @@ pub(crate) fn resume_prompt(reply: &Message, new: &[Message]) -> String {
     prompt
 }
 
+/// True when an active thread of `cli` can get a new mention in its running
+/// CLI session: the server types it into the pane at an idle (#17). Only
+/// claude has a thread adapter; codex would use `codex queue` (#22).
+pub(crate) fn has_mid_session_delivery(cli: AgentCli) -> bool {
+    matches!(cli, AgentCli::Claude)
+}
+
+/// What the server types into an active thread at an idle when a new
+/// mention of its agent waits in its channel: the whole mention, and how to
+/// take it or leave it to a new thread.
+pub(crate) fn decision_prompt(mention: &Message) -> String {
+    let channel = &mention.channel;
+    format!(
+        "Uma nova mensagem mencionou você no canal #{channel} do Regents enquanto esta thread \
+         está ativa.\n\n\
+         Mensagem [{}] ({}):\n{}\n\n\
+         Decida agora com um comando:\n\
+         - regents thread accept: você trata a mensagem nesta thread e responde no canal com \
+         regents channel post {channel} \"<resposta>\"\n\
+         - regents thread fork: o Regents abre uma thread nova para a mensagem; depois disso, \
+         não faça mais nada\n\
+         {PROMPT_LAST_LINE}\n",
+        mention.id,
+        author_label(mention),
+        // An ESC in the body could end the bracketed paste and type keys.
+        mention.body.replace('\x1b', ""),
+    )
+}
+
 fn author_label(message: &Message) -> String {
     let kind = match message.author.kind {
         AuthorKind::Human => "humano",
@@ -296,6 +325,28 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         std::fs::read_to_string(path).unwrap()
+    }
+
+    // #17: with accept, the thread has the whole mention, however long, and
+    // the screen reply still starts after the echo of the prompt.
+    #[test]
+    fn the_decision_prompt_carries_the_whole_mention_and_both_commands() {
+        let body = format!("@chief {}fim", "uma linha longa\n".repeat(400));
+
+        let prompt = decision_prompt(&message(7, &body));
+
+        assert!(prompt.contains(&body), "the whole body");
+        assert!(prompt.contains("Mensagem [7] (rafael, humano)"), "{prompt}");
+        assert!(prompt.contains("regents thread accept"));
+        assert!(prompt.contains("regents thread fork"));
+        assert!(prompt.contains("regents channel post geral"));
+        assert!(prompt.trim_end().ends_with(PROMPT_LAST_LINE));
+        let escaped = decision_prompt(&message(8, "@chief log\x1b[201~\r\x1b[31mfim"));
+        assert!(!escaped.contains('\x1b'), "{escaped:?}");
+        assert!(escaped.contains("@chief log[201~\r[31mfim"));
+        assert!(has_mid_session_delivery(AgentCli::Claude));
+        assert!(!has_mid_session_delivery(AgentCli::Codex));
+        assert!(!has_mid_session_delivery(AgentCli::Agy));
     }
 
     #[test]

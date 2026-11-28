@@ -158,6 +158,8 @@ operations::define_operations! {
     ChannelRead(ChannelReadParams) => "channel.read", false, false;
     ThreadList(ThreadListParams) => "thread.list", false, false;
     ThreadOpen(ThreadOpenParams) => "thread.open", true, true;
+    ThreadAccept(ThreadDecisionParams) => "thread.accept", false, false;
+    ThreadFork(ThreadDecisionParams) => "thread.fork", false, false;
     AgentDefinitionList(AgentDefinitionListParams) => "agent.definition.list", false, false;
     ChannelOpen(ChannelOpenParams) => "channel.open", true, true;
     ChannelCreate(ChannelCreateParams) => "channel.create", false, false;

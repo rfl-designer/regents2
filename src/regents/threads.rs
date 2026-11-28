@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, OptionalExtension};
 
 use super::agents::{AgentCli, Isolation};
+use super::pending::Phase;
 use super::store;
 use crate::detect::AgentState;
 
@@ -49,6 +50,23 @@ const SCHEMA: store::Schema = store::Schema {
          ALTER TABLE threads ADD COLUMN queued_message_id INTEGER;
          CREATE UNIQUE INDEX threads_one_queued_per_pair
              ON threads(agent, channel) WHERE state = 'queued';",
+        // Version 4: the pending mentions of active threads (#17). An open
+        // mention ('waiting' or 'delivered') is one per thread; each phase
+        // change is a compare-and-set, so a decision applies once.
+        "CREATE TABLE pending_mentions (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             thread_id INTEGER NOT NULL,
+             message_id INTEGER NOT NULL,
+             phase TEXT NOT NULL,
+             -- Unix seconds: past it an open mention times out.
+             decide_by INTEGER NOT NULL,
+             -- The thread that took the mention after a fork or a timeout.
+             fork_thread_id INTEGER,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         CREATE UNIQUE INDEX pending_mentions_one_open_per_thread
+             ON pending_mentions(thread_id) WHERE phase IN ('waiting', 'delivered');",
     ],
 };
 
@@ -183,6 +201,21 @@ pub(crate) enum Admission {
     Queued(String),
     /// The queued thread of the same agent and channel took the mention.
     Absorbed(String),
+    /// The mention waits for the decision of this active thread.
+    Pending(String),
+}
+
+/// A mention that waits for, or got, the decision of an active thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingMention {
+    pub(crate) id: i64,
+    pub(crate) thread_id: String,
+    pub(crate) message_id: u64,
+    pub(crate) phase: Phase,
+    /// Unix seconds: past it an open mention times out.
+    pub(crate) decide_by: i64,
+    /// The thread that took the mention after a fork or a timeout.
+    pub(crate) fork_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,61 +305,187 @@ impl ThreadRegistry {
         })
     }
 
-    /// Admission of a mention: a new queued thread, or the queued thread of
-    /// the same agent and channel takes the mention as its new anchor. The
-    /// drain starts it.
-    // shortcut: only a queued thread absorbs a mention, and an older mention
-    // can fall out of the RECENT_MESSAGES of the prompt; let an active thread
-    // absorb too (and widen the prompt) when its agent decides (#17).
+    /// Admission of a mention. The queued thread of the same agent and
+    /// channel takes the mention as its new anchor. Otherwise, with a
+    /// deadline `decide_by` (Unix seconds), the newest active channel thread
+    /// of the pair without an open pending mention gets it as pending: it
+    /// decides (#17). Otherwise a new thread enters the queue, and the drain
+    /// starts it.
+    // shortcut: an older mention that a queued thread absorbed can fall out
+    // of the RECENT_MESSAGES of its prompt; keep every absorbed mention when
+    // an agent needs them all.
     pub(crate) fn admit_mention(
         &self,
         thread: NewThread,
+        decide_by: Option<i64>,
         now: time::OffsetDateTime,
     ) -> Result<Admission, ThreadError> {
         let now = super::utc_seconds(now).map_err(ThreadError)?;
-        let message = thread.origin_message_id.map(sql_message_id).transpose()?;
         let mut connection = store::open_writable(&self.path, &SCHEMA)?;
-        // One writer at a time: the absorb and the insert see the same queue.
+        // One writer at a time: the absorb, the pending mention and the
+        // insert see the same queue.
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let absorbed: Option<i64> = transaction
-            .query_row(
-                "UPDATE threads
-                 SET queued_message_id = max(coalesce(queued_message_id, 0), ?1), updated_at = ?2
-                 WHERE state = 'queued' AND agent = ?3 AND channel IS ?4
-                 RETURNING id",
-                params![message, now, thread.agent, thread.channel],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let admission = match absorbed {
-            Some(row) => Admission::Absorbed(format!("{ID_PREFIX}{row}")),
-            None => {
-                transaction.execute(
-                    "INSERT INTO threads
-                         (agent, cli, origin_kind, channel, origin_message_id, opener_thread_id,
-                          depth, isolation, state, session_id, created_at, updated_at,
-                          queue_seq, queued_message_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?10, ?10,
-                             (SELECT coalesce(max(queue_seq), 0) + 1 FROM threads), ?5)",
-                    params![
-                        thread.agent,
-                        thread.cli.as_str(),
-                        thread.origin.as_str(),
-                        thread.channel,
-                        message,
-                        thread.opener_thread_id,
-                        thread.depth,
-                        thread.isolation.as_str(),
-                        thread.session_id,
-                        now,
-                    ],
-                )?;
-                Admission::Queued(format!("{ID_PREFIX}{}", transaction.last_insert_rowid()))
+        let admission = match (decide_by, thread.origin_message_id) {
+            (Some(decide_by), Some(message)) if !has_queued(&transaction, &thread)? => {
+                let active: Option<i64> = transaction
+                    .query_row(
+                        "SELECT id FROM threads
+                         WHERE state = 'active' AND origin_kind = 'channel'
+                           AND agent = ?1 AND channel IS ?2
+                           AND id NOT IN (SELECT thread_id FROM pending_mentions
+                                          WHERE phase IN ('waiting', 'delivered'))
+                         ORDER BY id DESC LIMIT 1",
+                        params![thread.agent, thread.channel],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match active {
+                    Some(row) => {
+                        transaction.execute(
+                            "INSERT INTO pending_mentions
+                                 (thread_id, message_id, phase, decide_by, created_at, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                            params![
+                                row,
+                                sql_message_id(message)?,
+                                Phase::Waiting.as_str(),
+                                decide_by,
+                                now
+                            ],
+                        )?;
+                        Admission::Pending(format!("{ID_PREFIX}{row}"))
+                    }
+                    None => queue_in(&transaction, &thread, &now)?,
+                }
             }
+            _ => queue_in(&transaction, &thread, &now)?,
         };
         transaction.commit()?;
         Ok(admission)
+    }
+
+    /// The open pending mentions, oldest first.
+    pub(crate) fn open_pending_mentions(&self) -> Result<Vec<PendingMention>, ThreadError> {
+        self.pending_query("WHERE phase IN ('waiting', 'delivered') ORDER BY id", [])
+    }
+
+    /// The newest pending mention of the thread `thread_id`, open or not.
+    pub(crate) fn latest_pending_mention(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<PendingMention>, ThreadError> {
+        let row = parse_id(thread_id)?;
+        Ok(self
+            .pending_query("WHERE thread_id = ?1 ORDER BY id DESC LIMIT 1", [row])?
+            .pop())
+    }
+
+    /// Compare-and-set of a step of `pending`: it goes from its phase to
+    /// `to`, with the change that `to` brings to its thread. An accept
+    /// starts the decision turn at the mention; a fork or a timeout admits
+    /// `fork` as a new thread, or gives the mention to the queued thread of
+    /// the pair. False when another writer changed the mention first.
+    pub(crate) fn advance_pending(
+        &self,
+        pending: &PendingMention,
+        to: Phase,
+        fork: Option<NewThread>,
+        now: time::OffsetDateTime,
+    ) -> Result<bool, ThreadError> {
+        let now = super::utc_seconds(now).map_err(ThreadError)?;
+        let thread = parse_id(&pending.thread_id)?;
+        let mut connection = store::open_writable(&self.path, &SCHEMA)?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE pending_mentions SET phase = ?1, updated_at = ?2 WHERE id = ?3 AND phase = ?4",
+            params![to.as_str(), now, pending.id, pending.phase.as_str()],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        match to {
+            Phase::Accepted => {
+                transaction.execute(
+                    "UPDATE threads SET turn_message_id = ?1, updated_at = ?2
+                     WHERE id = ?3 AND state = 'active'",
+                    params![sql_message_id(pending.message_id)?, now, thread],
+                )?;
+            }
+            Phase::Forked | Phase::TimedOut => {
+                if let Some(fork) = &fork {
+                    let admitted = queue_in(&transaction, fork, &now)?;
+                    if let Admission::Queued(id) | Admission::Absorbed(id) = &admitted {
+                        transaction.execute(
+                            "UPDATE pending_mentions SET fork_thread_id = ?1 WHERE id = ?2",
+                            params![parse_id(id)?, pending.id],
+                        )?;
+                    }
+                }
+            }
+            Phase::Waiting | Phase::Delivered => {}
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// The CLI session of the active thread `id` got a new prompt: the
+    /// decision about a pending mention is its next turn.
+    pub(crate) fn start_decision_turn(
+        &self,
+        id: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<(), ThreadError> {
+        let now = super::utc_seconds(now).map_err(ThreadError)?;
+        store::open_writable(&self.path, &SCHEMA)?.execute(
+            "UPDATE threads SET turn = turn + 1, updated_at = ?1 WHERE id = ?2 AND state = 'active'",
+            params![now, parse_id(id)?],
+        )?;
+        Ok(())
+    }
+
+    fn pending_query<P: rusqlite::Params>(
+        &self,
+        clause: &str,
+        params: P,
+    ) -> Result<Vec<PendingMention>, ThreadError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, thread_id, message_id, phase, decide_by, fork_thread_id
+             FROM pending_mentions {clause}"
+        ))?;
+        let rows = statement.query_map(params, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        let mut mentions = Vec::new();
+        for row in rows {
+            let (id, thread, message, phase, decide_by, fork) = row?;
+            // A phase of a newer Regents is not this Regents' to step.
+            let (Some(phase), Ok(message_id)) = (Phase::parse(&phase), u64::try_from(message))
+            else {
+                continue;
+            };
+            mentions.push(PendingMention {
+                id,
+                thread_id: format!("{ID_PREFIX}{thread}"),
+                message_id,
+                phase,
+                decide_by,
+                fork_thread_id: fork.map(|row| format!("{ID_PREFIX}{row}")),
+            });
+        }
+        Ok(mentions)
     }
 
     /// Compare-and-set of the admission of a resume: the thread `id` enters
@@ -644,6 +803,63 @@ pub(crate) fn read_output_from(dir: &Path, id: &str) -> Option<String> {
             .is_file()
     })?;
     std::fs::read_to_string(output_path(&root.join(super::folder::STATE_DIR), id)?).ok()
+}
+
+/// True when the agent of `thread` has a queued thread in its channel.
+fn has_queued(transaction: &rusqlite::Transaction, thread: &NewThread) -> rusqlite::Result<bool> {
+    transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM threads WHERE state = 'queued' AND agent = ?1 AND channel IS ?2)",
+        params![thread.agent, thread.channel],
+        |row| row.get(0),
+    )
+}
+
+/// The queue part of an admission: the queued thread of the same agent and
+/// channel takes the mention as its new anchor, or `thread` enters the
+/// queue.
+fn queue_in(
+    transaction: &rusqlite::Transaction,
+    thread: &NewThread,
+    now: &str,
+) -> Result<Admission, ThreadError> {
+    let message = thread.origin_message_id.map(sql_message_id).transpose()?;
+    let absorbed: Option<i64> = transaction
+        .query_row(
+            "UPDATE threads
+             SET queued_message_id = max(coalesce(queued_message_id, 0), ?1), updated_at = ?2
+             WHERE state = 'queued' AND agent = ?3 AND channel IS ?4
+             RETURNING id",
+            params![message, now, thread.agent, thread.channel],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(row) = absorbed {
+        return Ok(Admission::Absorbed(format!("{ID_PREFIX}{row}")));
+    }
+    transaction.execute(
+        "INSERT INTO threads
+             (agent, cli, origin_kind, channel, origin_message_id, opener_thread_id,
+              depth, isolation, state, session_id, created_at, updated_at,
+              queue_seq, queued_message_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?10, ?10,
+                 (SELECT coalesce(max(queue_seq), 0) + 1 FROM threads), ?5)",
+        params![
+            thread.agent,
+            thread.cli.as_str(),
+            thread.origin.as_str(),
+            thread.channel,
+            message,
+            thread.opener_thread_id,
+            thread.depth,
+            thread.isolation.as_str(),
+            thread.session_id,
+            now,
+        ],
+    )?;
+    Ok(Admission::Queued(format!(
+        "{ID_PREFIX}{}",
+        transaction.last_insert_rowid()
+    )))
 }
 
 fn sql_message_id(id: u64) -> Result<i64, ThreadError> {
@@ -992,6 +1208,7 @@ mod tests {
                         channel: Some(channel.into()),
                         ..mention(agent, message)
                     },
+                    None,
                     at(0),
                 )
                 .unwrap()
@@ -1182,10 +1399,172 @@ mod tests {
         assert_eq!(listed[0].queue_position, None);
         assert_eq!(
             registry(&folder.0)
-                .admit_mention(mention("chief", 5), at(0))
+                .admit_mention(mention("chief", 5), None, at(0))
                 .unwrap(),
             Admission::Queued("t2".into())
         );
+    }
+
+    // #17: a mention of the pair of an active thread is pending in it, once
+    // per thread; another channel, a queued pair or no deadline queue.
+    #[test]
+    fn a_mention_of_an_active_pair_is_pending_once_per_thread() {
+        let folder = TempFolder::new("threads-pending");
+        let registry = registry(&folder.0);
+        let active = registry.create(mention("chief", 1), at(0)).unwrap();
+        let admit = |channel: &str, message, decide_by| {
+            registry
+                .admit_mention(
+                    NewThread {
+                        channel: Some(channel.into()),
+                        ..mention("chief", message)
+                    },
+                    decide_by,
+                    at(0),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(
+            admit("geral", 2, Some(300)),
+            Admission::Pending(active.id.clone())
+        );
+        assert_eq!(
+            admit("geral", 3, Some(300)),
+            Admission::Queued("t2".into()),
+            "one open pending mention per thread"
+        );
+        assert_eq!(
+            admit("geral", 4, Some(300)),
+            Admission::Absorbed("t2".into()),
+            "the queued thread of the pair first"
+        );
+        assert_eq!(
+            admit("dev", 5, Some(300)),
+            Admission::Queued("t3".into()),
+            "another channel"
+        );
+        let open = registry.open_pending_mentions().unwrap();
+        assert_eq!(
+            open,
+            [PendingMention {
+                id: 1,
+                thread_id: active.id.clone(),
+                message_id: 2,
+                phase: Phase::Waiting,
+                decide_by: 300,
+                fork_thread_id: None,
+            }]
+        );
+        let second_open = store::open_writable(&registry.path, &SCHEMA)
+            .unwrap()
+            .execute(
+                "INSERT INTO pending_mentions
+                     (thread_id, message_id, phase, decide_by, created_at, updated_at)
+                 VALUES (1, 9, 'delivered', 0, 'x', 'x')",
+                [],
+            );
+        assert!(second_open.is_err(), "the index holds the invariant");
+        assert_eq!(
+            registry.latest_pending_mention(&active.id).unwrap(),
+            Some(open[0].clone())
+        );
+        assert_eq!(registry.latest_pending_mention("t3").unwrap(), None);
+    }
+
+    #[test]
+    fn a_delivery_starts_the_next_turn_and_an_accept_anchors_it_at_the_mention() {
+        let folder = TempFolder::new("threads-pending-accept");
+        let registry = registry(&folder.0);
+        let active = registry.create(mention("chief", 1), at(0)).unwrap();
+        registry
+            .admit_mention(mention("chief", 2), Some(300), at(0))
+            .unwrap();
+        let waiting = registry.open_pending_mentions().unwrap().remove(0);
+
+        assert_eq!(
+            registry.advance_pending(&waiting, Phase::Delivered, None, at(1)),
+            Ok(true)
+        );
+        assert_eq!(
+            registry.advance_pending(&waiting, Phase::Delivered, None, at(1)),
+            Ok(false),
+            "a stale phase loses"
+        );
+        let record = registry.get(&active.id).unwrap().unwrap();
+        assert_eq!(
+            (record.turn, record.turn_message_id),
+            (0, Some(1)),
+            "the turn waits for the CLI to get the prompt"
+        );
+        registry.start_decision_turn(&active.id, at(1)).unwrap();
+        let record = registry.get(&active.id).unwrap().unwrap();
+        assert_eq!((record.turn, record.turn_message_id), (1, Some(1)));
+
+        let delivered = registry
+            .latest_pending_mention(&active.id)
+            .unwrap()
+            .unwrap();
+        assert!(registry
+            .advance_pending(&delivered, Phase::Accepted, None, at(2))
+            .unwrap());
+
+        let record = registry.get(&active.id).unwrap().unwrap();
+        assert_eq!((record.turn, record.turn_message_id), (1, Some(2)));
+        assert_eq!(registry.list().unwrap().len(), 1, "no new thread");
+        assert!(registry.open_pending_mentions().unwrap().is_empty());
+        assert_eq!(
+            registry
+                .admit_mention(mention("chief", 3), Some(300), at(3))
+                .unwrap(),
+            Admission::Pending(active.id),
+            "a decided mention frees the thread for the next one"
+        );
+    }
+
+    #[test]
+    fn concurrent_forks_open_one_thread() {
+        let folder = TempFolder::new("threads-pending-race");
+        registry(&folder.0)
+            .create(mention("chief", 1), at(0))
+            .unwrap();
+        registry(&folder.0)
+            .admit_mention(mention("chief", 2), Some(300), at(0))
+            .unwrap();
+        let waiting = registry(&folder.0)
+            .open_pending_mentions()
+            .unwrap()
+            .remove(0);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        let won = (0..8)
+            .map(|_| {
+                let (path, barrier, waiting) = (folder.0.clone(), barrier.clone(), waiting.clone());
+                std::thread::spawn(move || {
+                    let registry = registry(&path);
+                    barrier.wait();
+                    registry
+                        .advance_pending(&waiting, Phase::Forked, Some(mention("chief", 2)), at(1))
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|&won| won)
+            .count();
+
+        assert_eq!(won, 1);
+        let records = registry(&folder.0).list().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].origin_message_id, Some(2));
+        assert_eq!(records[1].state, ThreadState::Queued);
+        let forked = registry(&folder.0)
+            .latest_pending_mention("t1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(forked.phase, Phase::Forked);
+        assert_eq!(forked.fork_thread_id.as_deref(), Some("t2"));
     }
 
     #[test]

@@ -4,7 +4,11 @@
 //! presentation work. The thread registry in the workspace folder records
 //! it. When the agent finishes its turn, the CLI process ends and the thread
 //! keeps its CLI session. A threaded reply to a message of a done thread
-//! resumes that session in the next turn of the same thread (#14).
+//! resumes that session in the next turn of the same thread (#14). A new
+//! mention of the agent of an active thread, in its channel, waits for the
+//! decision of that thread (#17, `pending`).
+
+mod pending;
 
 use std::path::{Path, PathBuf};
 
@@ -62,6 +66,9 @@ pub(crate) struct RunningThread {
     /// a post of the thread after it is the reply of the turn.
     turn: u32,
     turn_message_id: Option<u64>,
+    /// The turn that runs is the decision about a pending mention: its
+    /// reply is no reply to the channel, unless the thread accepts.
+    decision_turn: bool,
 }
 
 /// The first prompt of a thread opened by `message`: the mention and the
@@ -111,8 +118,9 @@ impl App {
         self.drain_thread_queue(state_dir);
     }
 
-    /// The admission of a mention of `agent`: a new queued thread, or the
-    /// mention moves the anchor of its queued thread in the channel.
+    /// The admission of a mention of `agent`: a new queued thread, the
+    /// mention moves the anchor of its queued thread in the channel, or it
+    /// waits for the decision of an active thread of the agent there.
     fn admit_mention(
         &mut self,
         ws_idx: usize,
@@ -143,11 +151,19 @@ impl App {
             isolation: Isolation::Shared,
             session_id: Some(adapter::new_session_id()),
         };
+        let now = time::OffsetDateTime::now_utc();
+        let decide_by = self.mention_decision_deadline(state_dir, agent.cli, now);
         let admission = threads::registry(state_dir)
-            .admit_mention(thread, time::OffsetDateTime::now_utc())
+            .admit_mention(thread, decide_by, now)
             .map_err(|err| err.to_string())?;
-        if let Admission::Absorbed(thread_id) = &admission {
-            tracing::info!(thread = %thread_id, message = origin.id, "a queued thread absorbed a mention");
+        match &admission {
+            Admission::Absorbed(thread_id) => {
+                tracing::info!(thread = %thread_id, message = origin.id, "a queued thread absorbed a mention");
+            }
+            Admission::Pending(thread_id) => {
+                tracing::info!(thread = %thread_id, message = origin.id, "a mention waits for an active thread");
+            }
+            Admission::Queued(_) => {}
         }
         self.refresh_folder_threads();
         Ok(())
@@ -301,6 +317,7 @@ impl App {
             if self.recovered_thread_folders.insert(folder_id) {
                 self.interrupt_orphan_threads(&state_dir);
             }
+            self.tick_pending_mentions(&state_dir);
             self.drain_thread_queue(&state_dir);
         }
     }
@@ -435,6 +452,7 @@ impl App {
                         channel: thread.channel,
                         turn: thread.turn,
                         turn_message_id: thread.turn_message_id,
+                        decision_turn: false,
                     },
                 );
                 Ok(pane_id)
@@ -675,7 +693,11 @@ impl App {
                         body,
                     );
                 }
-                ThreadStep::Done => self.end_thread(update.pane_id, ThreadState::Done, None),
+                ThreadStep::Done => {
+                    if !self.pending_mention_at_idle(update.pane_id) {
+                        self.end_thread(update.pane_id, ThreadState::Done, None);
+                    }
+                }
             }
         }
     }
@@ -774,7 +796,7 @@ impl App {
             return;
         };
         // ADR-0004: a failed or interrupted turn can be incomplete or go on.
-        if state == ThreadState::Done {
+        if state == ThreadState::Done && !thread.decision_turn {
             self.capture_reply(pane_id, &thread);
         }
         if let Some(runtime) = self.terminal_runtimes.get(&thread.terminal_id) {
@@ -818,6 +840,7 @@ impl App {
             self.expected_thread_exits.insert(pane_id);
             self.shutdown_terminal_runtime(thread.terminal_id);
         }
+        self.end_pending_mention(&thread.state_dir, &thread.thread_id);
         // The slot is free.
         self.drain_thread_queue(&thread.state_dir);
     }
@@ -1234,6 +1257,7 @@ impl App {
                     channel: Some("geral".into()),
                     turn: 0,
                     turn_message_id: Some(1),
+                    decision_turn: false,
                 },
             );
         }
@@ -1313,8 +1337,14 @@ mod tests {
 
         /// The agent of the thread works and goes idle: the thread is done.
         fn finish_turn(&mut self, pane_id: PaneId) {
+            self.report(pane_id, &["working", "idle"]);
+            assert!(!self.app.running_threads.contains_key(&pane_id));
+        }
+
+        /// The agent of the thread reports `states`, in order.
+        fn report(&mut self, pane_id: PaneId, states: &[&str]) {
             let public_pane_id = self.public_pane_id(pane_id);
-            for state in ["working", "idle"] {
+            for state in states {
                 let reported = self.request(
                     "pane.report_agent",
                     json!({"pane_id": public_pane_id, "source": "custom:test",
@@ -1322,7 +1352,6 @@ mod tests {
                 );
                 assert!(reported.get("error").is_none(), "{reported}");
             }
-            assert!(!self.app.running_threads.contains_key(&pane_id));
         }
 
         /// A post of the thread `t1` with its credential.
@@ -2459,6 +2488,8 @@ contains = ["FAKE-WORKING"]
         let mut fixture = Fixture::new("resume-then-mention");
         let (_, state_dir, workspace_id) = fixture.done_thread();
         fixture.reply(&workspace_id, 2, "e o resto?");
+        // While the resumed turn runs, the mention would wait for t1 (#17).
+        fixture.finish_turn(fixture.running_pane("t1"));
 
         let posted = fixture.request(
             "channel.post",
@@ -2902,6 +2933,8 @@ contains = ["FAKE-WORKING"]
         let (ws_idx, state_dir, workspace_id) = fixture.done_thread();
         Fixture::set_limit(&state_dir, 1);
         fixture.thread(ws_idx, &state_dir);
+        // The first mention waits for the active t2 (#17); the next queues.
+        fixture.mention(&workspace_id, "geral", "@chief antes");
         fixture.mention(&workspace_id, "geral", "@chief outra coisa");
         assert_eq!(Fixture::records(&state_dir)[2].state, ThreadState::Queued);
 
@@ -3307,6 +3340,8 @@ contains = ["FAKE-WORKING"]
     async fn a_new_limit_applies_to_the_next_threads() {
         let mut fixture = Fixture::new("queue-limit");
         let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        // A third agent: a mention of chief in #geral would wait for t1 (#17).
+        Fixture::agent(&state_dir, "coder");
         fixture.mention(&workspace_id, "geral", "@chief um");
         fixture.mention(&workspace_id, "geral", "@reviewer dois");
 
@@ -3320,7 +3355,7 @@ contains = ["FAKE-WORKING"]
 
         Fixture::set_limit(&state_dir, 1);
         fixture.app.refresh_folder_connections();
-        fixture.mention(&workspace_id, "geral", "@chief três");
+        fixture.mention(&workspace_id, "geral", "@coder três");
         assert_eq!(
             Fixture::queue(&state_dir),
             (vec!["t1".into(), "t2".into()], vec!["t3".into()]),
@@ -3407,9 +3442,12 @@ contains = ["FAKE-WORKING"]
         for handoff in [false, true] {
             let mut old = Fixture::new(&format!("queue-restart-old-{handoff}"));
             let (_, state_dir, workspace_id) = queue_workspace(&mut old, 1);
+            // A third agent: a mention of chief in #geral would wait for t1
+            // (#17).
+            Fixture::agent(&state_dir, "coder");
             old.mention(&workspace_id, "geral", "@chief um");
             old.mention(&workspace_id, "geral", "@reviewer dois");
-            old.mention(&workspace_id, "geral", "@chief três");
+            old.mention(&workspace_id, "geral", "@coder três");
             if handoff {
                 old.app.interrupt_running_threads();
                 assert_eq!(
@@ -3478,8 +3516,11 @@ contains = ["FAKE-WORKING"]
             .is_empty());
     }
 
-    /// The reference model of the queue: FIFO, a slot counter and the
-    /// absorption rule.
+    /// The reference model of the queue: FIFO, a slot counter, the
+    /// absorption rule and the pending mention (#17): a mention of the pair
+    /// of an active thread without one waits in the newest such thread, its
+    /// first idle after work gets it, and the next idle or an end gives it
+    /// to the queue.
     #[derive(Default)]
     struct QueueModel {
         next_id: u32,
@@ -3487,32 +3528,69 @@ contains = ["FAKE-WORKING"]
         /// Active thread numbers, oldest first.
         active: Vec<u32>,
         queue: std::collections::VecDeque<(u32, &'static str, &'static str)>,
+        /// Agent and channel of each active thread.
+        pairs: std::collections::BTreeMap<u32, (&'static str, &'static str)>,
+        /// The open pending mention of an active thread: true once delivered.
+        pending: std::collections::BTreeMap<u32, bool>,
     }
 
     impl QueueModel {
         fn mention(&mut self, agent: &'static str, channel: &'static str) {
-            if !self
-                .queue
+            let waits_in = self
+                .active
                 .iter()
-                .any(|(_, a, c)| *a == agent && *c == channel)
-            {
-                self.next_id += 1;
-                self.queue.push_back((self.next_id, agent, channel));
+                .copied()
+                .filter(|id| self.pairs[id] == (agent, channel) && !self.pending.contains_key(id))
+                .max();
+            match waits_in {
+                Some(id) if !self.has_queued(agent, channel) => {
+                    self.pending.insert(id, false);
+                }
+                _ => self.admit(agent, channel),
             }
             self.drain();
         }
 
+        fn has_queued(&self, agent: &str, channel: &str) -> bool {
+            self.queue
+                .iter()
+                .any(|(_, a, c)| *a == agent && *c == channel)
+        }
+
+        fn admit(&mut self, agent: &'static str, channel: &'static str) {
+            if !self.has_queued(agent, channel) {
+                self.next_id += 1;
+                self.queue.push_back((self.next_id, agent, channel));
+            }
+        }
+
+        /// The thread at `index` works and goes idle.
+        fn finish(&mut self, index: usize) {
+            let id = self.active[index];
+            match self.pending.get(&id) {
+                Some(false) => {
+                    self.pending.insert(id, true);
+                }
+                _ => self.end(index),
+            }
+        }
+
         fn end(&mut self, index: usize) {
-            self.active.remove(index);
+            let id = self.active.remove(index);
+            let (agent, channel) = self.pairs.remove(&id).unwrap();
+            if self.pending.remove(&id).is_some() {
+                self.admit(agent, channel);
+            }
             self.drain();
         }
 
         fn drain(&mut self) {
             while self.active.len() < self.limit {
-                let Some((id, _, _)) = self.queue.pop_front() else {
+                let Some((id, agent, channel)) = self.queue.pop_front() else {
                     return;
                 };
                 self.active.push(id);
+                self.pairs.insert(id, (agent, channel));
             }
         }
 
@@ -3535,6 +3613,7 @@ contains = ["FAKE-WORKING"]
     async fn the_queue_follows_its_reference_model() {
         const AGENTS: [&str; 3] = ["chief", "reviewer", "coder"];
         const CHANNELS: [&str; 2] = ["geral", "dev"];
+        let (mut waited, mut delivered) = (0, 0);
         for seed in [1_u64, 7, 42] {
             let mut fixture = Fixture::new(&format!("queue-model-{seed}"));
             let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 2);
@@ -3573,20 +3652,26 @@ contains = ["FAKE-WORKING"]
                             active[index]
                         });
                         let pane_id = fixture.running_pane(&thread_id);
-                        match event {
-                            5 => fixture.finish_turn(pane_id),
-                            6 => fixture.exit(pane_id),
-                            _ => {
-                                let public_pane_id = fixture.public_pane_id(pane_id);
-                                fixture.request("pane.close", json!({"pane_id": public_pane_id}));
-                            }
-                        }
                         let position = model
                             .active
                             .iter()
                             .position(|id| format!("t{id}") == thread_id)
                             .unwrap();
-                        model.end(position);
+                        match event {
+                            5 => {
+                                fixture.report(pane_id, &["working", "idle"]);
+                                model.finish(position);
+                            }
+                            6 => {
+                                fixture.exit(pane_id);
+                                model.end(position);
+                            }
+                            _ => {
+                                let public_pane_id = fixture.public_pane_id(pane_id);
+                                fixture.request("pane.close", json!({"pane_id": public_pane_id}));
+                                model.end(position);
+                            }
+                        }
                     }
                     8 | 9 => {
                         let limit = 1 + next(3) as usize;
@@ -3603,8 +3688,22 @@ contains = ["FAKE-WORKING"]
                     "seed {seed}, step {step}"
                 );
                 fixture.assert_queue_invariants(&state_dir, model.limit);
+                waited += model
+                    .pending
+                    .values()
+                    .filter(|delivered| !**delivered)
+                    .count();
+                delivered += model
+                    .pending
+                    .values()
+                    .filter(|delivered| **delivered)
+                    .count();
             }
         }
+        assert!(
+            waited > 0 && delivered > 0,
+            "the events reach both open phases: {waited} {delivered}"
+        );
     }
 
     #[test]
@@ -3649,5 +3748,355 @@ contains = ["FAKE-WORKING"]
         assert!(!prompt.contains("msg-01"), "{prompt}");
         assert!(!prompt.contains("depois da menção"), "{prompt}");
         assert!(prompt.contains("@chief olá"));
+    }
+
+    // The pending mention (#17). Two agents, chief and reviewer, limit 3:
+    // `@chief um` opens t1, and a second mention of chief in #geral waits
+    // for the decision of t1.
+
+    impl Fixture {
+        /// A workspace with t1, a running thread of chief opened by
+        /// `@chief um`, and the mention `@chief dois` pending in it.
+        fn pending_workspace(&mut self) -> (PathBuf, String, PaneId, u64) {
+            let (_, state_dir, workspace_id) = queue_workspace(self, 3);
+            self.mention(&workspace_id, "geral", "@chief um");
+            let second = self.mention(&workspace_id, "geral", "@chief dois");
+            (state_dir, workspace_id, self.running_pane("t1"), second)
+        }
+
+        /// `thread.accept` or `thread.fork` with the credential of the
+        /// thread `thread_id` in `pane_id`.
+        fn decide(
+            &mut self,
+            workspace_id: &str,
+            method: &str,
+            pane_id: PaneId,
+            thread_id: &str,
+        ) -> Value {
+            let token = self.app.running_threads[&pane_id].token.clone();
+            self.request(
+                method,
+                json!({"workspace_id": workspace_id, "thread_id": thread_id, "thread_token": token}),
+            )
+        }
+
+        fn pending(state_dir: &Path) -> threads::PendingMention {
+            threads::registry(state_dir)
+                .latest_pending_mention("t1")
+                .unwrap()
+                .unwrap()
+        }
+
+        /// Writes `mention_decision_timeout_seconds = seconds`.
+        fn set_decision_timeout(state_dir: &Path, seconds: u64) {
+            let path = state_dir.join("workspace.toml");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("mention_decision_timeout_seconds"))
+                .unwrap()
+                .to_owned();
+            std::fs::write(
+                &path,
+                text.replace(
+                    &line,
+                    &format!("mention_decision_timeout_seconds = {seconds}"),
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    // AC1: with accept, no new thread opens and the mention belongs to the
+    // active thread: its next turn starts at the mention.
+    #[tokio::test]
+    async fn with_accept_no_thread_opens_and_the_mention_belongs_to_the_active_thread() {
+        let mut fixture = Fixture::new("pending-accept");
+        let (state_dir, workspace_id, pane_id, second) = fixture.pending_workspace();
+        assert_eq!(Fixture::records(&state_dir).len(), 1);
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::Waiting
+        );
+        let early = fixture.decide(&workspace_id, "thread.accept", pane_id, "t1");
+        assert_eq!(early["error"]["code"], "mention_not_delivered", "{early}");
+
+        fixture.report(pane_id, &["working", "idle"]);
+
+        assert!(
+            fixture.app.running_threads.contains_key(&pane_id),
+            "the done waits"
+        );
+        // The PTY echoes what the server typed: the decision prompt with
+        // the mention.
+        let terminal_id = fixture.app.running_threads[&pane_id].terminal_id.clone();
+        let mut screen = String::new();
+        for _ in 0..50 {
+            screen = fixture
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .recent_unwrapped_text_snapshot(OUTPUT_LINES)
+                .text;
+            if screen.contains("regents thread fork") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(screen.contains(&format!("Mensagem [{second}]")), "{screen}");
+        assert!(screen.contains("@chief dois"), "{screen}");
+        assert!(screen.contains("regents thread accept"), "{screen}");
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::Delivered
+        );
+        assert_eq!(
+            Fixture::records(&state_dir)[0].turn,
+            1,
+            "the decision is the next turn"
+        );
+        let accepted = fixture.decide(&workspace_id, "thread.accept", pane_id, "t1");
+        assert_eq!(
+            accepted["result"]["type"], "thread_mention_decided",
+            "{accepted}"
+        );
+        assert_eq!(accepted["result"]["decision"], "accepted", "{accepted}");
+        assert_eq!(accepted["result"]["message_id"], second, "{accepted}");
+        let again = fixture.decide(&workspace_id, "thread.accept", pane_id, "t1");
+        assert_eq!(
+            again["result"]["decision"], "accepted",
+            "idempotent: {again}"
+        );
+        let fork = fixture.decide(&workspace_id, "thread.fork", pane_id, "t1");
+        assert_eq!(fork["error"]["code"], "mention_already_decided", "{fork}");
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records.len(), 1, "no new thread");
+        assert_eq!(
+            (records[0].turn, records[0].turn_message_id),
+            (1, Some(second))
+        );
+        assert_eq!(
+            fixture.app.running_threads[&pane_id].turn_message_id,
+            Some(second)
+        );
+
+        fixture.finish_turn(pane_id);
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
+        fixture.assert_queue_invariants(&state_dir, 3);
+    }
+
+    // AC2: with fork, a new thread opens for the mention, and the decision
+    // turn of the active thread posts no reply.
+    #[tokio::test]
+    async fn with_fork_a_new_thread_opens_for_the_mention() {
+        let mut fixture = Fixture::new("pending-fork");
+        let (state_dir, workspace_id, pane_id, second) = fixture.pending_workspace();
+        // The agent gets the mention and runs `regents thread fork`.
+        fixture.report(pane_id, &["working", "idle", "working"]);
+
+        let forked = fixture.decide(&workspace_id, "thread.fork", pane_id, "t1");
+
+        assert_eq!(forked["result"]["decision"], "forked", "{forked}");
+        assert_eq!(forked["result"]["fork_thread_id"], "t2", "{forked}");
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].origin_message_id, Some(second));
+        assert_eq!(
+            (records[1].depth, records[1].opener_thread_id.clone()),
+            (0, None)
+        );
+        let prompt = fixture.running_argv("t2").pop().unwrap();
+        assert!(prompt.contains("@chief dois"), "{prompt}");
+        fixture.finish_turn(pane_id);
+        assert!(
+            !Fixture::messages(&state_dir)
+                .iter()
+                .any(|message| message.origin_thread_id.as_deref() == Some("t1")),
+            "no capture of the decision turn"
+        );
+        fixture.assert_queue_invariants(&state_dir, 3);
+    }
+
+    // AC3: without an answer until the timeout, a new thread opens.
+    #[tokio::test]
+    async fn without_an_answer_until_the_timeout_a_new_thread_opens() {
+        let mut fixture = Fixture::new("pending-timeout");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 3);
+        Fixture::set_decision_timeout(&state_dir, 0);
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        let pane_id = fixture.running_pane("t1");
+        let second = fixture.mention(&workspace_id, "geral", "@chief dois");
+        assert_eq!(Fixture::records(&state_dir).len(), 1, "it waits");
+
+        fixture.app.check_folder_thread_queues();
+
+        let pending = Fixture::pending(&state_dir);
+        assert_eq!(pending.phase, crate::regents::pending::Phase::TimedOut);
+        assert_eq!(pending.fork_thread_id.as_deref(), Some("t2"));
+        assert_eq!(
+            Fixture::records(&state_dir)[1].origin_message_id,
+            Some(second)
+        );
+        assert!(
+            fixture.app.running_threads.contains_key(&pane_id),
+            "t1 goes on"
+        );
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            [format!(
+                "@chief não decidiu sobre a mensagem {second} a tempo; uma thread nova a recebe"
+            )]
+        );
+        let late = fixture.decide(&workspace_id, "thread.accept", pane_id, "t1");
+        assert_eq!(late["error"]["code"], "mention_already_decided", "{late}");
+        fixture.assert_queue_invariants(&state_dir, 3);
+    }
+
+    // The deadline also ends a decision turn whose idle already went by.
+    #[tokio::test]
+    async fn a_timeout_after_the_delivery_ends_an_idle_decision_turn() {
+        let mut fixture = Fixture::new("pending-timeout-idle");
+        let (state_dir, _, pane_id, _) = fixture.pending_workspace();
+        fixture.report(pane_id, &["working", "idle"]);
+        // An idle without new work: the decision turn did not end yet.
+        fixture.report(pane_id, &["idle"]);
+        assert!(fixture.app.running_threads.contains_key(&pane_id));
+        Fixture::sql(&state_dir, "UPDATE pending_mentions SET decide_by = 0");
+
+        fixture.app.check_folder_thread_queues();
+
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::TimedOut
+        );
+        assert!(!fixture.app.running_threads.contains_key(&pane_id));
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records[0].state, ThreadState::Done);
+        assert_eq!(records[1].state, ThreadState::Active);
+        fixture.assert_queue_invariants(&state_dir, 3);
+    }
+
+    // AC4: a mention of the same agent in another channel opens a new
+    // thread at once.
+    #[tokio::test]
+    async fn a_mention_in_another_channel_opens_a_new_thread_at_once() {
+        let mut fixture = Fixture::new("pending-other-channel");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 3);
+        fixture.request(
+            "channel.create",
+            json!({"workspace_id": workspace_id, "channel": "dev"}),
+        );
+        fixture.mention(&workspace_id, "geral", "@chief um");
+
+        fixture.mention(&workspace_id, "dev", "@chief em dev");
+
+        assert_eq!(
+            Fixture::queue(&state_dir),
+            (vec!["t1".into(), "t2".into()], vec![])
+        );
+        assert!(threads::registry(&state_dir)
+            .open_pending_mentions()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            Fixture::records(&state_dir)[1].channel.as_deref(),
+            Some("dev")
+        );
+    }
+
+    // Table: an idle after the delivery without a decision is a fork, and
+    // the thread is done.
+    #[tokio::test]
+    async fn an_idle_after_the_delivery_without_a_decision_forks() {
+        let mut fixture = Fixture::new("pending-idle-fork");
+        let (state_dir, _, pane_id, _) = fixture.pending_workspace();
+        fixture.report(pane_id, &["working", "idle"]);
+
+        fixture.finish_turn(pane_id);
+
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::Forked
+        );
+        assert_eq!(Fixture::queue(&state_dir), (vec!["t2".into()], vec![]));
+    }
+
+    // Table: the delivery waits for the end of the approval; text typed in
+    // an approval prompt answers it (#17 evidence).
+    #[tokio::test]
+    async fn a_blocked_thread_gets_the_mention_after_the_approval() {
+        let mut fixture = Fixture::new("pending-blocked");
+        let (state_dir, _, pane_id, _) = fixture.pending_workspace();
+
+        fixture.report(pane_id, &["working", "blocked"]);
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::Waiting
+        );
+
+        fixture.report(pane_id, &["idle"]);
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::Delivered
+        );
+        assert!(fixture.app.running_threads.contains_key(&pane_id));
+    }
+
+    // Table: a thread decides only about its own mention, with its own
+    // credential.
+    #[tokio::test]
+    async fn a_thread_cannot_decide_the_mention_of_another_thread() {
+        let mut fixture = Fixture::new("pending-auth");
+        let (state_dir, workspace_id, pane_id, _) = fixture.pending_workspace();
+        fixture.mention(&workspace_id, "geral", "@reviewer oi");
+        let reviewer = fixture.running_pane("t2");
+        fixture.report(pane_id, &["working", "idle"]);
+
+        let own = fixture.decide(&workspace_id, "thread.accept", reviewer, "t2");
+        assert_eq!(own["error"]["code"], "no_pending_mention", "{own}");
+        let borrowed = fixture.decide(&workspace_id, "thread.accept", reviewer, "t1");
+        assert_eq!(
+            borrowed["error"]["code"], "invalid_thread_credential",
+            "{borrowed}"
+        );
+        let anonymous = fixture.request("thread.fork", json!({"workspace_id": workspace_id}));
+        assert_eq!(
+            anonymous["error"]["code"], "invalid_thread_credential",
+            "{anonymous}"
+        );
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::Delivered
+        );
+        assert_eq!(Fixture::records(&state_dir).len(), 2);
+    }
+
+    // Table: restart. A pending mention whose thread no process runs goes
+    // to a new thread at the next folder check; an exit forks at once.
+    #[tokio::test]
+    async fn a_restart_or_an_exit_gives_the_pending_mention_to_a_new_thread() {
+        let mut fixture = Fixture::new("pending-restart");
+        let (state_dir, _, _, second) = fixture.pending_workspace();
+
+        fixture.app.interrupt_running_threads();
+        fixture.app.check_folder_thread_queues();
+
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records[0].state, ThreadState::Interrupted);
+        assert_eq!(records[1].origin_message_id, Some(second));
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::Forked
+        );
+
+        let mut fixture = Fixture::new("pending-exit");
+        let (state_dir, _, pane_id, _) = fixture.pending_workspace();
+        fixture.exit(pane_id);
+        assert_eq!(
+            Fixture::pending(&state_dir).phase,
+            crate::regents::pending::Phase::Forked
+        );
+        assert_eq!(Fixture::queue(&state_dir), (vec!["t2".into()], vec![]));
     }
 }

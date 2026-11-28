@@ -1292,6 +1292,20 @@ impl App {
             Method::ThreadOpen(params) => {
                 return self.handle_thread_open(request.id, params);
             }
+            Method::ThreadAccept(params) => {
+                return self.handle_thread_decision(
+                    request.id,
+                    params,
+                    crate::regents::pending::Event::Accept,
+                );
+            }
+            Method::ThreadFork(params) => {
+                return self.handle_thread_decision(
+                    request.id,
+                    params,
+                    crate::regents::pending::Event::Fork,
+                );
+            }
             Method::AgentDefinitionList(params) => {
                 return self.handle_agent_definition_list(request.id, params);
             }

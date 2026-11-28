@@ -9,7 +9,8 @@ use std::path::Path;
 use clap::Command;
 
 use crate::api::schema::threads::{
-    AgentDefinitionListProjection, ThreadListProjection, ThreadOpenProjection,
+    AgentDefinitionListProjection, ThreadDecisionProjection, ThreadListProjection,
+    ThreadOpenProjection,
 };
 use crate::api::schema::{Method, Request};
 
@@ -18,7 +19,7 @@ use super::projection::{self, Input, Leaf, ParseError};
 /// `thread output`: the command that the popup of an ended thread runs.
 pub(crate) const OUTPUT_COMMAND: &str = "output";
 
-const THREAD_LEAVES: [Leaf; 2] = [
+const THREAD_LEAVES: [Leaf; 4] = [
     Leaf {
         name: "list",
         about: "List the threads of the workspace",
@@ -32,6 +33,21 @@ const THREAD_LEAVES: [Leaf; 2] = [
         id: "cli:thread:open",
         arguments: ThreadOpenProjection::arguments,
         method: |matches| ThreadOpenProjection::from_matches(matches).map(Method::ThreadOpen),
+    },
+    Leaf {
+        name: "accept",
+        about: "Take the mention that waits for this thread (run it from the thread)",
+        id: "cli:thread:accept",
+        arguments: ThreadDecisionProjection::arguments,
+        method: |matches| ThreadDecisionProjection::from_matches(matches).map(Method::ThreadAccept),
+    },
+    Leaf {
+        name: "fork",
+        about:
+            "Leave the mention that waits for this thread to a new thread (run it from the thread)",
+        id: "cli:thread:fork",
+        arguments: ThreadDecisionProjection::arguments,
+        method: |matches| ThreadDecisionProjection::from_matches(matches).map(Method::ThreadFork),
     },
 ];
 
@@ -121,7 +137,7 @@ const AGENT_LEAVES: [Leaf; 1] = [Leaf {
 
 pub(crate) fn command() -> Command {
     Command::new("thread")
-        .about("Show the threads of the workspace over the socket API")
+        .about("Show the threads of the workspace and decide about a pending mention over the socket API")
         .subcommand_required(true)
         .subcommands(THREAD_LEAVES.iter().map(Leaf::command))
         .subcommand(output_command())
@@ -138,10 +154,16 @@ pub(crate) fn is_regents_agent_command(args: &[String]) -> bool {
 
 pub(crate) fn thread_request(args: &[String]) -> Result<Request, ParseError> {
     let cwd = std::env::current_dir().map_err(ParseError::Io)?;
-    with_folder_workspace(
+    let mut request = with_folder_workspace(
         projection::group_request(command(), &THREAD_LEAVES, args)?,
         &cwd,
-    )
+    )?;
+    if let Method::ThreadAccept(params) | Method::ThreadFork(params) = &mut request.method {
+        params.thread_id = super::channel_bindings::env_value(crate::regents::THREAD_ID_ENV_VAR);
+        params.thread_token =
+            super::channel_bindings::env_value(crate::regents::THREAD_TOKEN_ENV_VAR);
+    }
+    Ok(request)
 }
 
 pub(crate) fn agent_request(args: &[String]) -> Result<Request, ParseError> {
@@ -158,6 +180,7 @@ fn with_folder_workspace(mut request: Request, cwd: &Path) -> Result<Request, Pa
     let workspace_id = match &mut request.method {
         Method::ThreadList(params) => &mut params.workspace_id,
         Method::ThreadOpen(params) => &mut params.workspace_id,
+        Method::ThreadAccept(params) | Method::ThreadFork(params) => &mut params.workspace_id,
         Method::AgentDefinitionList(params) => &mut params.workspace_id,
         _ => return Ok(request),
     };

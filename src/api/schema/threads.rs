@@ -1,4 +1,5 @@
-//! Regents threads and agent definitions: `thread.list`, `thread.open` and
+//! Regents threads and agent definitions: `thread.list`, `thread.open`,
+//! `thread.accept`, `thread.fork` and
 //! `agent.definition.list` (ADR-0004). `agent.*` without `definition` is
 //! herdr's family for agent processes in panes.
 
@@ -28,6 +29,26 @@ cli_params! {
         /// Thread ID, for example `t1`.
         pub thread_id: String => Field::new(String::new())
             .input(crate::cli::thread_bindings::thread_id()),
+    }
+}
+
+cli_params! {
+    /// `thread.accept` and `thread.fork`: an active thread decides about the
+    /// mention that waits for it (#17). The CLI reads the thread and its
+    /// credential from the environment of the thread.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct ThreadDecisionParams => ThreadDecisionProjection {
+        /// Workspace of the thread: its public ID or the stable ID from
+        /// `workspace.toml`. Absent means the active workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub workspace_id: Option<String> => Field::new(None)
+            .input(super::tabs::workspace_option("WORKSPACE_ID").order(0)),
+        /// The thread that decides, from `REGENTS_THREAD_ID`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub thread_id: Option<String> => Field::new(Option::<String>::None),
+        /// Credential of `thread_id`, from `REGENTS_THREAD_TOKEN`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub thread_token: Option<String> => Field::new(Option::<String>::None),
     }
 }
 

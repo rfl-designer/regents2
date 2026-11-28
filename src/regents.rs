@@ -14,6 +14,7 @@ pub(crate) mod chat;
 pub(crate) mod chat_panes;
 pub(crate) mod folder;
 pub(crate) mod mention;
+pub(crate) mod pending;
 pub(crate) mod registry;
 pub(crate) mod store;
 pub(crate) mod threads;

@@ -341,6 +341,17 @@ pub enum ResponseResult {
         opened: bool,
         pane: super::panes::PaneInfo,
     },
+    /// The decision of a thread about its pending mention: `decision` is
+    /// `accepted`, `forked` or `timed_out`. `fork_thread_id` is the thread
+    /// that took the mention after a fork or a timeout.
+    ThreadMentionDecided {
+        workspace_id: String,
+        thread_id: String,
+        message_id: u64,
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_thread_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

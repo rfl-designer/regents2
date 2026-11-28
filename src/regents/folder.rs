@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const STATE_DIR: &str = ".regents";
 pub(crate) const MANIFEST_FILE: &str = "workspace.toml";
 const DEFAULT_MAX_ACTIVE_THREADS: u32 = 3;
+const DEFAULT_MENTION_DECISION_TIMEOUT_SECONDS: u64 = 300;
 /// With 0 no thread could ever start, so the queue would never drain.
 const MIN_MAX_ACTIVE_THREADS: u32 = 1;
 
@@ -22,10 +23,18 @@ pub(crate) struct WorkspaceManifest {
     pub(crate) name: String,
     #[serde(default = "default_max_active_threads")]
     pub(crate) max_active_threads: u32,
+    /// How long a mention of the agent of an active thread waits for the
+    /// decision of the thread; then a new thread takes it (#17).
+    #[serde(default = "default_mention_decision_timeout_seconds")]
+    pub(crate) mention_decision_timeout_seconds: u64,
 }
 
 fn default_max_active_threads() -> u32 {
     DEFAULT_MAX_ACTIVE_THREADS
+}
+
+fn default_mention_decision_timeout_seconds() -> u64 {
+    DEFAULT_MENTION_DECISION_TIMEOUT_SECONDS
 }
 
 /// Binding of a herdr workspace (the layout container) to a workspace folder.
@@ -106,6 +115,7 @@ pub(crate) fn open_or_init(root: &Path) -> io::Result<OpenedFolder> {
         id: new_workspace_id(root),
         name: default_name(root),
         max_active_threads: DEFAULT_MAX_ACTIVE_THREADS,
+        mention_decision_timeout_seconds: DEFAULT_MENTION_DECISION_TIMEOUT_SECONDS,
     };
     let manifest_toml = toml::to_string(&manifest)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
@@ -293,6 +303,7 @@ mod tests {
                 id: "from-another-machine".into(),
                 name: "Projeto".into(),
                 max_active_threads: 7,
+                mention_decision_timeout_seconds: 300,
             }
         );
         let after = files_under(&root);

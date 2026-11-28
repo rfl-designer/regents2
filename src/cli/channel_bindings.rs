@@ -168,7 +168,7 @@ pub(crate) fn request(args: &[String]) -> Result<Request, ParseError> {
 /// The thread of a command that a thread CLI runs: the server sets
 /// `REGENTS_THREAD_ID` and `REGENTS_THREAD_TOKEN` in the environment of each
 /// thread.
-fn env_value(var: &str) -> Option<String> {
+pub(super) fn env_value(var: &str) -> Option<String> {
     std::env::var(var)
         .ok()
         .map(|id| id.trim().to_owned())
