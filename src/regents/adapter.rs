@@ -1,12 +1,105 @@
 //! CLI adapters (Regents): they turn an agent definition and the initial
-//! prompt of a thread into the command line of the agent CLI. Pure: no I/O.
-//! Only the claude adapter exists in this slice.
+//! prompt of a thread into the command line of the agent CLI, and read the
+//! last reply of a thread turn from the CLI session. Only `last_reply` reads
+//! files. Only the claude adapter exists in this slice.
+
+use std::path::Path;
 
 use super::agents::{AgentCli, AgentDefinition};
 use super::channel::{AuthorKind, Message};
 
 /// How many recent channel messages the initial prompt carries.
 pub(crate) const RECENT_MESSAGES: u32 = 20;
+/// The last line of each initial prompt: the reply on a screen starts after
+/// its echo.
+pub(crate) const PROMPT_LAST_LINE: &str = "A wiki do workspace começa em .regents/wiki/index.md.";
+
+/// The reply of the last turn of a CLI session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnReply {
+    /// Index of the turn in the session, from 0.
+    pub(crate) turn: u32,
+    /// The last text of the agent in the turn; `None` when the turn has no
+    /// text, for example only tool calls.
+    pub(crate) text: Option<String>,
+}
+
+/// The reply of the last turn of the CLI session `session_id`, from its
+/// transcript under `cli_home` (for claude, `~/.claude`). `None` when the
+/// session has no transcript or no turn.
+pub(crate) fn last_reply(cli: AgentCli, session_id: &str, cli_home: &Path) -> Option<TurnReply> {
+    match cli {
+        AgentCli::Claude => claude_last_reply(
+            &std::fs::read_to_string(claude_transcript(cli_home, session_id)?).ok()?,
+        ),
+        AgentCli::Codex | AgentCli::Agy => None,
+    }
+}
+
+/// claude keeps a session in `projects/<folder>/<session>.jsonl`; the
+/// session ID is unique, so the folder name needs no rule.
+fn claude_transcript(cli_home: &Path, session_id: &str) -> Option<std::path::PathBuf> {
+    let file = format!("{session_id}.jsonl");
+    std::fs::read_dir(cli_home.join("projects"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join(&file))
+        .find(|path| path.is_file())
+}
+
+/// The last turn of a claude transcript (JSONL, checked with claude
+/// 2.1.332). A turn starts at a `user` record with a prompt, not only tool
+/// results. Its reply is the last `text` block of the `assistant` records
+/// after it: thinking, tool calls, sidechain (subagent) and metadata records
+/// are not part of it.
+fn claude_last_reply(transcript: &str) -> Option<TurnReply> {
+    let mut prompts = 0u32;
+    let mut text = None;
+    for line in transcript.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record["isSidechain"] == true {
+            continue;
+        }
+        let content = &record["message"]["content"];
+        match record["type"].as_str() {
+            Some("user") if record["isMeta"] != true && is_prompt(content) => {
+                prompts += 1;
+                text = None;
+            }
+            Some("assistant") => {
+                let blocks = content.as_array().into_iter().flatten();
+                for block in blocks.filter(|block| block["type"] == "text") {
+                    if let Some(value) = block["text"].as_str() {
+                        text = Some(value.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(TurnReply {
+        turn: prompts.checked_sub(1)?,
+        text: text.filter(|text| !text.trim().is_empty()),
+    })
+}
+
+fn is_prompt(content: &serde_json::Value) -> bool {
+    content.is_string()
+        || content
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] != "tool_result"))
+}
+
+/// The reply on the screen of a thread whose session has no transcript:
+/// the text after the echo of the initial prompt. `None` without the echo,
+/// because then the screen shows no turn, only the CLI.
+pub(crate) fn screen_reply(screen: &str) -> Option<String> {
+    let start = screen.rfind(PROMPT_LAST_LINE)? + PROMPT_LAST_LINE.len();
+    let reply = screen[start..].trim();
+    (!reply.is_empty()).then(|| reply.to_owned())
+}
 
 /// The command line of a new thread of `agent`, or `None` when the CLI of the
 /// agent has no adapter yet. `session_id` names the CLI session, so the thread
@@ -83,7 +176,7 @@ pub(crate) fn initial_prompt(mention: &Message, recent: &[Message]) -> String {
     prompt.push_str(&format!(
         "\nPara ler mensagens mais antigas: regents channel read {channel} --before <id> --limit <n>\n\
          Para responder no canal: regents channel post {channel} \"<resposta>\"\n\
-         A wiki do workspace começa em .regents/wiki/index.md.\n"
+         {PROMPT_LAST_LINE}\n"
     ));
     prompt
 }
@@ -129,7 +222,89 @@ mod tests {
             origin_thread_id: None,
             mentions: Vec::new(),
             created_at: "2026-11-27T18:04:05Z".into(),
+            captured: false,
         }
+    }
+
+    /// A sanitized transcript of claude 2.1.332.
+    fn transcript(name: &str) -> String {
+        let path = format!(
+            "{}/tests/fixtures/regents/claude-2.1.332/{name}.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn the_reply_is_the_last_text_of_the_turn_after_its_tool_calls() {
+        assert_eq!(
+            claude_last_reply(&transcript("one-turn")),
+            Some(TurnReply {
+                turn: 0,
+                text: Some("pronto, linha 1\nlinha 2".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn the_second_turn_has_its_own_index_and_reply() {
+        assert_eq!(
+            claude_last_reply(&transcript("two-turns")),
+            Some(TurnReply {
+                turn: 1,
+                text: Some("segundo turno @reviewer".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_turn_with_only_tool_calls_has_no_reply() {
+        assert_eq!(
+            claude_last_reply(&transcript("tool-calls-only")),
+            Some(TurnReply {
+                turn: 0,
+                text: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_sidechain_record_is_not_the_reply() {
+        assert_eq!(
+            claude_last_reply(&transcript("one-turn-then-sidechain"))
+                .and_then(|reply| reply.text)
+                .as_deref(),
+            Some("pronto, linha 1\nlinha 2")
+        );
+    }
+
+    #[test]
+    fn a_transcript_without_a_prompt_has_no_turn() {
+        assert_eq!(claude_last_reply(""), None);
+        assert_eq!(claude_last_reply("not json\n{\"type\":\"mode\"}"), None);
+    }
+
+    #[test]
+    fn last_reply_finds_the_session_in_any_project_folder() {
+        let home = crate::regents::store::TempFolder::new("adapter-transcript");
+        let project = home.0.join("projects").join("-tmp-projeto");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("sid.jsonl"), transcript("one-turn")).unwrap();
+
+        let reply = last_reply(AgentCli::Claude, "sid", &home.0);
+
+        assert_eq!(reply.map(|reply| reply.turn), Some(0));
+        assert_eq!(last_reply(AgentCli::Claude, "other", &home.0), None);
+        assert_eq!(last_reply(AgentCli::Codex, "sid", &home.0), None);
+    }
+
+    #[test]
+    fn the_screen_reply_starts_after_the_prompt_echo() {
+        let screen = format!("> prompt\n{PROMPT_LAST_LINE}\n\n  resposta\n");
+
+        assert_eq!(screen_reply(&screen).as_deref(), Some("resposta"));
+        assert_eq!(screen_reply("só a tela do CLI"), None);
+        assert_eq!(screen_reply(&format!("{PROMPT_LAST_LINE}\n  ")), None);
     }
 
     #[test]

@@ -339,7 +339,6 @@ impl App {
         let (index, state_dir) = self.folder_state_dir(workspace_id)?;
         let author = self.post_author(&state_dir, origin_thread_id.as_deref(), thread_token)?;
         let channel = channel::open(&state_dir, &channel)?;
-        let workspace_id = self.public_workspace_id(index);
         let agents = agents::list(&state_dir);
         let mentions = mention::resolve(&body, agents.iter().map(|agent| agent.name.as_str()));
         let posted = channel.post(
@@ -353,10 +352,25 @@ impl App {
             time::OffsetDateTime::now_utc(),
         )?;
         self.open_mention_threads(index, &state_dir, &channel, &posted, &agents);
+        let (workspace_id, message) = self.announce_channel_message(index, posted);
+        Ok(ResponseResult::ChannelMessagePosted {
+            workspace_id,
+            message,
+        })
+    }
+
+    /// Marks the channel of `posted`, a new message of the workspace at
+    /// `index`, unread and announces it as an event.
+    pub(crate) fn announce_channel_message(
+        &mut self,
+        index: usize,
+        posted: Message,
+    ) -> (String, ChannelMessageInfo) {
+        let workspace_id = self.public_workspace_id(index);
         if let Ok(folder_id) = self.folder_id(index) {
             self.mark_channel_unread(ChannelView {
                 folder_id,
-                channel: channel.name().to_owned(),
+                channel: posted.channel.clone(),
             });
         }
         let message = message_info(posted);
@@ -367,10 +381,7 @@ impl App {
                 message: message.clone(),
             },
         });
-        Ok(ResponseResult::ChannelMessagePosted {
-            workspace_id,
-            message,
-        })
+        (workspace_id, message)
     }
 
     /// The author of a post: the local human without an origin thread, the
@@ -564,6 +575,7 @@ fn message_info(message: Message) -> ChannelMessageInfo {
         origin_thread_id: message.origin_thread_id,
         mentions: message.mentions,
         created_at: message.created_at,
+        captured: message.captured,
     }
 }
 

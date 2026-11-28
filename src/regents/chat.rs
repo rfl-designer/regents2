@@ -964,6 +964,7 @@ mod tests {
             origin_thread_id: None,
             mentions: Vec::new(),
             created_at: "2026-11-27T18:04:05Z".into(),
+            captured: false,
         }
     }
 

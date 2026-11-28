@@ -1,0 +1,33 @@
+{"type":"session-owner"}
+{"type":"derived-from"}
+{"type":"queue-operation"}
+{"type":"queue-operation"}
+{"type":"attachment"}
+{"type":"user","isSidechain":false,"version":"2.1.332","message":{"role":"user","content":"Rode o comando `echo oi` com a ferramenta Bash e depois responda exatamente: pronto, linha 1\nlinha 2"}}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"data-flow-records"}
+{"type":"atis-latch"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"attachment"}
+{"type":"api-request-shape"}
+{"type":"api-request-blob","message":{"role":"user","content":[{"type":"text","text":"<redacted>"},{"type":"text","text":"<redacted>"},{"type":"text","text":"<redacted>"},{"type":"text","text":"<redacted>"}]}}
+{"type":"api-request-blob","message":{"role":"system","content":[{"type":"text","text":"<redacted>"},{"type":"tool_addition","text":null},{"type":"tool_addition","text":null},{"type":"tool_addition","text":null}]}}
+{"type":"api-request"}
+{"type":"last-prompt"}
+{"type":"session-owner"}
+{"type":"atis-latch"}
+{"type":"tools-used"}
+{"type":"data-flow-records"}
+{"type":"assistant","isSidechain":false,"version":"2.1.332","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo oi","description":"Imprime oi no terminal"}}]}}
+{"type":"user","isSidechain":false,"version":"2.1.332","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"oi","is_error":false}]}}

@@ -1492,6 +1492,7 @@ fn channel_message_wire_shape_keeps_optional_fields_out_and_tolerates_newer_serv
         origin_thread_id: None,
         mentions: Vec::new(),
         created_at: "2026-11-27T18:04:05Z".into(),
+        captured: false,
     };
     let event = EventEnvelope {
         event: EventKind::ChannelMessagePosted,
@@ -1536,6 +1537,10 @@ fn channel_message_wire_shape_keeps_optional_fields_out_and_tolerates_newer_serv
     assert_eq!(from_newer_server.reply_to, Some(1));
     assert_eq!(from_newer_server.origin_thread_id.as_deref(), Some("t1"));
     assert_eq!(from_newer_server.mentions, ["chief-of-staff"]);
+    assert!(
+        !from_newer_server.captured,
+        "an older server sends no capture mark"
+    );
 
     let subscribe: Request = serde_json::from_value(serde_json::json!({
         "id": "s", "method": "events.subscribe",

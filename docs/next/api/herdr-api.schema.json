@@ -121,6 +121,10 @@
             "body": {
               "type": "string"
             },
+            "captured": {
+              "description": "The server copied the message from the reply of a thread that did\nnot post it. Absent means a post.",
+              "type": "boolean"
+            },
             "channel": {
               "type": "string"
             },
@@ -7606,6 +7610,10 @@
             },
             "body": {
               "type": "string"
+            },
+            "captured": {
+              "description": "The server copied the message from the reply of a thread that did\nnot post it. Absent means a post.",
+              "type": "boolean"
             },
             "channel": {
               "type": "string"

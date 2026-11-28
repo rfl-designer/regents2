@@ -12,8 +12,8 @@ use crate::app::App;
 use crate::layout::PaneId;
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::regents::adapter;
-use crate::regents::agents::AgentDefinition;
-use crate::regents::channel::{Channel, Message, ReadRange};
+use crate::regents::agents::{AgentCli, AgentDefinition};
+use crate::regents::channel::{self, Capture, Channel, Message, ReadRange};
 use crate::regents::threads::{
     self, NewThread, ThreadOrigin, ThreadProgress, ThreadState, ThreadStep,
 };
@@ -47,6 +47,11 @@ pub(crate) struct RunningThread {
     pub(crate) token: String,
     terminal_id: TerminalId,
     progress: ThreadProgress,
+    cli: Option<AgentCli>,
+    session_id: Option<String>,
+    /// Channel and message of the mention that opened the thread.
+    channel: Option<String>,
+    origin_message_id: Option<u64>,
 }
 
 /// The first prompt of a thread opened by `message`: the mention and the
@@ -159,6 +164,10 @@ impl App {
                         token,
                         terminal_id,
                         progress: ThreadProgress::default(),
+                        cli: thread.cli,
+                        session_id: thread.session_id,
+                        channel: thread.channel,
+                        origin_message_id: thread.origin_message_id,
                     },
                 );
                 Ok(pane_id)
@@ -303,6 +312,10 @@ impl App {
         let Some(thread) = self.running_threads.remove(&pane_id) else {
             return;
         };
+        // ADR-0004: a failed or interrupted turn can be incomplete or go on.
+        if state == ThreadState::Done {
+            self.capture_reply(pane_id, &thread);
+        }
         if let Some(runtime) = self.terminal_runtimes.get(&thread.terminal_id) {
             let output = runtime.recent_ansi_snapshot(OUTPUT_LINES).text;
             if let Err(err) = threads::write_output(&thread.state_dir, &thread.thread_id, &output) {
@@ -332,6 +345,63 @@ impl App {
         if self.terminal_runtimes.get(&thread.terminal_id).is_some() {
             self.expected_thread_exits.insert(pane_id);
             self.shutdown_terminal_runtime(thread.terminal_id);
+        }
+    }
+
+    /// Posts the last reply of a done thread in its channel as its agent,
+    /// when the thread did not post: from the CLI transcript, or from the
+    /// screen when the session has no transcript. Mentions in the reply open
+    /// no thread; to delegate, the agent posts.
+    fn capture_reply(&mut self, pane_id: PaneId, thread: &RunningThread) {
+        let (Some(channel_name), Some(after)) = (&thread.channel, thread.origin_message_id) else {
+            return;
+        };
+        let transcript_reply = match (thread.cli, &thread.session_id, &self.claude_dir) {
+            (Some(cli), Some(session_id), Some(home)) => adapter::last_reply(cli, session_id, home),
+            _ => None,
+        };
+        let reply = transcript_reply.or_else(|| {
+            let runtime = self.terminal_runtimes.get(&thread.terminal_id)?;
+            let screen = runtime.recent_unwrapped_text_snapshot(OUTPUT_LINES).text;
+            // shortcut: a screen names no turn, so it is turn 0; read the
+            // turn from the screen when a thread without a transcript can
+            // have more turns (#17).
+            Some(adapter::TurnReply {
+                turn: 0,
+                text: adapter::screen_reply(&screen),
+            })
+        });
+        let Some(reply) = reply else {
+            return;
+        };
+        let Some(body) = reply.text else {
+            tracing::info!(thread = %thread.thread_id, turn = reply.turn,
+                "the thread turn has no text reply to capture");
+            return;
+        };
+        // shortcut: every turn starts after the mention that opened the
+        // thread; an absorbed mention (#17) must pass its own message ID.
+        let capture = Capture {
+            agent: thread.agent.clone(),
+            thread_id: thread.thread_id.clone(),
+            turn: reply.turn,
+            after,
+            body,
+        };
+        let posted = channel::open(&thread.state_dir, channel_name)
+            .and_then(|channel| channel.post_capture(capture, time::OffsetDateTime::now_utc()));
+        match posted {
+            Ok(Some(message)) => {
+                tracing::info!(thread = %thread.thread_id, turn = reply.turn,
+                    message = message.id, "captured the reply of a thread that did not post");
+                if let Some((ws_idx, _)) = self.find_pane(pane_id) {
+                    self.announce_channel_message(ws_idx, message);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(thread = %thread.thread_id, %err, "cannot capture the thread reply");
+            }
         }
     }
 
@@ -590,6 +660,10 @@ impl App {
                     token: String::new(),
                     terminal_id,
                     progress: ThreadProgress::default(),
+                    cli: Some(AgentCli::Claude),
+                    session_id: None,
+                    channel: Some("geral".into()),
+                    origin_message_id: Some(1),
                 },
             );
         }
@@ -628,7 +702,67 @@ mod tests {
                 super::super::api::test_support::exiting_test_command().into();
             app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
             app.workspace_registry_path = Some(base.0.join("config").join("workspaces.toml"));
+            app.claude_dir = Some(base.0.join("claude"));
             Self { app, base }
+        }
+
+        /// What a fake claude writes: the transcript of the session `sid`,
+        /// from a sanitized claude 2.1.332 transcript.
+        fn transcript(&self, fixture: &str) {
+            let project = self.base.0.join("claude").join("projects").join("-projeto");
+            std::fs::create_dir_all(&project).unwrap();
+            let source = format!(
+                "{}/tests/fixtures/regents/claude-2.1.332/{fixture}.jsonl",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            std::fs::copy(source, project.join("sid.jsonl")).unwrap();
+        }
+
+        /// A workspace with the channel `geral` and its message 1, the
+        /// mention that opens the test threads.
+        fn channel_workspace(&mut self) -> (usize, PathBuf, String) {
+            let (ws_idx, state_dir) = self.workspace("projeto");
+            let workspace_id = self.app.public_workspace_id(ws_idx);
+            self.request(
+                "channel.create",
+                json!({"workspace_id": workspace_id, "channel": "geral"}),
+            );
+            let posted = self.request(
+                "channel.post",
+                json!({"workspace_id": workspace_id, "channel": "geral", "body": "pergunta"}),
+            );
+            assert_eq!(posted["result"]["message"]["id"], 1, "{posted}");
+            (ws_idx, state_dir, workspace_id)
+        }
+
+        /// The agent of the thread works and goes idle: the thread is done.
+        fn finish_turn(&mut self, pane_id: PaneId) {
+            let public_pane_id = self.public_pane_id(pane_id);
+            for state in ["working", "idle"] {
+                let reported = self.request(
+                    "pane.report_agent",
+                    json!({"pane_id": public_pane_id, "source": "custom:test",
+                           "agent": "claude", "state": state}),
+                );
+                assert!(reported.get("error").is_none(), "{reported}");
+            }
+            assert!(!self.app.running_threads.contains_key(&pane_id));
+        }
+
+        /// A post of the thread `t1` with its credential.
+        fn thread_post(&mut self, workspace_id: &str, token: &str) -> Value {
+            self.request(
+                "channel.post",
+                json!({"workspace_id": workspace_id, "channel": "geral", "body": "postei",
+                       "origin_thread_id": "t1", "thread_token": token}),
+            )
+        }
+
+        fn messages(state_dir: &Path) -> Vec<Message> {
+            channel::open(state_dir, "geral")
+                .unwrap()
+                .read(ReadRange::default())
+                .unwrap()
         }
 
         /// Adds a folder workspace and returns its index and state directory.
@@ -870,6 +1004,131 @@ mod tests {
             .collect();
 
         assert_eq!(ids, ["t3", "t2", "t1"]);
+    }
+
+    #[tokio::test]
+    async fn a_done_thread_that_did_not_post_posts_its_last_reply_as_its_agent() {
+        let mut fixture = Fixture::new("capture");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("one-turn");
+
+        fixture.finish_turn(pane_id);
+
+        let messages = Fixture::messages(&state_dir);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        let captured = &messages[1];
+        assert_eq!(captured.author.kind, AuthorKind::Agent);
+        assert_eq!(captured.author.id, "chief");
+        assert_eq!(captured.origin_thread_id.as_deref(), Some("t1"));
+        assert!(captured.captured);
+        // Byte for byte the last text block of the transcript, no prompt echo.
+        assert_eq!(captured.body.as_bytes(), b"pronto, linha 1\nlinha 2");
+        let read = fixture.request("channel.read", json!({"channel": "geral"}));
+        assert_eq!(read["result"]["messages"][1]["captured"], true, "{read}");
+        assert_eq!(
+            read["result"]["messages"][0].get("captured"),
+            None,
+            "{read}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_thread_that_posted_gets_no_capture() {
+        let mut fixture = Fixture::new("capture-posted");
+        let (ws_idx, state_dir, workspace_id) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("one-turn");
+        let token = fixture.app.running_threads[&pane_id].token.clone();
+
+        let posted = fixture.thread_post(&workspace_id, &token);
+        fixture.finish_turn(pane_id);
+
+        assert!(posted.get("error").is_none(), "{posted}");
+        let messages = Fixture::messages(&state_dir);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1].body, "postei");
+        assert!(!messages[1].captured);
+    }
+
+    #[tokio::test]
+    async fn a_post_after_the_idle_adds_no_second_message() {
+        let mut fixture = Fixture::new("capture-late");
+        let (ws_idx, state_dir, workspace_id) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("one-turn");
+        let token = fixture.app.running_threads[&pane_id].token.clone();
+
+        fixture.finish_turn(pane_id);
+        let late = fixture.thread_post(&workspace_id, &token);
+
+        assert_eq!(late["error"]["code"], "invalid_thread_credential", "{late}");
+        let messages = Fixture::messages(&state_dir);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[1].captured);
+    }
+
+    #[tokio::test]
+    async fn a_failed_thread_or_a_turn_with_only_tool_calls_posts_nothing() {
+        let mut fixture = Fixture::new("capture-none");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let failed = fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("one-turn");
+        let public_pane_id = fixture.public_pane_id(failed);
+        fixture.request("pane.close", json!({"pane_id": public_pane_id}));
+        let tool_only = fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("tool-calls-only");
+        // A screen reply must not replace a transcript turn without text.
+        let terminal_id = &fixture.app.running_threads[&tool_only].terminal_id;
+        fixture
+            .app
+            .terminal_runtimes
+            .get(terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(
+                format!("{}\r\nresposta da tela\r\n", adapter::PROMPT_LAST_LINE).as_bytes(),
+            );
+
+        fixture.finish_turn(tool_only);
+
+        assert_eq!(Fixture::messages(&state_dir).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_thread_posts_nothing() {
+        let mut fixture = Fixture::new("capture-interrupted");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("one-turn");
+
+        fixture.app.interrupt_running_threads();
+
+        assert_eq!(
+            Fixture::records(&state_dir)[0].state,
+            ThreadState::Interrupted
+        );
+        assert_eq!(Fixture::messages(&state_dir).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_mention_in_a_captured_reply_opens_no_thread() {
+        let mut fixture = Fixture::new("capture-mention");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        std::fs::write(
+            state_dir.join("agents").join("reviewer.md"),
+            "+++\nname = \"reviewer\"\ncli = \"claude\"\n+++\n",
+        )
+        .unwrap();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("two-turns");
+
+        fixture.finish_turn(pane_id);
+
+        let messages = Fixture::messages(&state_dir);
+        assert_eq!(messages[1].body, "segundo turno @reviewer");
+        assert!(messages[1].mentions.is_empty());
+        assert!(fixture.app.running_threads.is_empty());
+        assert_eq!(Fixture::records(&state_dir).len(), 1);
     }
 
     #[test]

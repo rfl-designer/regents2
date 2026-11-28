@@ -141,4 +141,8 @@ pub struct ChannelMessageInfo {
     pub mentions: Vec<String>,
     /// RFC 3339 time in UTC, in whole seconds.
     pub created_at: String,
+    /// The server copied the message from the reply of a thread that did
+    /// not post it. Absent means a post.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub captured: bool,
 }

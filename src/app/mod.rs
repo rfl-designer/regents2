@@ -137,6 +137,9 @@ pub struct App {
     /// Global registry of workspace folders. Only the Regents product has
     /// folder workspaces; herdr keeps `None`.
     pub(crate) workspace_registry_path: Option<std::path::PathBuf>,
+    /// Config directory of claude, where the transcripts of thread sessions
+    /// are (Regents, ADR-0004).
+    pub(crate) claude_dir: Option<std::path::PathBuf>,
     /// Regents: the last reopen found no usable registered folder.
     folder_reopen_exhausted: bool,
     /// Regents: folders that the user closed last; the reopen skips them.
@@ -690,6 +693,7 @@ impl App {
             pending_worktree_remove_runtime_restores: HashMap::new(),
             next_api_worktree_operation_id: 1,
             workspace_registry_path: crate::regents::workspace_registry_path(),
+            claude_dir: crate::integration::claude_dir().ok(),
             folder_reopen_exhausted: false,
             reopen_excluded_folders: Vec::new(),
             disconnected_folders: HashSet::new(),

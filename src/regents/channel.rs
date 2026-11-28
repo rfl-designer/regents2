@@ -5,14 +5,16 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use super::store;
 
 const CHANNELS_DIR: &str = "channels";
 const DATABASE_FILE: &str = "channel.sqlite";
+/// The SQL brings a database of any older version to this one: the table
+/// keeps its version 1 form and each version appends its changes.
 const SCHEMA: store::Schema = store::Schema {
-    version: 1,
+    version: 2,
     sql: "CREATE TABLE IF NOT EXISTS messages (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              author_kind TEXT NOT NULL,
@@ -23,7 +25,10 @@ const SCHEMA: store::Schema = store::Schema {
              -- JSON array of the mentioned agent names.
              mentions TEXT NOT NULL DEFAULT '[]',
              created_at TEXT NOT NULL
-         );",
+         );
+         -- Version 2: `<thread>#<turn>` of a captured reply, NULL for a post.
+         ALTER TABLE messages ADD COLUMN capture_key TEXT;
+         CREATE UNIQUE INDEX messages_capture_key ON messages(capture_key);",
 };
 
 /// The channel that a chat pane shows: the pane runs the chat view of this
@@ -99,6 +104,22 @@ pub(crate) struct Message {
     pub(crate) mentions: Vec<String>,
     /// RFC 3339 time in UTC, in whole seconds.
     pub(crate) created_at: String,
+    /// The Regents copied the message from the reply of a thread that did not
+    /// post (ADR-0004); false for a post.
+    pub(crate) captured: bool,
+}
+
+/// The reply of a thread turn that posted nothing, to post as its agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Capture {
+    pub(crate) agent: String,
+    pub(crate) thread_id: String,
+    /// Index of the turn in the CLI session.
+    pub(crate) turn: u32,
+    /// The message that started the turn: a post of the thread after it
+    /// is the reply of the turn.
+    pub(crate) after: u64,
+    pub(crate) body: String,
 }
 
 /// Which messages `Channel::read` returns.
@@ -283,6 +304,41 @@ impl Channel {
         message: NewMessage,
         now: time::OffsetDateTime,
     ) -> Result<Message, ChannelError> {
+        self.append(message, now, None)?
+            .ok_or_else(|| ChannelError::Storage("a post without a capture key was skipped".into()))
+    }
+
+    /// Posts `capture` as a message of its agent, with no mentions, unless
+    /// the thread posted after `capture.after` or this turn is already
+    /// captured. One transaction checks and inserts, so a late post and the
+    /// capture never make two messages. `None` when it posted nothing.
+    pub(crate) fn post_capture(
+        &self,
+        capture: Capture,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<Message>, ChannelError> {
+        let key = format!("{}#{}", capture.thread_id, capture.turn);
+        let message = NewMessage {
+            author: Author {
+                kind: AuthorKind::Agent,
+                id: capture.agent,
+            },
+            body: capture.body,
+            reply_to: None,
+            origin_thread_id: Some(capture.thread_id),
+            mentions: Vec::new(),
+        };
+        self.append(message, now, Some((key, to_sql_id(capture.after)?)))
+    }
+
+    /// Appends `message`; with a capture key and a message ID, only when
+    /// the thread posted nothing after that message and the key is new.
+    fn append(
+        &self,
+        message: NewMessage,
+        now: time::OffsetDateTime,
+        capture: Option<(String, i64)>,
+    ) -> Result<Option<Message>, ChannelError> {
         if message.body.trim().is_empty() {
             return Err(ChannelError::EmptyBody);
         }
@@ -296,12 +352,19 @@ impl Channel {
             // Without a database the channel has no message to reply to.
             return Err(self.reply_not_found(id));
         }
-        let inserted = self.insert(&path, &message, reply_to, &mentions, &created_at);
+        let inserted = self.insert(
+            &path,
+            &message,
+            reply_to,
+            &mentions,
+            &created_at,
+            capture.as_ref(),
+        );
         if inserted.is_err() && !existed {
             remove_database(&path);
         }
-        Ok(Message {
-            id: inserted?,
+        Ok(inserted?.map(|id| Message {
+            id,
             channel: self.name.clone(),
             author: message.author,
             body: message.body,
@@ -309,7 +372,8 @@ impl Channel {
             origin_thread_id: message.origin_thread_id,
             mentions: message.mentions,
             created_at,
-        })
+            captured: capture.is_some(),
+        }))
     }
 
     fn insert(
@@ -319,9 +383,24 @@ impl Channel {
         reply_to: Option<i64>,
         mentions: &str,
         created_at: &str,
-    ) -> Result<u64, ChannelError> {
+        capture: Option<&(String, i64)>,
+    ) -> Result<Option<u64>, ChannelError> {
         let mut connection = store::open_writable(path, &SCHEMA)?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((key, after)) = capture {
+            let answered = transaction
+                .query_row(
+                    "SELECT 1 FROM messages WHERE origin_thread_id = ?1
+                         AND ((capture_key IS NULL AND id > ?2) OR capture_key = ?3)",
+                    params![message.origin_thread_id, after, key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if answered {
+                return Ok(None);
+            }
+        }
         if let (Some(id), Some(sql_id)) = (message.reply_to, reply_to) {
             let exists = transaction
                 .query_row(
@@ -337,8 +416,9 @@ impl Channel {
         }
         transaction.execute(
             "INSERT INTO messages
-                 (author_kind, author_id, body, reply_to, origin_thread_id, mentions, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (author_kind, author_id, body, reply_to, origin_thread_id, mentions, created_at,
+                  capture_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.author.kind.as_str(),
                 message.author.id,
@@ -347,11 +427,12 @@ impl Channel {
                 message.origin_thread_id,
                 mentions,
                 created_at,
+                capture.map(|(key, _)| key),
             ],
         )?;
         let id = from_sql_id(transaction.last_insert_rowid())?;
         transaction.commit()?;
-        Ok(id)
+        Ok(Some(id))
     }
 
     fn reply_not_found(&self, id: u64) -> ChannelError {
@@ -370,11 +451,13 @@ impl Channel {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let connection = store::open_read_only(&path)?;
+        // Only the server reads a channel, so a read can bring an older
+        // database to the current schema.
+        let connection = store::open_writable(&path, &SCHEMA)?;
         // The most recent `limit` messages before `before`, oldest first.
         let mut statement = connection.prepare(
             "SELECT id, author_kind, author_id, body, reply_to, origin_thread_id, mentions,
-                    created_at
+                    created_at, capture_key IS NOT NULL
              FROM (SELECT * FROM messages WHERE id < ?1 ORDER BY id DESC LIMIT ?2)
              ORDER BY id ASC",
         )?;
@@ -388,12 +471,22 @@ impl Channel {
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, bool>(8)?,
             ))
         })?;
         let mut messages = Vec::new();
         for row in rows {
-            let (id, kind, author_id, body, reply_to, origin_thread_id, mentions, created_at) =
-                row?;
+            let (
+                id,
+                kind,
+                author_id,
+                body,
+                reply_to,
+                origin_thread_id,
+                mentions,
+                created_at,
+                captured,
+            ) = row?;
             let mentions = serde_json::from_str(&mentions)
                 .map_err(|err| ChannelError::Storage(format!("invalid mentions: {err}")))?;
             messages.push(Message {
@@ -408,6 +501,7 @@ impl Channel {
                 origin_thread_id,
                 mentions,
                 created_at,
+                captured,
             });
         }
         Ok(messages)
@@ -492,6 +586,7 @@ mod tests {
             origin_thread_id: None,
             mentions: Vec::new(),
             created_at: "2026-11-27T18:04:05Z".into(),
+            captured: false,
         };
         assert_eq!(posted, expected);
         assert_eq!(channel.read(ReadRange::default()).unwrap(), vec![expected]);
@@ -762,6 +857,129 @@ mod tests {
         assert_eq!(code("deploy", "Release"), "invalid_channel_name");
         assert_eq!(code("outro", "release"), "channel_not_found");
         assert_eq!(list(&folder.state), ["deploy", "geral"]);
+    }
+
+    fn capture(thread_id: &str, turn: u32, after: u64, body: &str) -> Capture {
+        Capture {
+            agent: "chief".into(),
+            thread_id: thread_id.into(),
+            turn,
+            after,
+            body: body.into(),
+        }
+    }
+
+    fn from_thread(thread_id: &str, body: &str) -> NewMessage {
+        NewMessage {
+            author: Author {
+                kind: AuthorKind::Agent,
+                id: "chief".into(),
+            },
+            origin_thread_id: Some(thread_id.into()),
+            ..human(body)
+        }
+    }
+
+    #[test]
+    fn a_capture_posts_once_per_turn_as_the_agent_without_mentions() {
+        let folder = Folder::new("capture-turns");
+        let channel = open(&folder.state, "geral").unwrap();
+        let mention = channel
+            .post(human("@chief oi"), afternoon_in_sao_paulo())
+            .unwrap();
+        let now = afternoon_in_sao_paulo();
+
+        let first = channel
+            .post_capture(capture("t1", 0, mention.id, "feito @reviewer"), now)
+            .unwrap()
+            .unwrap();
+        let again = channel
+            .post_capture(capture("t1", 0, mention.id, "feito @reviewer"), now)
+            .unwrap();
+        let second_turn = channel
+            .post_capture(capture("t1", 1, mention.id, "segundo"), now)
+            .unwrap();
+
+        assert_eq!(first.author.kind, AuthorKind::Agent);
+        assert_eq!(first.author.id, "chief");
+        assert_eq!(first.origin_thread_id.as_deref(), Some("t1"));
+        assert!(first.mentions.is_empty());
+        assert!(first.captured);
+        assert_eq!(again, None);
+        assert_eq!(
+            second_turn.map(|message| message.body).as_deref(),
+            Some("segundo")
+        );
+        let read = channel.read(ReadRange::default()).unwrap();
+        assert_eq!(
+            read.iter()
+                .map(|message| message.captured)
+                .collect::<Vec<_>>(),
+            [false, true, true]
+        );
+        assert_eq!(read[1], first);
+    }
+
+    #[test]
+    fn a_post_of_the_thread_after_the_turn_start_skips_the_capture() {
+        let folder = Folder::new("capture-posted");
+        let channel = open(&folder.state, "geral").unwrap();
+        let now = afternoon_in_sao_paulo();
+        let mention = channel.post(human("@chief oi"), now).unwrap();
+        channel
+            .post(from_thread("t2", "outra thread"), now)
+            .unwrap();
+
+        let unanswered = channel
+            .post_capture(capture("t1", 0, mention.id, "captura"), now)
+            .unwrap();
+        channel.post(from_thread("t3", "resposta"), now).unwrap();
+        let answered = channel
+            .post_capture(capture("t3", 0, mention.id, "captura"), now)
+            .unwrap();
+        let older_post = channel
+            .post_capture(capture("t3", 0, 99, "captura"), now)
+            .unwrap();
+
+        assert!(unanswered.is_some(), "a post of another thread counts not");
+        assert_eq!(answered, None);
+        assert!(
+            older_post.is_some(),
+            "a post before the turn start counts not"
+        );
+    }
+
+    #[test]
+    fn a_version_1_database_reads_back_and_takes_captures() {
+        let folder = Folder::new("capture-upgrade");
+        let path = folder
+            .state
+            .join("channels")
+            .join("geral")
+            .join(DATABASE_FILE);
+        let v1 = rusqlite::Connection::open(&path).unwrap();
+        v1.execute_batch(
+            "CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, author_kind TEXT NOT NULL,
+                 author_id TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER,
+                 origin_thread_id TEXT, mentions TEXT NOT NULL DEFAULT '[]',
+                 created_at TEXT NOT NULL);
+             INSERT INTO messages (author_kind, author_id, body, created_at)
+                 VALUES ('human', 'rafael', 'antigo', '2026-11-27T18:04:05Z');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(v1);
+        let channel = open(&folder.state, "geral").unwrap();
+
+        let read = channel.read(ReadRange::default()).unwrap();
+        let captured = channel
+            .post_capture(capture("t1", 0, 1, "captura"), afternoon_in_sao_paulo())
+            .unwrap();
+
+        assert_eq!(read[0].body, "antigo");
+        assert!(!read[0].captured);
+        assert_eq!(captured.map(|message| message.id), Some(2));
     }
 
     #[test]
