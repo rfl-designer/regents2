@@ -373,6 +373,7 @@ pub(crate) fn render_sidebar(
             ),
             entry.index,
             channels,
+            &workspace.unread_channels,
             palette,
             hits,
         );
@@ -704,22 +705,40 @@ fn render_channel_toggle(
 }
 
 /// Draws one `#channel` row per channel below the workspace at
-/// `workspace_index` of the snapshot and records a hit for each one.
+/// `workspace_index` of the snapshot and records a hit for each one. An
+/// unread channel gets a dot and bright text.
 fn render_channel_rows(
     buffer: &mut Buffer,
     area: Rect,
     workspace_index: usize,
     channels: &[String],
+    unread: &[String],
     palette: &Palette,
     hits: &mut ShellHitMap,
 ) {
-    let style = Style::default().fg(palette.subtext0);
+    let read_style = Style::default().fg(palette.subtext0);
+    let unread_style = Style::default()
+        .fg(palette.text)
+        .add_modifier(Modifier::BOLD);
     let name_x = area.x.saturating_add(4);
     for (channel_index, channel) in channels.iter().enumerate() {
         let y = area.y.saturating_add(channel_index as u16);
         if y >= area.bottom() {
             break;
         }
+        let style = if unread.contains(channel) {
+            put_text(
+                buffer,
+                area.x.saturating_add(2),
+                y,
+                1,
+                "●",
+                Style::default().fg(palette.accent),
+            );
+            unread_style
+        } else {
+            read_style
+        };
         put_text(buffer, area.x.saturating_add(3), y, 1, "#", style);
         put_text(
             buffer,

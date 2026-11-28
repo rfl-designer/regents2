@@ -429,6 +429,7 @@ impl App {
             legacy: self.is_legacy_workspace(index),
             disconnected: self.is_disconnected_workspace(index),
             channels: self.workspace_channel_names(index).to_vec(),
+            unread_channels: self.workspace_unread_channels(index),
         }
     }
 }

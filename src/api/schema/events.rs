@@ -84,6 +84,8 @@ pub enum Subscription {
     LayoutUpdated {},
     #[serde(rename = "channel.message_posted")]
     ChannelMessagePosted {},
+    #[serde(rename = "channel.renamed")]
+    ChannelRenamed {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -221,6 +223,7 @@ pub enum EventKind {
     PaneAgentStatusChanged,
     LayoutUpdated,
     ChannelMessagePosted,
+    ChannelRenamed,
 }
 
 impl EventKind {
@@ -253,6 +256,7 @@ impl EventKind {
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
             EventKind::ChannelMessagePosted => "channel.message_posted",
+            EventKind::ChannelRenamed => "channel.renamed",
         }
     }
 }
@@ -286,6 +290,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
     EventKind::ChannelMessagePosted,
+    EventKind::ChannelRenamed,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -561,5 +566,11 @@ pub enum EventData {
     ChannelMessagePosted {
         workspace_id: String,
         message: super::channels::ChannelMessageInfo,
+    },
+    /// The channel `from` is now `channel`, with the same history.
+    ChannelRenamed {
+        workspace_id: String,
+        from: String,
+        channel: String,
     },
 }

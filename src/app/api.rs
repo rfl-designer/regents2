@@ -1294,6 +1294,12 @@ impl App {
             Method::ChannelOpen(params) => {
                 return self.handle_channel_open(request.id, params);
             }
+            Method::ChannelCreate(params) => {
+                return self.handle_channel_create(request.id, params);
+            }
+            Method::ChannelRename(params) => {
+                return self.handle_channel_rename(request.id, params);
+            }
             _ => {
                 return responses::encode_error(
                     request.id,

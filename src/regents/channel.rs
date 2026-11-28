@@ -29,7 +29,7 @@ const SCHEMA: store::Schema = store::Schema {
 /// The channel that a chat pane shows: the pane runs the chat view of this
 /// channel (`regents::chat_panes`), and a restart restores it in the same
 /// place of the layout.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ChannelView {
     /// Stable ID of the workspace folder, from `workspace.toml`.
     pub(crate) folder_id: String,
@@ -115,6 +115,8 @@ pub(crate) enum ChannelError {
     /// The name is not a slug (lowercase letters, digits and single hyphens).
     InvalidName(String),
     NotFound(String),
+    /// A channel with this name exists.
+    AlreadyExists(String),
     EmptyBody,
     /// `reply_to` names no message of the channel.
     ReplyNotFound {
@@ -131,6 +133,7 @@ impl ChannelError {
         match self {
             Self::InvalidName(_) => "invalid_channel_name",
             Self::NotFound(_) => "channel_not_found",
+            Self::AlreadyExists(_) => "channel_exists",
             Self::EmptyBody => "invalid_message",
             Self::ReplyNotFound { .. } => "message_not_found",
             Self::InvalidMessageId(_) => "invalid_params",
@@ -147,6 +150,9 @@ impl std::fmt::Display for ChannelError {
                 "invalid channel name {name:?}: use lowercase letters, digits and hyphens"
             ),
             Self::NotFound(name) => write!(f, "channel #{name} does not exist in this workspace"),
+            Self::AlreadyExists(name) => {
+                write!(f, "channel #{name} already exists in this workspace")
+            }
             Self::EmptyBody => write!(f, "the message is empty"),
             Self::ReplyNotFound { channel, id } => {
                 write!(f, "message {id} does not exist in channel #{channel}")
@@ -184,6 +190,51 @@ pub(crate) fn open(state_dir: &Path, name: &str) -> Result<Channel, ChannelError
         name: name.to_owned(),
         dir,
     })
+}
+
+/// Creates the channel `name`: an empty subfolder of `channels/`. The
+/// database appears with the first message.
+pub(crate) fn create(state_dir: &Path, name: &str) -> Result<Channel, ChannelError> {
+    if !is_slug(name) {
+        return Err(ChannelError::InvalidName(name.to_owned()));
+    }
+    let parent = state_dir.join(CHANNELS_DIR);
+    std::fs::create_dir_all(&parent).map_err(storage_error)?;
+    let dir = parent.join(name);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => Ok(Channel {
+            name: name.to_owned(),
+            dir,
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(ChannelError::AlreadyExists(name.to_owned()))
+        }
+        Err(err) => Err(storage_error(err)),
+    }
+}
+
+/// Renames the channel `from` to `to`. The subfolder moves with its
+/// database, so the history stays.
+pub(crate) fn rename(state_dir: &Path, from: &str, to: &str) -> Result<Channel, ChannelError> {
+    let channel = open(state_dir, from)?;
+    if !is_slug(to) {
+        return Err(ChannelError::InvalidName(to.to_owned()));
+    }
+    let dir = state_dir.join(CHANNELS_DIR).join(to);
+    // A Unix rename replaces an empty folder, so check first. The server is
+    // the only writer of `.regents/`.
+    if dir.exists() {
+        return Err(ChannelError::AlreadyExists(to.to_owned()));
+    }
+    std::fs::rename(&channel.dir, &dir).map_err(storage_error)?;
+    Ok(Channel {
+        name: to.to_owned(),
+        dir,
+    })
+}
+
+fn storage_error(err: std::io::Error) -> ChannelError {
+    ChannelError::Storage(err.to_string())
 }
 
 /// Names of the channels of the workspace whose state directory is
@@ -652,6 +703,65 @@ mod tests {
         std::fs::write(folder.state.join("channels").join("notes"), "a file").unwrap();
 
         assert_eq!(list(&folder.state), ["design", "geral", "ops"]);
+    }
+
+    #[test]
+    fn a_created_channel_is_listed_and_a_second_create_is_refused() {
+        let folder = Folder::new("create");
+
+        let created = create(&folder.state, "deploy").unwrap();
+
+        assert_eq!(created.name(), "deploy");
+        assert_eq!(list(&folder.state), ["deploy", "geral"]);
+        assert_eq!(
+            create(&folder.state, "deploy").unwrap_err().code(),
+            "channel_exists"
+        );
+    }
+
+    #[test]
+    fn create_refuses_a_name_that_is_not_a_slug() {
+        let folder = Folder::new("create-slug");
+
+        for name in ["Deploy", "a b", "../x", ""] {
+            let err = create(&folder.state, name).unwrap_err();
+            assert_eq!(err.code(), "invalid_channel_name", "{name:?}");
+        }
+        assert_eq!(list(&folder.state), ["geral"]);
+    }
+
+    #[test]
+    fn a_renamed_channel_keeps_its_history_under_the_new_name() {
+        let folder = Folder::new("rename");
+        let deploy = create(&folder.state, "deploy").unwrap();
+        deploy
+            .post(human("antes"), afternoon_in_sao_paulo())
+            .unwrap();
+
+        let release = rename(&folder.state, "deploy", "release").unwrap();
+
+        assert_eq!(list(&folder.state), ["geral", "release"]);
+        let read = release.read(ReadRange::default()).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].body, "antes");
+        assert_eq!(read[0].channel, "release");
+        assert_eq!(
+            open(&folder.state, "deploy").unwrap_err().code(),
+            "channel_not_found"
+        );
+    }
+
+    #[test]
+    fn rename_refuses_a_taken_name_a_bad_name_and_a_missing_channel() {
+        let folder = Folder::new("rename-refused");
+        create(&folder.state, "deploy").unwrap();
+
+        let code = |from, to| rename(&folder.state, from, to).unwrap_err().code();
+
+        assert_eq!(code("deploy", "geral"), "channel_exists");
+        assert_eq!(code("deploy", "Release"), "invalid_channel_name");
+        assert_eq!(code("outro", "release"), "channel_not_found");
+        assert_eq!(list(&folder.state), ["deploy", "geral"]);
     }
 
     #[test]

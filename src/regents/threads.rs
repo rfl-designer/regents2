@@ -253,6 +253,20 @@ impl ThreadRegistry {
         Ok(())
     }
 
+    /// Moves the threads of the channel `from` to the channel `to`, after
+    /// a rename of the channel. Without a registry file there is none.
+    pub(crate) fn rename_channel(&self, from: &str, to: &str) -> Result<(), ThreadError> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
+        connection.execute(
+            "UPDATE threads SET channel = ?1 WHERE channel = ?2",
+            params![to, from],
+        )?;
+        Ok(())
+    }
+
     /// Every thread, oldest first. Without a registry file there is none.
     pub(crate) fn list(&self) -> Result<Vec<ThreadRecord>, ThreadError> {
         if !self.path.exists() {
@@ -390,6 +404,37 @@ mod tests {
             }
         );
         assert_eq!(registry.list().unwrap(), vec![created]);
+    }
+
+    #[test]
+    fn a_channel_rename_moves_its_threads() {
+        let folder = TempFolder::new("threads-rename");
+        let registry = registry(&folder.0);
+        registry.rename_channel("geral", "anuncios").unwrap();
+        assert!(!folder.0.join(DATABASE_FILE).exists());
+        registry.create(mention("chief", 1), at(0)).unwrap();
+        registry
+            .create(
+                NewThread {
+                    channel: Some("design".into()),
+                    ..mention("chief", 2)
+                },
+                at(0),
+            )
+            .unwrap();
+
+        registry.rename_channel("geral", "anuncios").unwrap();
+
+        let channels: Vec<_> = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.channel)
+            .collect();
+        assert_eq!(
+            channels,
+            [Some("anuncios".to_owned()), Some("design".to_owned())]
+        );
     }
 
     #[test]

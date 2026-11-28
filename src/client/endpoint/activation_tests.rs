@@ -153,6 +153,7 @@ fn workspace_focus_success(id: &str, workspace_id: &str) -> Vec<u8> {
                 legacy: false,
                 disconnected: false,
                 channels: Vec::new(),
+                unread_channels: Vec::new(),
             },
         },
     })

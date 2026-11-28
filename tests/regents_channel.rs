@@ -1,6 +1,7 @@
 //! Channels of the `regents` binary through the CLI and the JSON API:
 //! `channel post`, `channel read`, the per-channel database and the
-//! `channel.message_posted` event (ticket #6).
+//! `channel.message_posted` event (ticket #6), and `channel create`,
+//! `channel rename` and the unread channels (ticket #8).
 
 #![cfg(unix)]
 
@@ -206,4 +207,67 @@ fn a_command_inside_a_workspace_folder_posts_to_that_workspace() {
         second_messages[0]["body"], "ativo",
         "the active workspace is the fallback"
     );
+}
+
+/// A field of the active workspace, as `workspace get` shows it.
+fn workspace_field(sandbox: &Sandbox, field: &str) -> Value {
+    let active = sandbox.cli(&["channel", "read", "geral"])["workspace_id"].clone();
+    sandbox.cli(&["workspace", "get", active.as_str().unwrap()])["workspace"][field].clone()
+}
+
+#[test]
+fn a_created_channel_gets_a_folder_and_a_renamed_one_keeps_its_history() {
+    let sandbox = Sandbox::new();
+    let _server = sandbox.start_server();
+    let folder = add_workspace(&sandbox, "projeto");
+    let channels = folder.join(".regents").join("channels");
+
+    let created = sandbox.cli(&["channel", "create", "deploy"]);
+    sandbox.cli(&["channel", "post", "deploy", "antes"]);
+    let renamed = sandbox.cli(&["channel", "rename", "deploy", "release"]);
+
+    assert_eq!(created["type"], "channel_created", "{created}");
+    assert_eq!(renamed["type"], "channel_renamed", "{renamed}");
+    assert!(!channels.join("deploy").exists());
+    assert!(channel_database(&folder, "release").is_file());
+    assert_eq!(
+        workspace_field(&sandbox, "channels"),
+        serde_json::json!(["geral", "release"])
+    );
+    let read = sandbox.cli(&["channel", "read", "release"]);
+    assert_eq!(read["messages"][0]["body"], "antes", "{read}");
+    assert_eq!(read["messages"][0]["channel"], "release", "{read}");
+}
+
+#[test]
+fn a_channel_name_that_is_not_a_slug_is_refused() {
+    let sandbox = Sandbox::new();
+    let _server = sandbox.start_server();
+    let folder = add_workspace(&sandbox, "projeto");
+
+    let error = sandbox.cli_error(&["channel", "create", "Deploy"]);
+
+    assert_eq!(error["code"], "invalid_channel_name", "{error}");
+    assert!(!folder.join(".regents/channels/Deploy").exists());
+    assert_eq!(
+        workspace_field(&sandbox, "channels"),
+        serde_json::json!(["geral"])
+    );
+}
+
+#[test]
+fn a_new_message_marks_the_channel_unread_until_it_opens() {
+    let sandbox = Sandbox::new();
+    let _server = sandbox.start_server();
+    add_workspace(&sandbox, "projeto");
+    sandbox.cli(&["channel", "create", "deploy"]);
+
+    sandbox.cli(&["channel", "post", "deploy", "oi"]);
+    assert_eq!(
+        workspace_field(&sandbox, "unread_channels"),
+        serde_json::json!(["deploy"])
+    );
+
+    sandbox.cli(&["channel", "open", "deploy"]);
+    assert_eq!(workspace_field(&sandbox, "unread_channels"), Value::Null);
 }

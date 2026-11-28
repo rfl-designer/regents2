@@ -1,11 +1,14 @@
-//! Channel commands (Regents): `channel.post`, `channel.read` and
-//! `channel.open`. The store lives in `crate::regents::channel`; this module
-//! resolves the workspace folder, maps the store to the API, emits
-//! `channel.message_posted` and opens chat panes (`crate::regents::chat_panes`).
+//! Channel commands (Regents): `channel.create`, `channel.rename`,
+//! `channel.post`, `channel.read` and `channel.open`. The store lives in
+//! `crate::regents::channel`; this module resolves the workspace folder, maps
+//! the store to the API, emits `channel.message_posted` and `channel.renamed`,
+//! keeps the unread channels and opens chat panes
+//! (`crate::regents::chat_panes`).
 
 use crate::api::schema::{
-    ChannelAuthorInfo, ChannelAuthorKind, ChannelMessageInfo, ChannelOpenParams, ChannelPostParams,
-    ChannelReadParams, ErrorBody, EventData, EventEnvelope, EventKind, ResponseResult,
+    ChannelAuthorInfo, ChannelAuthorKind, ChannelCreateParams, ChannelMessageInfo,
+    ChannelOpenParams, ChannelPostParams, ChannelReadParams, ChannelRenameParams, ErrorBody,
+    EventData, EventEnvelope, EventKind, ResponseResult,
 };
 use crate::app::App;
 use crate::layout::PaneId;
@@ -42,6 +45,104 @@ impl App {
         }
     }
 
+    pub(super) fn handle_channel_create(
+        &mut self,
+        id: String,
+        params: ChannelCreateParams,
+    ) -> String {
+        match self.create_channel(params) {
+            Ok(result) => encode_success(id, result),
+            Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    pub(super) fn handle_channel_rename(
+        &mut self,
+        id: String,
+        params: ChannelRenameParams,
+    ) -> String {
+        match self.rename_channel(params) {
+            Ok(result) => encode_success(id, result),
+            Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    fn create_channel(&mut self, params: ChannelCreateParams) -> Result<ResponseResult, ErrorBody> {
+        let (index, state_dir) = self.folder_state_dir(params.workspace_id)?;
+        let channel = channel::create(&state_dir, &params.channel)?;
+        self.refresh_folder_channels();
+        Ok(ResponseResult::ChannelCreated {
+            workspace_id: self.public_workspace_id(index),
+            channel: channel.name().to_owned(),
+        })
+    }
+
+    /// Renames a channel folder. The thread registry, the open chat panes,
+    /// their saved session binding and the unread mark follow the new name,
+    /// and `channel.renamed` tells the running chat views.
+    fn rename_channel(&mut self, params: ChannelRenameParams) -> Result<ResponseResult, ErrorBody> {
+        let (index, state_dir) = self.folder_state_dir(params.workspace_id)?;
+        let folder_id = self.folder_id(index)?;
+        let renamed = channel::rename(&state_dir, &params.channel, &params.new_name)?;
+        let (from, to) = (params.channel, renamed.name().to_owned());
+        if let Err(err) = crate::regents::threads::registry(&state_dir).rename_channel(&from, &to) {
+            // The channel folder moved already; the index keeps the old name.
+            tracing::warn!(%err, from, to, "cannot move the threads of a renamed channel");
+        }
+        let old_label = format!("#{from}");
+        let chat_panes: Vec<PaneId> = self
+            .state
+            .channel_views
+            .iter_mut()
+            .filter(|(_, view)| view.folder_id == folder_id && view.channel == from)
+            .map(|(pane_id, view)| {
+                view.channel.clone_from(&to);
+                *pane_id
+            })
+            .collect();
+        for pane_id in chat_panes {
+            let terminal = self
+                .find_pane(pane_id)
+                .map(|(_, pane)| pane.attached_terminal_id.clone())
+                .and_then(|terminal_id| self.state.terminals.get_mut(&terminal_id));
+            // A label that the user changed stays.
+            if let Some(terminal) =
+                terminal.filter(|terminal| terminal.manual_label.as_deref() == Some(&old_label))
+            {
+                terminal.set_manual_label(format!("#{to}"));
+            }
+            self.state.mark_session_dirty();
+        }
+        if let Some(unread) = self.unread_channels.get_mut(&folder_id) {
+            if unread.remove(&from) {
+                unread.insert(to.clone());
+            }
+        }
+        self.refresh_folder_channels();
+        let workspace_id = self.public_workspace_id(index);
+        self.emit_event(EventEnvelope {
+            event: EventKind::ChannelRenamed,
+            data: EventData::ChannelRenamed {
+                workspace_id: workspace_id.clone(),
+                from: from.clone(),
+                channel: to.clone(),
+            },
+        });
+        Ok(ResponseResult::ChannelRenamed {
+            workspace_id,
+            from,
+            channel: to,
+        })
+    }
+
+    fn folder_id(&self, index: usize) -> Result<String, ErrorBody> {
+        self.state.workspaces[index]
+            .folder
+            .as_ref()
+            .map(|binding| binding.id.clone())
+            .ok_or_else(|| error_body("workspace_legacy", "the workspace has no folder"))
+    }
+
     /// Gives focus to the chat pane of a channel. When no workspace has a
     /// chat pane for the channel, it opens one next to the focused pane of
     /// the channel's workspace.
@@ -60,12 +161,14 @@ impl App {
             channel: channel.name().to_owned(),
         };
         let root = binding.root.clone();
+        let view_key = view.clone();
         let (pane_index, pane_id, opened) = match self.channel_view_pane(&view) {
             Some((pane_index, pane_id)) => (pane_index, pane_id, false),
             None => (index, self.spawn_channel_view(index, view, root)?, true),
         };
         self.state.focus_pane_in_workspace(pane_index, pane_id);
         self.state.mark_active_tab_seen();
+        self.mark_channel_read(&view_key);
         self.state.mode = crate::app::Mode::Terminal;
         let pane = self
             .pane_info(pane_index, pane_id)
@@ -150,6 +253,53 @@ impl App {
         Ok(pane_id)
     }
 
+    /// Marks a channel that just got a message as unread, unless its chat
+    /// pane is the focused pane of the active workspace.
+    fn mark_channel_unread(&mut self, view: ChannelView) {
+        let in_focus = self
+            .state
+            .active
+            .and_then(|index| self.state.workspaces.get(index))
+            .and_then(|workspace| workspace.focused_pane_id())
+            .is_some_and(|pane_id| self.state.channel_views.get(&pane_id) == Some(&view));
+        if !in_focus
+            && self
+                .unread_channels
+                .entry(view.folder_id)
+                .or_default()
+                .insert(view.channel)
+        {
+            self.render_dirty.request_generic();
+        }
+    }
+
+    fn mark_channel_read(&mut self, view: &ChannelView) {
+        if let Some(unread) = self.unread_channels.get_mut(&view.folder_id) {
+            if unread.remove(&view.channel) {
+                self.render_dirty.request_generic();
+            }
+        }
+    }
+
+    /// Unread channels of the workspace at `index`, in name order. It reads
+    /// no file.
+    pub(crate) fn workspace_unread_channels(&self, index: usize) -> Vec<String> {
+        let Some(unread) = self
+            .state
+            .workspaces
+            .get(index)
+            .and_then(|workspace| workspace.folder.as_ref())
+            .and_then(|binding| self.unread_channels.get(&binding.id))
+        else {
+            return Vec::new();
+        };
+        self.workspace_channel_names(index)
+            .iter()
+            .filter(|name| unread.contains(*name))
+            .cloned()
+            .collect()
+    }
+
     /// Registers the chat panes of a restored session: the panes whose
     /// command line is a chat view command.
     pub(crate) fn register_restored_channel_views(&mut self) {
@@ -192,6 +342,12 @@ impl App {
             time::OffsetDateTime::now_utc(),
         )?;
         self.open_mention_threads(index, &state_dir, &channel, &posted, &agents);
+        if let Ok(folder_id) = self.folder_id(index) {
+            self.mark_channel_unread(ChannelView {
+                folder_id,
+                channel: channel.name().to_owned(),
+            });
+        }
         let message = message_info(posted);
         self.emit_event(EventEnvelope {
             event: EventKind::ChannelMessagePosted,
@@ -735,6 +891,143 @@ mod tests {
                 channel: "geral".into()
             }]
         );
+    }
+
+    fn workspace_field(fixture: &mut Fixture, workspace_id: &str, field: &str) -> Value {
+        fixture.request("workspace.get", json!({"workspace_id": workspace_id}))["result"]
+            ["workspace"][field]
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_created_channel_gets_a_folder_and_shows_in_the_workspace() {
+        let mut fixture = Fixture::new("create");
+        let (folder, workspace_id) = fixture.workspace("projeto");
+
+        let created = fixture.request(
+            "channel.create",
+            json!({"workspace_id": workspace_id, "channel": "deploy"}),
+        );
+
+        assert_eq!(created["result"]["type"], "channel_created", "{created}");
+        assert_eq!(created["result"]["channel"], "deploy");
+        assert!(folder.join(".regents/channels/deploy").is_dir());
+        assert_eq!(
+            workspace_field(&mut fixture, &workspace_id, "channels"),
+            json!(["deploy", "geral"])
+        );
+        let again = fixture.request("channel.create", json!({"channel": "deploy"}));
+        assert_eq!(again["error"]["code"], "channel_exists", "{again}");
+    }
+
+    #[tokio::test]
+    async fn a_channel_name_that_is_not_a_slug_is_refused() {
+        let mut fixture = Fixture::new("create-slug");
+        let (folder, workspace_id) = fixture.workspace("projeto");
+
+        let created = fixture.request("channel.create", json!({"channel": "Deploy Final"}));
+        let renamed = fixture.request(
+            "channel.rename",
+            json!({"channel": "geral", "new_name": "Geral"}),
+        );
+
+        assert_eq!(
+            created["error"]["code"], "invalid_channel_name",
+            "{created}"
+        );
+        assert_eq!(
+            renamed["error"]["code"], "invalid_channel_name",
+            "{renamed}"
+        );
+        assert_eq!(
+            workspace_field(&mut fixture, &workspace_id, "channels"),
+            json!(["geral"])
+        );
+        assert!(folder.join(".regents/channels/geral").is_dir());
+    }
+
+    #[tokio::test]
+    async fn a_rename_keeps_the_history_and_moves_the_open_chat_pane() {
+        let mut fixture = Fixture::new("rename");
+        let (folder, workspace_id) = fixture.workspace("projeto");
+        let folder_id = crate::regents::folder::read_manifest(&folder).unwrap().id;
+        fixture.request("channel.create", json!({"channel": "deploy"}));
+        fixture.request(
+            "channel.post",
+            json!({"channel": "deploy", "body": "antes"}),
+        );
+        let opened = fixture.request("channel.open", json!({"channel": "deploy"}));
+        let chat_pane = opened["result"]["pane"]["pane_id"].clone();
+
+        let renamed = fixture.request(
+            "channel.rename",
+            json!({"workspace_id": workspace_id, "channel": "deploy", "new_name": "release"}),
+        );
+
+        assert_eq!(renamed["result"]["type"], "channel_renamed", "{renamed}");
+        assert_eq!(renamed["result"]["from"], "deploy");
+        assert_eq!(renamed["result"]["channel"], "release");
+        assert!(!folder.join(".regents/channels/deploy").exists());
+        let read = fixture.request("channel.read", json!({"channel": "release"}));
+        assert_eq!(read["result"]["messages"][0]["body"], "antes", "{read}");
+        assert_eq!(
+            workspace_field(&mut fixture, &workspace_id, "channels"),
+            json!(["geral", "release"])
+        );
+        let pane = fixture.request("pane.get", json!({"pane_id": chat_pane}));
+        assert_eq!(
+            pane["result"]["pane"]["channel"],
+            json!({"folder_id": folder_id, "channel": "release"}),
+            "{pane}"
+        );
+        assert_eq!(pane["result"]["pane"]["label"], "#release", "{pane}");
+        let events: Vec<EventData> = fixture
+            .app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, event)| event.event == EventKind::ChannelRenamed)
+            .map(|(_, event)| event.data)
+            .collect();
+        assert_eq!(
+            events,
+            [EventData::ChannelRenamed {
+                workspace_id,
+                from: "deploy".into(),
+                channel: "release".into(),
+            }]
+        );
+        let again = fixture.request("channel.open", json!({"channel": "release"}));
+        assert_eq!(again["result"]["opened"], false, "{again}");
+    }
+
+    #[tokio::test]
+    async fn a_message_in_a_channel_out_of_focus_is_unread_until_the_channel_opens() {
+        let mut fixture = Fixture::new("unread");
+        let (_, workspace_id) = fixture.workspace("projeto");
+        fixture.request("channel.create", json!({"channel": "deploy"}));
+        let unread =
+            |fixture: &mut Fixture| workspace_field(fixture, &workspace_id, "unread_channels");
+
+        fixture.request("channel.post", json!({"channel": "deploy", "body": "oi"}));
+        assert_eq!(unread(&mut fixture), json!(["deploy"]));
+
+        fixture.request("channel.open", json!({"channel": "deploy"}));
+        assert_eq!(unread(&mut fixture), Value::Null);
+
+        // The chat pane of #deploy has focus: its new messages are seen.
+        fixture.request(
+            "channel.post",
+            json!({"channel": "deploy", "body": "visto"}),
+        );
+        assert_eq!(unread(&mut fixture), Value::Null);
+
+        fixture.request("channel.post", json!({"channel": "geral", "body": "oi"}));
+        fixture.request(
+            "channel.rename",
+            json!({"channel": "geral", "new_name": "anuncios"}),
+        );
+        assert_eq!(unread(&mut fixture), json!(["anuncios"]));
     }
 
     #[tokio::test]

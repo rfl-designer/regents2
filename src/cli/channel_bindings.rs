@@ -6,7 +6,8 @@ use std::path::Path;
 use clap::Command;
 
 use crate::api::schema::channels::{
-    ChannelOpenProjection, ChannelPostProjection, ChannelReadProjection,
+    ChannelCreateProjection, ChannelOpenProjection, ChannelPostProjection, ChannelReadProjection,
+    ChannelRenameProjection,
 };
 use crate::api::schema::{Method, Request};
 
@@ -18,6 +19,14 @@ pub(crate) fn channel_name() -> Input<String> {
         Ok(())
     })
     .value_name("CHANNEL")
+}
+
+pub(crate) fn new_channel_name() -> Input<String> {
+    Input::positional("new_name", 1, |slot, value| {
+        *slot = value.to_owned();
+        Ok(())
+    })
+    .value_name("NEW_NAME")
 }
 
 /// The message text: every word after the channel name, joined by spaces.
@@ -53,7 +62,21 @@ pub(crate) fn limit() -> Input<Option<u32>> {
     .help("Show at most N of the most recent messages")
 }
 
-const LEAVES: [Leaf; 3] = [
+const LEAVES: [Leaf; 5] = [
+    Leaf {
+        name: "create",
+        about: "Create a channel",
+        id: "cli:channel:create",
+        arguments: ChannelCreateProjection::arguments,
+        method: |matches| ChannelCreateProjection::from_matches(matches).map(Method::ChannelCreate),
+    },
+    Leaf {
+        name: "rename",
+        about: "Rename a channel; its history stays",
+        id: "cli:channel:rename",
+        arguments: ChannelRenameProjection::arguments,
+        method: |matches| ChannelRenameProjection::from_matches(matches).map(Method::ChannelRename),
+    },
     Leaf {
         name: "post",
         about: "Post a message to a channel",
@@ -126,7 +149,7 @@ fn view_arguments(matches: &clap::ArgMatches) -> (String, Option<String>) {
 
 pub(crate) fn command() -> Command {
     Command::new("channel")
-        .about("Post and read channel messages over the socket API")
+        .about("Create, rename, post to and read channels over the socket API")
         .subcommand_required(true)
         .subcommands(LEAVES.iter().map(Leaf::command))
         .subcommand(view_command())
@@ -160,6 +183,8 @@ fn request_in(args: &[String], cwd: &Path) -> Result<Request, ParseError> {
         Method::ChannelPost(params) => &mut params.workspace_id,
         Method::ChannelRead(params) => &mut params.workspace_id,
         Method::ChannelOpen(params) => &mut params.workspace_id,
+        Method::ChannelCreate(params) => &mut params.workspace_id,
+        Method::ChannelRename(params) => &mut params.workspace_id,
         _ => return Ok(request),
     };
     if workspace_id.is_none() {
@@ -271,6 +296,24 @@ mod tests {
     }
 
     #[test]
+    fn create_and_rename_send_the_channel_names() {
+        assert_eq!(
+            parse(&["create", "deploy"]),
+            serde_json::json!({
+                "id": "cli:channel:create", "method": "channel.create",
+                "params": {"channel": "deploy"}
+            })
+        );
+        assert_eq!(
+            parse(&["rename", "--workspace", "w1", "deploy", "release"]),
+            serde_json::json!({
+                "id": "cli:channel:rename", "method": "channel.rename",
+                "params": {"workspace_id": "w1", "channel": "deploy", "new_name": "release"}
+            })
+        );
+    }
+
+    #[test]
     fn usage_and_errors_name_the_running_binary() {
         crate::build_info::as_regents_for_test(|| {
             let commands = projection::group_commands(&command());
@@ -312,6 +355,10 @@ mod tests {
             &["read"],
             &["read", "--limit", "-1", "geral"],
             &["read", "geral", "extra"],
+            &["create"],
+            &["create", "a", "b"],
+            &["rename", "deploy"],
+            &["rename", "a", "b", "c"],
         ] {
             assert!(fails(args), "{args:?}");
         }

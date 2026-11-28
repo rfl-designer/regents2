@@ -831,6 +831,31 @@
                 "message"
               ],
               "type": "object"
+            },
+            {
+              "description": "The channel `from` is now `channel`, with the same history.",
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "from": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "channel_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "from",
+                "channel"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -862,7 +887,8 @@
             "pane_agent_detected",
             "pane_agent_status_changed",
             "layout_updated",
-            "channel_message_posted"
+            "channel_message_posted",
+            "channel_renamed"
           ],
           "type": "string"
         },
@@ -1292,6 +1318,13 @@
                 "pattern": "^[A-Za-z0-9_-]{1,32}$"
               },
               "type": "object"
+            },
+            "unread_channels": {
+              "description": "Channels of `channels` with a message that the human has not seen, in\nname order. Absent means none.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "workspace_id": {
               "type": "string"
@@ -1887,6 +1920,25 @@
           ],
           "type": "object"
         },
+        "ChannelCreateParams": {
+          "properties": {
+            "channel": {
+              "description": "Name of the new channel: a slug, for example `deploy`.",
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Workspace of the channel: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "channel"
+          ],
+          "type": "object"
+        },
         "ChannelOpenParams": {
           "properties": {
             "channel": {
@@ -1979,6 +2031,30 @@
           },
           "required": [
             "channel"
+          ],
+          "type": "object"
+        },
+        "ChannelRenameParams": {
+          "properties": {
+            "channel": {
+              "description": "Current channel name (slug).",
+              "type": "string"
+            },
+            "new_name": {
+              "description": "New channel name (slug).",
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Workspace of the channel: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "channel",
+            "new_name"
           ],
           "type": "object"
         },
@@ -4566,6 +4642,18 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "channel.renamed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -6845,6 +6933,38 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "channel.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ChannelCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "channel.rename",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ChannelRenameParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -8171,6 +8291,31 @@
                 "message"
               ],
               "type": "object"
+            },
+            {
+              "description": "The channel `from` is now `channel`, with the same history.",
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "from": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "channel_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "from",
+                "channel"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -8217,7 +8362,8 @@
             "pane_agent_detected",
             "pane_agent_status_changed",
             "layout_updated",
-            "channel_message_posted"
+            "channel_message_posted",
+            "channel_renamed"
           ],
           "type": "string"
         },
@@ -11439,6 +11585,51 @@
               "type": "object"
             },
             {
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "channel_created",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "channel"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The channel `from` is now `channel`, with the same history.",
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "from": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "channel_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "from",
+                "channel"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The chat pane of a channel has focus. `opened` is false when the\nchannel was already open in the workspace layout.",
               "properties": {
                 "channel": {
@@ -11861,6 +12052,13 @@
                 "pattern": "^[A-Za-z0-9_-]{1,32}$"
               },
               "type": "object"
+            },
+            "unread_channels": {
+              "description": "Channels of `channels` with a message that the human has not seen, in\nname order. Absent means none.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "workspace_id": {
               "type": "string"

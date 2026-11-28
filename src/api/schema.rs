@@ -159,6 +159,8 @@ operations::define_operations! {
     ThreadList(ThreadListParams) => "thread.list", false, false;
     AgentDefinitionList(AgentDefinitionListParams) => "agent.definition.list", false, false;
     ChannelOpen(ChannelOpenParams) => "channel.open", true, true;
+    ChannelCreate(ChannelCreateParams) => "channel.create", false, false;
+    ChannelRename(ChannelRenameParams) => "channel.rename", false, false;
 }
 
 #[cfg(test)]

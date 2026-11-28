@@ -1048,6 +1048,10 @@ pub struct ClientShellWorkspace {
     /// servers.
     #[serde(default)]
     pub channels: Vec<String>,
+    /// Unread channels of a Regents folder workspace. Optional for older
+    /// servers.
+    #[serde(default)]
+    pub unread_channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2851,6 +2855,7 @@ mod tests {
                 legacy: false,
                 disconnected: false,
                 channels: Vec::new(),
+                unread_channels: Vec::new(),
             }],
             tabs: vec![ClientShellTab {
                 tab_id: "w1:t1".into(),

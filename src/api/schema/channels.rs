@@ -1,5 +1,6 @@
-//! Regents channels: `channel.post`, `channel.read` and the
-//! `channel.message_posted` event (ADR-0004).
+//! Regents channels: `channel.create`, `channel.rename`, `channel.post`,
+//! `channel.read`, `channel.open` and the `channel.message_posted` and
+//! `channel.renamed` events (ADR-0004).
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,34 @@ cli_params! {
             .input(super::tabs::workspace_option("WORKSPACE_ID").order(0)),
         /// Channel name (slug), for example `geral`.
         pub channel: String => Field::new(String::new()).input(bindings::channel_name()),
+    }
+}
+
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct ChannelCreateParams => ChannelCreateProjection {
+        /// Workspace of the channel: its public ID or the stable ID from
+        /// `workspace.toml`. Absent means the active workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub workspace_id: Option<String> => Field::new(None)
+            .input(super::tabs::workspace_option("WORKSPACE_ID").order(0)),
+        /// Name of the new channel: a slug, for example `deploy`.
+        pub channel: String => Field::new(String::new()).input(bindings::channel_name()),
+    }
+}
+
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct ChannelRenameParams => ChannelRenameProjection {
+        /// Workspace of the channel: its public ID or the stable ID from
+        /// `workspace.toml`. Absent means the active workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub workspace_id: Option<String> => Field::new(None)
+            .input(super::tabs::workspace_option("WORKSPACE_ID").order(0)),
+        /// Current channel name (slug).
+        pub channel: String => Field::new(String::new()).input(bindings::channel_name()),
+        /// New channel name (slug).
+        pub new_name: String => Field::new(String::new()).input(bindings::new_channel_name()),
     }
 }
 

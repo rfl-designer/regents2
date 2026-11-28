@@ -43,6 +43,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
             legacy: false,
             disconnected: false,
             channels: Vec::new(),
+            unread_channels: Vec::new(),
         }],
         tabs: vec![ClientShellTab {
             tab_id: "tab_1".into(),

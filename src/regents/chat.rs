@@ -468,6 +468,8 @@ pub(crate) trait ChatSource {
         limit: u32,
     ) -> Result<(String, Vec<ChannelMessageInfo>), String>;
     fn post(&self, body: String) -> Result<ChannelMessageInfo, String>;
+    /// The channel has a new name; later reads and posts use it.
+    fn rename(&mut self, _channel: &str) {}
 }
 
 /// Input of the view loop besides the terminal events.
@@ -475,6 +477,12 @@ pub(crate) enum Update {
     Posted {
         workspace_id: String,
         message: ChannelMessageInfo,
+    },
+    /// A channel has a new name (`channel.renamed`).
+    Renamed {
+        workspace_id: String,
+        from: String,
+        channel: String,
     },
     /// The event stream started (true) or closed (false).
     Following(bool),
@@ -522,6 +530,20 @@ impl<S: ChatSource> ChatSession<S> {
                     && message.channel == self.channel
                 {
                     self.view.add_recent([message]);
+                    self.dirty = true;
+                }
+            }
+            Update::Renamed {
+                workspace_id,
+                from,
+                channel,
+            } => {
+                if self.workspace_id.as_deref() == Some(workspace_id.as_str())
+                    && from == self.channel
+                {
+                    self.source.rename(&channel);
+                    self.view.channel.clone_from(&channel);
+                    self.channel = channel;
                     self.dirty = true;
                 }
             }
@@ -713,6 +735,10 @@ impl ChatSource for ApiSource {
             result => Err(format!("unexpected api result: {result:?}")),
         }
     }
+
+    fn rename(&mut self, channel: &str) {
+        self.channel = channel.to_owned();
+    }
 }
 
 /// Runs the chat view of `channel` until the user quits. `workspace_id` is a
@@ -750,13 +776,17 @@ pub(crate) fn run(channel: String, workspace_id: Option<String>) -> io::Result<i
     }
 }
 
-/// Follows `channel.message_posted` on a background thread and sends each
-/// message to `updates`. It subscribes again when the stream closes.
+/// Follows `channel.message_posted` and `channel.renamed` on a background
+/// thread and sends each event to `updates`. It subscribes again when the
+/// stream closes.
 fn follow_channel(client: ApiClient, updates: mpsc::Sender<Update>) {
     let subscribe = Request {
         id: "chat:follow".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {
-            subscriptions: vec![Subscription::ChannelMessagePosted {}],
+            subscriptions: vec![
+                Subscription::ChannelMessagePosted {},
+                Subscription::ChannelRenamed {},
+            ],
         }),
     };
     std::thread::spawn(move || loop {
@@ -766,24 +796,34 @@ fn follow_channel(client: ApiClient, updates: mpsc::Sender<Update>) {
             }
             for line in stream.lines() {
                 let Ok(line) = line else { break };
-                let Ok(EventEnvelope {
-                    data:
-                        EventData::ChannelMessagePosted {
-                            workspace_id,
-                            message,
-                        },
-                    ..
-                }) = serde_json::from_str(&line)
-                else {
-                    continue;
-                };
-                if updates
-                    .send(Update::Posted {
+                let update = match serde_json::from_str(&line) {
+                    Ok(EventEnvelope {
+                        data:
+                            EventData::ChannelMessagePosted {
+                                workspace_id,
+                                message,
+                            },
+                        ..
+                    }) => Update::Posted {
                         workspace_id,
                         message,
-                    })
-                    .is_err()
-                {
+                    },
+                    Ok(EventEnvelope {
+                        data:
+                            EventData::ChannelRenamed {
+                                workspace_id,
+                                from,
+                                channel,
+                            },
+                        ..
+                    }) => Update::Renamed {
+                        workspace_id,
+                        from,
+                        channel,
+                    },
+                    _ => continue,
+                };
+                if updates.send(update).is_err() {
                     return;
                 }
             }
@@ -1157,6 +1197,40 @@ mod tests {
         );
 
         assert_eq!(session.view.message_count(), 1);
+    }
+
+    #[test]
+    fn a_rename_of_the_channel_moves_the_view_to_the_new_name() {
+        let source = FakeSource::answering(vec![Ok(vec![human(1)])]);
+        let now = Instant::now();
+        let mut session = ChatSession::new("geral".into(), &source, time::UtcOffset::UTC, now);
+        session.sync(now);
+        let renamed = |workspace_id: &str, from: &str| Update::Renamed {
+            workspace_id: workspace_id.into(),
+            from: from.into(),
+            channel: "anuncios".into(),
+        };
+
+        session.apply_update(renamed("w2", "geral"), now);
+        session.apply_update(renamed("w1", "design"), now);
+        assert_eq!(session.channel, "geral");
+
+        session.apply_update(renamed("w1", "geral"), now);
+        let mut moved = human(2);
+        moved.channel = "anuncios".into();
+        session.apply_update(
+            Update::Posted {
+                workspace_id: "w1".into(),
+                message: moved,
+            },
+            now,
+        );
+
+        assert_eq!(session.channel, "anuncios");
+        assert_eq!(session.view.message_count(), 2);
+        assert!(screen(&mut session.view, 40, 6)
+            .iter()
+            .any(|line| line.contains("#anuncios")));
     }
 
     #[test]

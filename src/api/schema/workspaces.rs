@@ -109,6 +109,10 @@ pub struct WorkspaceInfo {
     /// means none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub channels: Vec<String>,
+    /// Channels of `channels` with a message that the human has not seen, in
+    /// name order. Absent means none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread_channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

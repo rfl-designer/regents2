@@ -98,6 +98,7 @@ pub(super) fn snapshot_with_completions(
                 legacy: workspace.legacy,
                 disconnected: workspace.disconnected,
                 channels: workspace.channels,
+                unread_channels: workspace.unread_channels,
             }
         })
         .collect();

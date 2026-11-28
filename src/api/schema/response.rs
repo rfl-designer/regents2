@@ -323,6 +323,16 @@ pub enum ResponseResult {
         workspace_id: String,
         agents: Vec<super::threads::AgentDefinitionInfo>,
     },
+    ChannelCreated {
+        workspace_id: String,
+        channel: String,
+    },
+    /// The channel `from` is now `channel`, with the same history.
+    ChannelRenamed {
+        workspace_id: String,
+        from: String,
+        channel: String,
+    },
     /// The chat pane of a channel has focus. `opened` is false when the
     /// channel was already open in the workspace layout.
     ChannelOpened {

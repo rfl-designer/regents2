@@ -148,6 +148,12 @@ pub struct App {
     /// Regents: channel names of each connected open folder workspace, by
     /// folder ID. Refreshed with `disconnected_folders`, never during render.
     folder_channels: HashMap<String, Vec<String>>,
+    /// Regents: channels with a message that the human has not seen, by
+    /// folder ID. A post to a channel whose chat pane is not in focus adds
+    /// it; `channel.open` removes it.
+    /// shortcut: kept in memory only, so a restart clears it; persist a last
+    /// read message per channel when the unread state must survive restarts.
+    unread_channels: HashMap<String, HashSet<String>>,
     /// Regents: next periodic check of the open workspace folders; `None`
     /// until the first check.
     next_folder_connection_check: Option<Instant>,
@@ -684,6 +690,7 @@ impl App {
             reopen_excluded_folders: Vec::new(),
             disconnected_folders: HashSet::new(),
             folder_channels: HashMap::new(),
+            unread_channels: HashMap::new(),
             next_folder_connection_check: None,
             running_threads: HashMap::new(),
             expected_thread_exits: HashSet::new(),

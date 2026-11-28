@@ -201,3 +201,27 @@ fn the_parent_of_a_worktree_group_expands_its_channels_too() {
         "{expanded}"
     );
 }
+
+#[test]
+fn an_unread_channel_row_shows_a_dot() {
+    let mut state = state_with_channels(&["deploy", "geral"]);
+    if let Some(snapshot) = state.snapshot.as_deref() {
+        let mut projected = snapshot.clone();
+        projected.workspaces[0].unread_channels = vec!["deploy".into()];
+        state.set_snapshot(Box::new(projected));
+    }
+    compose_text(&mut state);
+    click_channel_toggle(&mut state);
+
+    let lines = sidebar_lines(&compose_text(&mut state));
+
+    let row = |name: &str| {
+        lines
+            .iter()
+            .find(|line| line.contains(name))
+            .unwrap_or_else(|| panic!("no {name} row: {lines:?}"))
+            .clone()
+    };
+    assert!(row("#deploy").contains("●#deploy"), "{lines:?}");
+    assert!(!row("#geral").contains('●'), "{lines:?}");
+}

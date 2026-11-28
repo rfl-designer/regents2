@@ -812,6 +812,7 @@ fn worktree_request_and_response_round_trip() {
                 legacy: false,
                 disconnected: false,
                 channels: Vec::new(),
+                unread_channels: Vec::new(),
             },
             tab: TabInfo {
                 tab_id: "w_1:1".into(),
@@ -904,6 +905,7 @@ fn worktree_lifecycle_events_round_trip() {
         legacy: false,
         disconnected: false,
         channels: Vec::new(),
+        unread_channels: Vec::new(),
     };
     let worktree = WorktreeInfo {
         path: "/worktrees/herdr/worktree-api".into(),
