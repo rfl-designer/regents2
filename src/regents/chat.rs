@@ -356,21 +356,28 @@ impl ChatView {
                 ));
             }
             spans.push(author_span(message));
-            if let Some(thread) = message
-                .origin_thread_id
-                .as_ref()
-                .filter(|_| message.author.kind == ChannelAuthorKind::Agent)
-            {
+            if let Some(thread) = message.origin_thread_id.as_ref().filter(|_| {
+                matches!(
+                    message.author.kind,
+                    ChannelAuthorKind::Agent | ChannelAuthorKind::System
+                )
+            }) {
                 links.push((lines.len(), thread.clone()));
                 spans.push(Span::styled(
                     format!(" [{thread}]"),
                     dim.add_modifier(Modifier::UNDERLINED),
                 ));
             }
+            // A system message is the Regents speaking, not a participant.
+            let body_style = if message.author.kind == ChannelAuthorKind::System {
+                dim.add_modifier(Modifier::ITALIC)
+            } else {
+                Style::default()
+            };
             spans.push(Span::raw(": "));
-            spans.push(Span::raw(first));
+            spans.push(Span::styled(first, body_style));
             lines.push(Line::from(spans));
-            lines.extend(body.map(|line| Line::raw(format!("  {line}"))));
+            lines.extend(body.map(|line| Line::styled(format!("  {line}"), body_style)));
         }
         (lines, links)
     }
@@ -1098,6 +1105,35 @@ mod tests {
         assert_eq!(lines[4], "18:04 system: thread bloqueada");
         assert_eq!(lines[7], "─".repeat(40));
         assert_eq!(lines[8], ">");
+    }
+
+    #[test]
+    fn a_system_message_has_a_dim_italic_body_and_links_its_thread() {
+        let mut view = view();
+        view.add_recent([
+            message(1, ChannelAuthorKind::Human, "rafael", "oi"),
+            ChannelMessageInfo {
+                origin_thread_id: Some("t1".into()),
+                ..message(
+                    2,
+                    ChannelAuthorKind::System,
+                    "regents",
+                    "@chief precisa de aprovação",
+                )
+            },
+        ]);
+        let area = Rect::new(0, 0, 50, 6);
+        view.set_viewport(50, 6);
+        let mut buffer = Buffer::empty(area);
+        view.render(area, &mut buffer);
+        let row = |y: u16| -> String { (0..50).map(|x| buffer[(x, y)].symbol()).collect() };
+        let body_x = row(3).find("@chief").unwrap() as u16;
+
+        assert!(row(3).starts_with("18:04 system [t1]: @chief precisa de aprovação"));
+        let body = buffer[(body_x, 3)].modifier;
+        assert!(body.contains(Modifier::ITALIC) && body.contains(Modifier::DIM));
+        let human_x = row(2).find("oi").unwrap() as u16;
+        assert!(!buffer[(human_x, 2)].modifier.contains(Modifier::ITALIC));
     }
 
     #[test]

@@ -183,6 +183,14 @@ pub(super) fn thread_rows(snapshot: &ClientShellSnapshot) -> Vec<PanelRow> {
 fn render_thread_row(buffer: &mut Buffer, rect: Rect, row: &ThreadRow, config: &ClientShellConfig) {
     let palette = &config.palette;
     let color = status_color(row.status, palette);
+    // A thread that waits for an approval stands out: it needs the user.
+    let blocked = row.status == crate::api::schema::AgentStatus::Blocked;
+    let agent_color = if blocked { color } else { palette.subtext0 };
+    let state_style = if blocked {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color)
+    };
     let spans = vec![
         ratatui::text::Span::raw("   "),
         ratatui::text::Span::styled(
@@ -192,14 +200,14 @@ fn render_thread_row(buffer: &mut Buffer, rect: Rect, row: &ThreadRow, config: &
         ratatui::text::Span::styled(
             format!(" @{} ", row.agent),
             Style::default()
-                .fg(palette.subtext0)
+                .fg(agent_color)
                 .add_modifier(Modifier::BOLD),
         ),
         ratatui::text::Span::styled(
             format!("{} ", row.thread_id),
             Style::default().fg(palette.overlay0),
         ),
-        ratatui::text::Span::styled(row.state_text, Style::default().fg(color)),
+        ratatui::text::Span::styled(row.state_text, state_style),
     ];
     Paragraph::new(Line::from(spans)).render(rect, buffer);
 }

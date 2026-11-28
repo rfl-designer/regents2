@@ -14,6 +14,20 @@ pub(crate) fn resolve<'a>(body: &str, known: impl IntoIterator<Item = &'a str>) 
     resolved
 }
 
+/// Mentioned names of `body` that are not in `known`, in the order of their
+/// first mention, each one once. Same tokens as `resolve`, so text that is
+/// not a mention there is not one here.
+pub(crate) fn unknown<'a>(body: &str, known: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let known: Vec<&str> = known.into_iter().collect();
+    let mut unknown: Vec<String> = Vec::new();
+    for name in mentioned_names(body) {
+        if !known.contains(&name.as_str()) && !unknown.contains(&name) {
+            unknown.push(name);
+        }
+    }
+    unknown
+}
+
 /// Every `@name` token of `body`, lowercased. An `@` counts only at the start
 /// of the text or after a character that is not a letter, digit, `.` or `_`,
 /// so `rafael@example.com` is not a mention.
@@ -71,7 +85,19 @@ mod tests {
     fn text_that_only_contains_an_at_sign_is_not_a_mention() {
         for body in ["rafael@chief.com", "a_@chief", "@ sozinho", "@", "x.@chief"] {
             assert!(resolve(body, AGENTS).is_empty(), "{body:?}");
+            assert!(unknown(body, AGENTS).is_empty(), "{body:?}");
         }
+    }
+
+    #[test]
+    fn unknown_names_are_the_mentions_that_resolve_ignores() {
+        assert_eq!(unknown("@ninguem oi @chief", AGENTS), ["ninguem"]);
+        assert_eq!(
+            unknown("@Ninguem, @outro e @ninguem de novo", AGENTS),
+            ["ninguem", "outro"]
+        );
+        assert!(unknown("@chief e @code-bot", AGENTS).is_empty());
+        assert_eq!(unknown("fale com @nada-", AGENTS), ["nada"]);
     }
 
     #[test]

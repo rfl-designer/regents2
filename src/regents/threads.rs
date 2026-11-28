@@ -360,35 +360,63 @@ fn parse_id(id: &str) -> Result<i64, ThreadError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadStep {
     Running,
+    /// The agent began to wait for an approval: announce it once.
+    Blocked,
     /// The agent finished its turn: end the CLI process.
     Done,
 }
 
 /// Follows the detected agent state of a running thread. The agent starts
 /// with its prompt, so the thread is done at the first idle state after the
-/// agent worked. Herdr's own `done` status means "idle and not seen", which
+/// agent worked. A block is not work: claude asks to trust the folder and
+/// goes idle for a moment before its turn starts. Herdr's own `done` status means "idle and not seen", which
 /// a hidden pane always is, so it cannot tell this.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ThreadProgress {
     worked: bool,
+    /// The last known state is blocked. `Unknown` keeps it, so a gap in
+    /// detection does not announce the same block twice.
+    blocked: bool,
 }
 
 impl ThreadProgress {
     pub(crate) fn observe(&mut self, state: AgentState) -> ThreadStep {
         match state {
-            AgentState::Working | AgentState::Blocked => {
+            AgentState::Blocked => {
+                if std::mem::replace(&mut self.blocked, true) {
+                    ThreadStep::Running
+                } else {
+                    ThreadStep::Blocked
+                }
+            }
+            AgentState::Working => {
                 self.worked = true;
+                self.blocked = false;
                 ThreadStep::Running
             }
-            AgentState::Idle if self.worked => ThreadStep::Done,
-            AgentState::Idle | AgentState::Unknown => ThreadStep::Running,
+            AgentState::Idle if self.worked => {
+                self.blocked = false;
+                ThreadStep::Done
+            }
+            // shortcut: an idle after a block without work never ends the thread,
+            // add a turn timeout if a CLI asks for an approval before it works.
+            AgentState::Idle => {
+                self.blocked = false;
+                ThreadStep::Running
+            }
+            AgentState::Unknown => ThreadStep::Running,
         }
     }
 
     /// The final state of a thread whose CLI process exited by itself, and
     /// the reason when it is not done.
     pub(crate) fn state_after_exit(self) -> (ThreadState, Option<&'static str>) {
-        if self.worked {
+        if self.blocked {
+            (
+                ThreadState::Failed,
+                Some("the agent CLI exited while it waited for approval"),
+            )
+        } else if self.worked {
             (ThreadState::Done, None)
         } else {
             (
@@ -612,8 +640,60 @@ mod tests {
         assert_eq!(progress.observe(AgentState::Unknown), ThreadStep::Running);
         assert_eq!(progress.observe(AgentState::Idle), ThreadStep::Running);
         assert_eq!(progress.observe(AgentState::Working), ThreadStep::Running);
-        assert_eq!(progress.observe(AgentState::Blocked), ThreadStep::Running);
+        assert_eq!(progress.observe(AgentState::Blocked), ThreadStep::Blocked);
         assert_eq!(progress.observe(AgentState::Idle), ThreadStep::Done);
+    }
+
+    #[test]
+    fn an_idle_after_a_block_without_work_is_not_the_end_of_the_turn() {
+        let mut progress = ThreadProgress::default();
+
+        // claude 2.1.332: the folder trust prompt, then idle, then the turn.
+        assert_eq!(progress.observe(AgentState::Blocked), ThreadStep::Blocked);
+        assert_eq!(progress.observe(AgentState::Idle), ThreadStep::Running);
+        assert_eq!(progress.observe(AgentState::Blocked), ThreadStep::Blocked);
+        assert_eq!(progress.observe(AgentState::Working), ThreadStep::Running);
+        assert_eq!(progress.observe(AgentState::Idle), ThreadStep::Done);
+    }
+
+    #[test]
+    fn each_entry_into_blocked_is_announced_once() {
+        let mut progress = ThreadProgress::default();
+        let steps: Vec<ThreadStep> = [
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Blocked,
+            AgentState::Unknown,
+            AgentState::Blocked,
+            AgentState::Working,
+            AgentState::Blocked,
+        ]
+        .into_iter()
+        .map(|state| progress.observe(state))
+        .collect();
+
+        let announced = steps
+            .iter()
+            .filter(|step| **step == ThreadStep::Blocked)
+            .count();
+        assert_eq!(announced, 2, "{steps:?}");
+    }
+
+    #[test]
+    fn an_exit_while_blocked_is_a_failure() {
+        let mut progress = ThreadProgress::default();
+        progress.observe(AgentState::Working);
+        progress.observe(AgentState::Blocked);
+
+        let (state, reason) = progress.state_after_exit();
+        assert_eq!(state, ThreadState::Failed);
+        assert_eq!(
+            reason,
+            Some("the agent CLI exited while it waited for approval")
+        );
+
+        progress.observe(AgentState::Working);
+        assert_eq!(progress.state_after_exit(), (ThreadState::Done, None));
     }
 
     #[test]

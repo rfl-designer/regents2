@@ -106,8 +106,17 @@ impl App {
         origin: &Message,
     ) -> Result<PaneId, String> {
         let session_id = adapter::new_session_id();
-        let argv = adapter::launch_argv(agent, prompt, &session_id)
-            .ok_or_else(|| format!("the {} CLI has no thread adapter yet", agent.cli.as_str()))?;
+        let Some(argv) = adapter::launch_argv(agent, prompt, &session_id) else {
+            let reason = format!("the {} CLI has no thread adapter yet", agent.cli.as_str());
+            self.post_system_message(
+                Some(ws_idx),
+                state_dir,
+                &origin.channel,
+                None,
+                format!("a thread de @{} não iniciou: {reason}", agent.name),
+            );
+            return Err(reason);
+        };
         let thread = NewThread {
             agent: agent.name.clone(),
             cli: agent.cli,
@@ -176,6 +185,15 @@ impl App {
                 let reason = format!("cannot start {}: {err}", argv[0]);
                 record_state(&registry, &thread.id, ThreadState::Failed, Some(&reason));
                 self.refresh_folder_threads();
+                if let Some(channel) = &thread.channel {
+                    self.post_system_message(
+                        Some(ws_idx),
+                        state_dir,
+                        channel,
+                        Some(&thread.id),
+                        format!("a thread de @{} não iniciou: {reason}", thread.agent),
+                    );
+                }
                 Err(reason)
             }
         }
@@ -231,7 +249,8 @@ impl App {
     }
 
     /// Advances the running threads whose agent state changed. A thread whose
-    /// agent finished its turn is done.
+    /// agent finished its turn is done; a thread whose agent began to wait
+    /// for an approval says so in its channel.
     pub(crate) fn observe_thread_states(&mut self, updates: &[PaneStateUpdate]) {
         if self.running_threads.is_empty() {
             return;
@@ -242,8 +261,52 @@ impl App {
             };
             // The thread index shows the agent state of a hidden pane.
             self.render_dirty.request_generic();
-            if thread.progress.observe(update.state) == ThreadStep::Done {
-                self.end_thread(update.pane_id, ThreadState::Done, None);
+            match thread.progress.observe(update.state) {
+                ThreadStep::Running => {}
+                ThreadStep::Blocked => {
+                    let Some(channel) = thread.channel.clone() else {
+                        continue;
+                    };
+                    let state_dir = thread.state_dir.clone();
+                    let thread_id = thread.thread_id.clone();
+                    let body = format!("@{} precisa de aprovação", thread.agent);
+                    self.post_system_message(
+                        Some(update.ws_idx),
+                        &state_dir,
+                        &channel,
+                        Some(&thread_id),
+                        body,
+                    );
+                }
+                ThreadStep::Done => self.end_thread(update.pane_id, ThreadState::Done, None),
+            }
+        }
+    }
+
+    /// Posts `body` as a system message of the channel `channel_name` and
+    /// announces it. A post that fails is logged.
+    pub(crate) fn post_system_message(
+        &mut self,
+        ws_idx: Option<usize>,
+        state_dir: &Path,
+        channel_name: &str,
+        thread_id: Option<&str>,
+        body: String,
+    ) {
+        let posted = channel::open(state_dir, channel_name).and_then(|channel| {
+            channel.post_system(
+                body,
+                thread_id.map(str::to_owned),
+                time::OffsetDateTime::now_utc(),
+            )
+        });
+        match (posted, ws_idx) {
+            (Ok(message), Some(ws_idx)) => {
+                self.announce_channel_message(ws_idx, message);
+            }
+            (Ok(_), None) => {}
+            (Err(err), _) => {
+                tracing::warn!(channel = %channel_name, %err, "cannot post a system message");
             }
         }
     }
@@ -295,13 +358,26 @@ impl App {
     /// Marks every running thread interrupted, for a live handoff that does
     /// not carry thread panes (#19). Their runtimes stop with the old server.
     pub(crate) fn interrupt_running_threads(&mut self) {
-        for (_, thread) in std::mem::take(&mut self.running_threads) {
+        for (pane_id, thread) in std::mem::take(&mut self.running_threads) {
             record_state(
                 &threads::registry(&thread.state_dir),
                 &thread.thread_id,
                 ThreadState::Interrupted,
                 Some(SERVER_HANDOFF),
             );
+            if let Some(channel) = &thread.channel {
+                let ws_idx = self.find_pane(pane_id).map(|(ws_idx, _)| ws_idx);
+                self.post_system_message(
+                    ws_idx,
+                    &thread.state_dir,
+                    channel,
+                    Some(&thread.thread_id),
+                    format!(
+                        "a thread de @{} foi interrompida: {SERVER_HANDOFF}",
+                        thread.agent
+                    ),
+                );
+            }
         }
         self.refresh_folder_threads();
     }
@@ -336,6 +412,17 @@ impl App {
             state,
             reason,
         );
+        if let (ThreadState::Failed, Some(reason), Some(channel)) = (state, reason, &thread.channel)
+        {
+            let ws_idx = self.find_pane(pane_id).map(|(ws_idx, _)| ws_idx);
+            self.post_system_message(
+                ws_idx,
+                &thread.state_dir,
+                channel,
+                Some(&thread.thread_id),
+                format!("a thread de @{} falhou: {reason}", thread.agent),
+            );
+        }
         self.refresh_folder_threads();
         for workspace in &mut self.state.workspaces {
             workspace.remove_background_pane(pane_id);
@@ -826,6 +913,443 @@ mod tests {
         }
     }
 
+    /// Codex is only a registry key here: a synthetic manifest that tells
+    /// the screens of the fake CLI apart. It never classifies a real CLI.
+    const FAKE_MANIFEST: &str = r#"
+id = "codex"
+
+[[rules]]
+id = "fake-approval"
+state = "blocked"
+contains = ["FAKE-APPROVAL"]
+
+[[rules]]
+id = "fake-working"
+state = "working"
+contains = ["FAKE-WORKING"]
+"#;
+    const FAKE_BLOCKED: &str = "FAKE-APPROVAL allow the command? [y/n]";
+    const FAKE_WORKING: &str = "FAKE-WORKING running the command";
+    const FAKE_IDLE: &str = "> ";
+
+    /// The synthetic manifest as the local override of the process; the
+    /// drop restores the configuration directory.
+    struct FakeManifest {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        old_config: Option<std::ffi::OsString>,
+        _dir: TempFolder,
+    }
+
+    impl FakeManifest {
+        fn install(name: &str) -> Self {
+            let lock = crate::config::test_config_env_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = TempFolder::new(&format!("fake-manifest-{name}"));
+            let old_config = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", &dir.0);
+            let path = crate::config::config_dir()
+                .join("agent-detection")
+                .join("codex.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, FAKE_MANIFEST).unwrap();
+            crate::detect::manifest::reload_manifests();
+            Self {
+                _lock: lock,
+                old_config,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for FakeManifest {
+        fn drop(&mut self) {
+            match self.old_config.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            crate::detect::manifest::reload_manifests();
+        }
+    }
+
+    impl Fixture {
+        /// The fake CLI of the thread draws `screen`; the synthetic manifest
+        /// classifies the detection text, and the state reaches the app as
+        /// a detection event.
+        fn show(&mut self, pane_id: PaneId, screen: &str) -> crate::detect::AgentState {
+            let terminal_id = self.app.running_threads[&pane_id].terminal_id.clone();
+            let runtime = self.app.terminal_runtimes.get(&terminal_id).unwrap();
+            runtime.test_process_pty_bytes(format!("\x1b[2J\x1b[H{screen}").as_bytes());
+            let text = runtime.detection_text();
+            let state = crate::detect::detect_state(Some(crate::detect::Agent::Codex), &text);
+            self.app
+                .handle_internal_event(crate::events::AppEvent::StateChanged {
+                    pane_id,
+                    agent: Some(crate::detect::Agent::Codex),
+                    state,
+                    visible_blocker: state == crate::detect::AgentState::Blocked,
+                    visible_working: state == crate::detect::AgentState::Working,
+                    process_exited: false,
+                    observed_at: std::time::Instant::now(),
+                });
+            self.app.state.assert_invariants_for_test();
+            state
+        }
+
+        /// `agent_status` of the thread `t1` in `thread.list`.
+        fn listed_status(&mut self) -> Value {
+            let listed = self.request("thread.list", json!({}));
+            listed["result"]["threads"][0]["agent_status"].clone()
+        }
+
+        /// Bodies of the system messages of `geral`.
+        fn system_bodies(state_dir: &Path) -> Vec<String> {
+            Self::messages(state_dir)
+                .into_iter()
+                .filter(|message| message.author.kind == AuthorKind::System)
+                .map(|message| message.body)
+                .collect()
+        }
+
+        fn exit(&mut self, pane_id: PaneId) {
+            self.app
+                .handle_internal_event(crate::events::AppEvent::PaneDied {
+                    pane_id,
+                    exit_reason: crate::platform::ChildExitReason::Exited,
+                });
+            self.app.state.assert_invariants_for_test();
+        }
+    }
+
+    const BLOCKED_MESSAGE: &str = "@chief precisa de aprovação";
+
+    #[tokio::test]
+    async fn a_block_posts_one_system_message_and_the_approval_clears_the_highlight() {
+        let _manifest = FakeManifest::install("approve");
+        let mut fixture = Fixture::new("blocked-approve");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        use crate::detect::AgentState;
+
+        assert_eq!(fixture.show(pane_id, FAKE_WORKING), AgentState::Working);
+        assert_eq!(fixture.listed_status(), "working");
+        assert_eq!(fixture.show(pane_id, FAKE_BLOCKED), AgentState::Blocked);
+        assert_eq!(fixture.listed_status(), "blocked");
+        let indexed = fixture.app.workspace_thread_infos(ws_idx);
+        assert_eq!(
+            indexed[0].agent_status,
+            Some(crate::api::schema::AgentStatus::Blocked)
+        );
+        // The same block again, as a repeated detection: no second message.
+        fixture.show(pane_id, FAKE_BLOCKED);
+        assert_eq!(Fixture::system_bodies(&state_dir), [BLOCKED_MESSAGE]);
+
+        // The approval in the popup: the agent works again.
+        assert_eq!(fixture.show(pane_id, FAKE_WORKING), AgentState::Working);
+
+        assert_eq!(fixture.listed_status(), "working");
+        assert_eq!(Fixture::system_bodies(&state_dir), [BLOCKED_MESSAGE]);
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Active);
+        let read = fixture.request("channel.read", json!({"channel": "geral"}));
+        let system = &read["result"]["messages"][1];
+        assert_eq!(system["author"]["kind"], "system", "{read}");
+        assert_eq!(system["author"]["id"], "regents", "{read}");
+        assert_eq!(system["origin_thread_id"], "t1", "{read}");
+    }
+
+    #[tokio::test]
+    async fn each_new_block_posts_one_more_message() {
+        let _manifest = FakeManifest::install("again");
+        let mut fixture = Fixture::new("blocked-again");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+
+        for screen in [FAKE_BLOCKED, FAKE_WORKING, FAKE_BLOCKED, FAKE_WORKING] {
+            fixture.show(pane_id, screen);
+        }
+
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            [BLOCKED_MESSAGE, BLOCKED_MESSAGE]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_system_message_that_mentions_an_agent_opens_no_thread() {
+        let _manifest = FakeManifest::install("no-thread");
+        let mut fixture = Fixture::new("blocked-no-thread");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+
+        fixture.show(pane_id, FAKE_BLOCKED);
+
+        let messages = Fixture::messages(&state_dir);
+        assert!(messages[1].body.contains("@chief"));
+        assert!(messages[1].mentions.is_empty());
+        assert_eq!(Fixture::records(&state_dir).len(), 1);
+        assert_eq!(fixture.app.running_threads.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_block_that_ends_in_idle_without_work_keeps_the_thread_running() {
+        let _manifest = FakeManifest::install("idle");
+        let mut fixture = Fixture::new("blocked-idle");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+
+        fixture.show(pane_id, FAKE_BLOCKED);
+        assert_eq!(
+            fixture.show(pane_id, FAKE_IDLE),
+            crate::detect::AgentState::Idle
+        );
+
+        assert!(fixture.app.running_threads.contains_key(&pane_id));
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Active);
+        assert_eq!(fixture.listed_status(), "idle", "the highlight is gone");
+        assert_eq!(Fixture::system_bodies(&state_dir), [BLOCKED_MESSAGE]);
+
+        fixture.show(pane_id, FAKE_WORKING);
+        fixture.show(pane_id, FAKE_IDLE);
+
+        assert!(fixture.app.running_threads.is_empty());
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_exits_while_blocked_fails_and_says_so() {
+        let _manifest = FakeManifest::install("exit");
+        let mut fixture = Fixture::new("blocked-exit");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        fixture.show(pane_id, FAKE_WORKING);
+        fixture.show(pane_id, FAKE_BLOCKED);
+
+        fixture.exit(pane_id);
+
+        let record = &Fixture::records(&state_dir)[0];
+        assert_eq!(record.state, ThreadState::Failed);
+        let reason = "the agent CLI exited while it waited for approval";
+        assert_eq!(record.end_reason.as_deref(), Some(reason));
+        assert_eq!(fixture.listed_status(), Value::Null);
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            [
+                BLOCKED_MESSAGE.to_owned(),
+                format!("a thread de @chief falhou: {reason}")
+            ]
+        );
+        let agent_posts = Fixture::messages(&state_dir)
+            .iter()
+            .filter(|message| message.author.kind == AuthorKind::Agent)
+            .count();
+        assert_eq!(agent_posts, 0, "a failed turn captures no reply");
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_exits_before_any_work_fails_and_says_so() {
+        let mut fixture = Fixture::new("exit-no-work");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+
+        fixture.exit(pane_id);
+
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Failed);
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            ["a thread de @chief falhou: the agent CLI exited before it did any work"]
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_the_pane_of_a_blocked_thread_fails_it_and_clears_the_highlight() {
+        let _manifest = FakeManifest::install("close");
+        let mut fixture = Fixture::new("blocked-close");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        fixture.show(pane_id, FAKE_BLOCKED);
+        let public_pane_id = fixture.public_pane_id(pane_id);
+
+        let closed = fixture.request("pane.close", json!({"pane_id": public_pane_id}));
+
+        assert!(closed.get("error").is_none(), "{closed}");
+        fixture.app.state.assert_invariants_for_test();
+        let record = &Fixture::records(&state_dir)[0];
+        assert_eq!(record.state, ThreadState::Failed);
+        assert_eq!(record.end_reason.as_deref(), Some(PANE_CLOSED));
+        assert_eq!(fixture.listed_status(), Value::Null);
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            [
+                BLOCKED_MESSAGE.to_owned(),
+                format!("a thread de @chief falhou: {PANE_CLOSED}")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_interrupts_a_blocked_thread_once() {
+        let _manifest = FakeManifest::install("handoff");
+        let mut fixture = Fixture::new("blocked-handoff");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        fixture.show(pane_id, FAKE_BLOCKED);
+
+        fixture.app.interrupt_running_threads();
+
+        fixture.app.state.assert_invariants_for_test();
+        assert_eq!(
+            Fixture::records(&state_dir)[0].state,
+            ThreadState::Interrupted
+        );
+        assert_eq!(fixture.listed_status(), Value::Null);
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            [
+                BLOCKED_MESSAGE.to_owned(),
+                format!("a thread de @chief foi interrompida: {SERVER_HANDOFF}")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_server_shows_no_highlight_and_repeats_no_message_of_a_blocked_thread() {
+        let _manifest = FakeManifest::install("restart");
+        let mut old = Fixture::new("blocked-restart-old");
+        let (ws_idx, state_dir, _) = old.channel_workspace();
+        let pane_id = old.thread(ws_idx, &state_dir);
+        old.show(pane_id, FAKE_BLOCKED);
+        let folder = state_dir.parent().unwrap().to_path_buf();
+
+        // A cold restart: the old server dies without a handoff and handles
+        // no more events, and a new one opens the same folder.
+        shutdown_test_runtimes(&mut old.app);
+        let mut new = Fixture::new("blocked-restart-new");
+        let added = new.request(
+            "workspace.add",
+            json!({"path": folder.display().to_string(), "focus": true}),
+        );
+        assert_eq!(added["result"]["type"], "workspace_added", "{added}");
+        let ws_idx = new.app.state.active.unwrap();
+        new.app.state.assert_invariants_for_test();
+
+        let indexed = new.app.workspace_thread_infos(ws_idx);
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].agent_status, None, "no stuck highlight");
+        assert_eq!(new.listed_status(), Value::Null);
+        assert!(new.app.running_threads.is_empty());
+        assert_eq!(Fixture::system_bodies(&state_dir), [BLOCKED_MESSAGE]);
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_cannot_start_fails_with_a_system_message() {
+        let mut fixture = Fixture::new("spawn-fails");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let not_executable = fixture.base.0.join("fake-cli");
+        std::fs::write(&not_executable, "#!/bin/sh\n").unwrap();
+        let cases = [
+            "regents-fake-cli-not-in-path".to_owned(),
+            not_executable.display().to_string(),
+        ];
+
+        for (index, program) in cases.iter().enumerate() {
+            let launched = fixture.app.launch_thread(
+                ws_idx,
+                &state_dir,
+                NewThread {
+                    agent: "chief".into(),
+                    cli: AgentCli::Claude,
+                    origin: ThreadOrigin::Channel,
+                    channel: Some("geral".into()),
+                    origin_message_id: Some(1),
+                    opener_thread_id: None,
+                    depth: 0,
+                    isolation: Isolation::Shared,
+                    session_id: None,
+                },
+                std::slice::from_ref(program),
+            );
+            let reason = launched.expect_err(program);
+            fixture.app.state.assert_invariants_for_test();
+
+            let record = &Fixture::records(&state_dir)[index];
+            assert_eq!(record.state, ThreadState::Failed, "{program}");
+            assert_eq!(record.end_reason.as_deref(), Some(reason.as_str()));
+            assert!(
+                reason.starts_with(&format!("cannot start {program}")),
+                "{reason}"
+            );
+            let messages = Fixture::messages(&state_dir);
+            let system = messages.last().unwrap();
+            assert_eq!(system.author.kind, AuthorKind::System);
+            assert_eq!(
+                system.body,
+                format!("a thread de @chief não iniciou: {reason}")
+            );
+            assert_eq!(system.origin_thread_id, Some(record.id.clone()));
+        }
+        assert!(fixture.app.running_threads.is_empty());
+        assert!(fixture.app.state.workspaces[ws_idx]
+            .background_panes
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mention_of_an_unknown_agent_posts_a_system_message_and_opens_no_thread() {
+        let mut fixture = Fixture::new("unknown-mention");
+        let (_, state_dir, workspace_id) = fixture.channel_workspace();
+
+        let posted = fixture.request(
+            "channel.post",
+            json!({"workspace_id": workspace_id, "channel": "geral",
+                   "body": "@ninguem e @outro, olá; rafael@chief.com"}),
+        );
+
+        assert!(posted.get("error").is_none(), "{posted}");
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            ["@ninguem, @outro não são agentes deste workspace"]
+        );
+        assert!(Fixture::records(&state_dir).is_empty());
+        assert!(fixture.app.running_threads.is_empty());
+        fixture.app.state.assert_invariants_for_test();
+
+        fixture.request(
+            "channel.post",
+            json!({"workspace_id": workspace_id, "channel": "geral", "body": "@ninguem?"}),
+        );
+        assert_eq!(
+            Fixture::system_bodies(&state_dir)
+                .last()
+                .map(String::as_str),
+            Some("@ninguem não é um agente deste workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mention_of_an_agent_without_a_thread_adapter_posts_a_system_message() {
+        let mut fixture = Fixture::new("no-adapter");
+        let (_, state_dir, workspace_id) = fixture.channel_workspace();
+        std::fs::write(
+            state_dir.join("agents").join("coder.md"),
+            "+++\nname = \"coder\"\ncli = \"codex\"\n+++\n",
+        )
+        .unwrap();
+
+        let posted = fixture.request(
+            "channel.post",
+            json!({"workspace_id": workspace_id, "channel": "geral", "body": "@coder faça"}),
+        );
+
+        assert!(posted.get("error").is_none(), "{posted}");
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            ["a thread de @coder não iniciou: the codex CLI has no thread adapter yet"]
+        );
+        assert!(Fixture::records(&state_dir).is_empty());
+        assert!(fixture.app.running_threads.is_empty());
+        fixture.app.state.assert_invariants_for_test();
+    }
+
     #[tokio::test]
     async fn closing_the_workspace_ends_its_threads() {
         let mut fixture = Fixture::new("close-ws");
@@ -1091,7 +1615,12 @@ mod tests {
 
         fixture.finish_turn(tool_only);
 
-        assert_eq!(Fixture::messages(&state_dir).len(), 1);
+        let authors: Vec<AuthorKind> = Fixture::messages(&state_dir)
+            .iter()
+            .map(|message| message.author.kind)
+            .collect();
+        // The failed thread says so as the Regents; no thread reply is posted.
+        assert_eq!(authors, [AuthorKind::Human, AuthorKind::System]);
     }
 
     #[tokio::test]
@@ -1107,7 +1636,14 @@ mod tests {
             Fixture::records(&state_dir)[0].state,
             ThreadState::Interrupted
         );
-        assert_eq!(Fixture::messages(&state_dir).len(), 1);
+        let messages = Fixture::messages(&state_dir);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1].author.kind, AuthorKind::System);
+        assert_eq!(
+            messages[1].body,
+            format!("a thread de @chief foi interrompida: {SERVER_HANDOFF}")
+        );
+        assert_eq!(messages[1].origin_thread_id.as_deref(), Some("t1"));
     }
 
     #[tokio::test]

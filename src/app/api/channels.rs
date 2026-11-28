@@ -341,6 +341,7 @@ impl App {
         let channel = channel::open(&state_dir, &channel)?;
         let agents = agents::list(&state_dir);
         let mentions = mention::resolve(&body, agents.iter().map(|agent| agent.name.as_str()));
+        let unknown = mention::unknown(&body, agents.iter().map(|agent| agent.name.as_str()));
         let posted = channel.post(
             NewMessage {
                 author,
@@ -352,7 +353,23 @@ impl App {
             time::OffsetDateTime::now_utc(),
         )?;
         self.open_mention_threads(index, &state_dir, &channel, &posted, &agents);
+        let channel_name = posted.channel.clone();
         let (workspace_id, message) = self.announce_channel_message(index, posted);
+        if !unknown.is_empty() {
+            let names: Vec<String> = unknown.iter().map(|name| format!("@{name}")).collect();
+            let verb = if names.len() == 1 {
+                "não é um agente"
+            } else {
+                "não são agentes"
+            };
+            self.post_system_message(
+                Some(index),
+                &state_dir,
+                &channel_name,
+                None,
+                format!("{} {verb} deste workspace", names.join(", ")),
+            );
+        }
         Ok(ResponseResult::ChannelMessagePosted {
             workspace_id,
             message,

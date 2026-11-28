@@ -172,3 +172,32 @@ fn a_click_outside_another_popup_keeps_it() {
 
     assert!(endpoint_methods(&outside).is_empty());
 }
+
+#[test]
+fn a_blocked_thread_stands_out_in_the_index_until_it_works_again() {
+    let agent_color = |status| {
+        let mut state = state_with_threads(
+            vec![ThreadInfo {
+                agent_status: Some(status),
+                ..thread("t1", "chief", "geral", ThreadState::Active)
+            }],
+            surface(),
+        );
+        let frame = state.compose(106, 30).expect("composed frame");
+        let width = frame.width as usize;
+        let lines = sidebar_lines(&mut state);
+        let y = lines
+            .iter()
+            .position(|line| line.contains("@chief t1"))
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        let x = lines[y].chars().position(|ch| ch == '@').unwrap();
+        frame.cells[y * width + x].fg
+    };
+
+    let blocked = agent_color(AgentStatus::Blocked);
+    let working = agent_color(AgentStatus::Working);
+    let idle = agent_color(AgentStatus::Idle);
+
+    assert_ne!(blocked, working);
+    assert_eq!(working, idle, "only a block changes the agent color");
+}

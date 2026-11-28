@@ -11,6 +11,8 @@ use super::store;
 
 const CHANNELS_DIR: &str = "channels";
 const DATABASE_FILE: &str = "channel.sqlite";
+/// Author ID of the system messages.
+const SYSTEM_AUTHOR: &str = "regents";
 /// The SQL brings a database of any older version to this one: the table
 /// keeps its version 1 form and each version appends its changes.
 const SCHEMA: store::Schema = store::Schema {
@@ -308,6 +310,30 @@ impl Channel {
             .ok_or_else(|| ChannelError::Storage("a post without a capture key was skipped".into()))
     }
 
+    /// Posts `body` as a message of the Regents itself, about the thread
+    /// `thread_id` when there is one. It mentions no agent, so it opens no
+    /// thread, and it does not count as a post of that thread.
+    pub(crate) fn post_system(
+        &self,
+        body: String,
+        thread_id: Option<String>,
+        now: time::OffsetDateTime,
+    ) -> Result<Message, ChannelError> {
+        self.post(
+            NewMessage {
+                author: Author {
+                    kind: AuthorKind::System,
+                    id: SYSTEM_AUTHOR.into(),
+                },
+                body,
+                reply_to: None,
+                origin_thread_id: thread_id,
+                mentions: Vec::new(),
+            },
+            now,
+        )
+    }
+
     /// Posts `capture` as a message of its agent, with no mentions, unless
     /// the thread posted after `capture.after` or this turn is already
     /// captured. One transaction checks and inserts, so a late post and the
@@ -390,7 +416,7 @@ impl Channel {
         if let Some((key, after)) = capture {
             let answered = transaction
                 .query_row(
-                    "SELECT 1 FROM messages WHERE origin_thread_id = ?1
+                    "SELECT 1 FROM messages WHERE origin_thread_id = ?1 AND author_kind = 'agent'
                          AND ((capture_key IS NULL AND id > ?2) OR capture_key = ?3)",
                     params![message.origin_thread_id, after, key],
                     |_| Ok(()),
@@ -930,6 +956,9 @@ mod tests {
             .post(from_thread("t2", "outra thread"), now)
             .unwrap();
 
+        channel
+            .post_system("@chief precisa de aprovação".into(), Some("t1".into()), now)
+            .unwrap();
         let unanswered = channel
             .post_capture(capture("t1", 0, mention.id, "captura"), now)
             .unwrap();
@@ -941,7 +970,10 @@ mod tests {
             .post_capture(capture("t3", 0, 99, "captura"), now)
             .unwrap();
 
-        assert!(unanswered.is_some(), "a post of another thread counts not");
+        assert!(
+            unanswered.is_some(),
+            "a post of another thread or a system message counts not"
+        );
         assert_eq!(answered, None);
         assert!(
             older_post.is_some(),
@@ -980,6 +1012,28 @@ mod tests {
         assert_eq!(read[0].body, "antigo");
         assert!(!read[0].captured);
         assert_eq!(captured.map(|message| message.id), Some(2));
+    }
+
+    #[test]
+    fn a_system_message_names_its_thread_and_mentions_no_agent() {
+        let folder = Folder::new("system");
+        let channel = open(&folder.state, "geral").unwrap();
+
+        let posted = channel
+            .post_system(
+                "@chief precisa de aprovação".into(),
+                Some("t1".into()),
+                afternoon_in_sao_paulo(),
+            )
+            .unwrap();
+
+        let read = channel.read(ReadRange::default()).unwrap();
+        assert_eq!(read, [posted]);
+        assert_eq!(read[0].author.kind, AuthorKind::System);
+        assert_eq!(read[0].author.id, "regents");
+        assert_eq!(read[0].origin_thread_id.as_deref(), Some("t1"));
+        assert!(read[0].mentions.is_empty());
+        assert!(!read[0].captured);
     }
 
     #[test]
