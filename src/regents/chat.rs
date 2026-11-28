@@ -3,8 +3,10 @@
 //! command, so the layout, focus, mouse, popup and remote clients of herdr
 //! treat it as any other pane. The view is an ordinary JSON API client: it
 //! follows `channel.message_posted`, reads the history with `channel.read`
-//! and posts the one-line draft with `channel.post`. The draft and the scroll
-//! position are state of this process (ADR-0001 records this exception).
+//! and posts the one-line draft with `channel.post`. A click on the `[↩]`
+//! link of an agent message makes the draft a threaded reply to it. The
+//! draft, its reply target and the scroll position are state of this
+//! process (ADR-0001 records this exception).
 //!
 //! The view draws only after a change, so an idle chat pane writes no bytes
 //! to its PTY. It never exits on its own when the channel cannot be read: it
@@ -53,14 +55,37 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Marker before the name of a human author. Agents show `@name`, the system
 /// shows `system`.
 const HUMAN_MARKER: &str = "●";
+/// Link of an agent message that makes the draft a reply to it.
+const REPLY_LINK: &str = " [↩]";
 
 /// What a key asks the chat view to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChatAction {
     None,
-    /// Post this message body to the channel.
-    Send(String),
+    /// Post this message body to the channel, as a reply to `reply_to`.
+    Send {
+        body: String,
+        reply_to: Option<u64>,
+    },
     Quit,
+}
+
+/// What a click on the first line of a message opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChatLink {
+    /// The thread that posted the message.
+    Thread(String),
+    /// A threaded reply to the message.
+    Reply(u64),
+}
+
+/// The links of the first line of a message: its index in the history
+/// lines, its thread and the columns of its reply link.
+#[derive(Debug, Clone)]
+struct MessageLinks {
+    line: usize,
+    thread: Option<String>,
+    reply: Option<(std::ops::Range<usize>, u64)>,
 }
 
 /// State of the chat view: a bounded window of messages, the draft and the
@@ -76,6 +101,8 @@ pub(crate) struct ChatView {
     /// A load of older messages dropped the newest ones from the window.
     newest_dropped: bool,
     draft: String,
+    /// The message that the draft replies to.
+    reply_to: Option<u64>,
     /// Rows above the newest line of the history. Zero follows new messages.
     scroll_from_bottom: usize,
     /// Size of the area of the next render, for page scrolling.
@@ -95,6 +122,7 @@ impl ChatView {
             older_exhausted: false,
             newest_dropped: false,
             draft: String::new(),
+            reply_to: None,
             scroll_from_bottom: 0,
             viewport: (0, 0),
             notice: None,
@@ -208,24 +236,33 @@ impl ChatView {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                if self.draft.is_empty() {
+                if self.draft.is_empty() && self.reply_to.is_none() {
                     return ChatAction::Quit;
                 }
                 self.draft.clear();
+                self.reply_to = None;
             }
-            KeyCode::Char('d') if ctrl && self.draft.is_empty() => return ChatAction::Quit,
+            KeyCode::Char('d') if ctrl && self.draft.is_empty() && self.reply_to.is_none() => {
+                return ChatAction::Quit
+            }
             KeyCode::Char(_) if ctrl => {}
             KeyCode::Char(ch) => self.draft.push(ch),
             KeyCode::Backspace => {
                 self.draft.pop();
             }
-            KeyCode::Esc => self.draft.clear(),
+            KeyCode::Esc => {
+                self.draft.clear();
+                self.reply_to = None;
+            }
             KeyCode::Enter => {
                 if self.draft.trim().is_empty() {
                     return ChatAction::None;
                 }
                 self.scroll_from_bottom = 0;
-                return ChatAction::Send(std::mem::take(&mut self.draft));
+                return ChatAction::Send {
+                    body: std::mem::take(&mut self.draft),
+                    reply_to: self.reply_to.take(),
+                };
             }
             KeyCode::Up => self.scroll_up(1),
             KeyCode::Down => self.scroll_down(1),
@@ -250,10 +287,16 @@ impl ChatView {
     }
 
     /// Puts back a draft whose post failed, so the user can send it again.
-    pub(crate) fn restore_draft(&mut self, body: String) {
+    pub(crate) fn restore_draft(&mut self, body: String, reply_to: Option<u64>) {
         if self.draft.is_empty() {
             self.draft = body;
+            self.reply_to = self.reply_to.or(reply_to);
         }
+    }
+
+    /// Makes the draft a threaded reply to the message `id`.
+    pub(crate) fn reply_to(&mut self, id: u64) {
+        self.reply_to = Some(id);
     }
 
     fn scroll_up(&mut self, lines: usize) {
@@ -288,9 +331,10 @@ impl ChatView {
         Paragraph::new(Text::from(self.history_lines().0)).wrap(Wrap { trim: false })
     }
 
-    /// The thread whose link is at `(column, row)` of `area`: a click on the
-    /// first line of an agent message opens the thread that posted it.
-    pub(crate) fn thread_at(&self, area: Rect, column: u16, row: u16) -> Option<String> {
+    /// The link at `(column, row)` of `area`: a click on the reply link of
+    /// an agent message replies to it, and a click elsewhere on its first
+    /// line opens the thread that posted it.
+    pub(crate) fn link_at(&self, area: Rect, column: u16, row: u16) -> Option<ChatLink> {
         let history = history_area(area);
         let inside = column >= history.x
             && column < history.right()
@@ -313,19 +357,27 @@ impl ChatView {
             let bottom = top + wrapped(line);
             if target < bottom {
                 // Only the first row of the message is the link.
-                return (target == top)
-                    .then(|| links.iter().find(|(line, _)| *line == index))
-                    .flatten()
-                    .map(|(_, thread)| thread.clone());
+                let found = links.iter().find(|links| links.line == index);
+                let found = found.filter(|_| target == top)?;
+                let column = usize::from(column - history.x);
+                if let Some((_, id)) = found
+                    .reply
+                    .as_ref()
+                    .filter(|(cols, _)| cols.contains(&column))
+                {
+                    return Some(ChatLink::Reply(*id));
+                }
+                return found.thread.clone().map(ChatLink::Thread);
             }
             top = bottom;
         }
         None
     }
 
-    /// The history lines, and the index of the first line of each agent
-    /// message that links to its thread.
-    fn history_lines(&self) -> (Vec<Line<'_>>, Vec<(usize, String)>) {
+    /// The history lines, and the links of the first line of each agent and
+    /// system message of a thread. A reply starts with a line that quotes
+    /// the message it answers.
+    fn history_lines(&self) -> (Vec<Line<'_>>, Vec<MessageLinks>) {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let mut links = Vec::new();
         let mut lines = Vec::new();
@@ -346,9 +398,20 @@ impl ChatView {
                     ));
                 }
             }
+            if let Some(replied) = message.reply_to {
+                let quote = match self.messages.iter().find(|known| known.id == replied) {
+                    Some(known) => format!(
+                        "  ↳ {}: {}",
+                        author_span(known).content,
+                        known.body.lines().next().unwrap_or_default()
+                    ),
+                    None => format!("  ↳ [{replied}]"),
+                };
+                lines.push(Line::styled(quote, dim));
+            }
             let mut body = message.body.lines();
             let first = body.next().unwrap_or_default();
-            let mut spans = Vec::with_capacity(4);
+            let mut spans = Vec::with_capacity(5);
             if let Some(local) = local {
                 spans.push(Span::styled(
                     format!("{:02}:{:02} ", local.hour(), local.minute()),
@@ -362,11 +425,20 @@ impl ChatView {
                     ChannelAuthorKind::Agent | ChannelAuthorKind::System
                 )
             }) {
-                links.push((lines.len(), thread.clone()));
-                spans.push(Span::styled(
-                    format!(" [{thread}]"),
-                    dim.add_modifier(Modifier::UNDERLINED),
-                ));
+                let link = dim.add_modifier(Modifier::UNDERLINED);
+                spans.push(Span::styled(format!(" [{thread}]"), link));
+                // Only an agent message continues a thread when answered.
+                let reply = (message.author.kind == ChannelAuthorKind::Agent).then(|| {
+                    let start = spans.iter().map(Span::width).sum::<usize>();
+                    spans.push(Span::styled(REPLY_LINK, link));
+                    // The leading space is not part of the link.
+                    (start + 1..start + Span::raw(REPLY_LINK).width(), message.id)
+                });
+                links.push(MessageLinks {
+                    line: lines.len(),
+                    thread: Some(thread.clone()),
+                    reply,
+                });
             }
             // A system message is the Regents speaking, not a participant.
             let body_style = if message.author.kind == ChannelAuthorKind::System {
@@ -412,8 +484,22 @@ impl ChatView {
             return;
         }
         let separator_y = area.bottom().saturating_sub(2);
+        let separator = match self.reply_to {
+            Some(id) => {
+                let target = self
+                    .messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .map_or_else(
+                        || format!("[{id}]"),
+                        |message| author_span(message).content.into_owned(),
+                    );
+                format!("↳ respondendo a {target} · esc cancela")
+            }
+            None => "─".repeat(usize::from(area.width)),
+        };
         Paragraph::new(Line::styled(
-            "─".repeat(usize::from(area.width)),
+            separator,
             Style::default().add_modifier(Modifier::DIM),
         ))
         .render(
@@ -534,7 +620,7 @@ pub(crate) trait ChatSource {
         before: Option<u64>,
         limit: u32,
     ) -> Result<(String, Vec<ChannelMessageInfo>), String>;
-    fn post(&self, body: String) -> Result<ChannelMessageInfo, String>;
+    fn post(&self, body: String, reply_to: Option<u64>) -> Result<ChannelMessageInfo, String>;
     /// Shows the thread `thread_id` of the channel's workspace as a popup.
     fn open_thread(&self, thread_id: &str) -> Result<(), String>;
     /// The channel has a new name; later reads and posts use it.
@@ -637,26 +723,35 @@ impl<S: ChatSource> ChatSession<S> {
                 self.dirty = true;
                 match self.view.handle_key(key) {
                     ChatAction::Quit => return true,
-                    ChatAction::Send(body) => match self.source.post(body.clone()) {
-                        Ok(message) => {
-                            self.view.set_notice(None);
-                            self.view.add_recent([message]);
+                    ChatAction::Send { body, reply_to } => {
+                        match self.source.post(body.clone(), reply_to) {
+                            Ok(message) => {
+                                self.view.set_notice(None);
+                                self.view.add_recent([message]);
+                            }
+                            Err(err) => {
+                                self.view.set_notice(Some(err));
+                                self.view.restore_draft(body, reply_to);
+                            }
                         }
-                        Err(err) => {
-                            self.view.set_notice(Some(err));
-                            self.view.restore_draft(body);
-                        }
-                    },
+                    }
                     ChatAction::None => {}
                 }
             }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 let (width, height) = self.view.viewport;
                 let area = Rect::new(0, 0, width, height);
-                if let Some(thread) = self.view.thread_at(area, mouse.column, mouse.row) {
-                    let notice = self.source.open_thread(&thread).err();
-                    self.view.set_notice(notice);
-                    self.dirty = true;
+                match self.view.link_at(area, mouse.column, mouse.row) {
+                    Some(ChatLink::Thread(thread)) => {
+                        let notice = self.source.open_thread(&thread).err();
+                        self.view.set_notice(notice);
+                        self.dirty = true;
+                    }
+                    Some(ChatLink::Reply(id)) => {
+                        self.view.reply_to(id);
+                        self.dirty = true;
+                    }
+                    None => {}
                 }
             }
             Event::Mouse(mouse) => self.dirty |= self.view.handle_mouse(mouse),
@@ -797,14 +892,14 @@ impl ChatSource for ApiSource {
         }
     }
 
-    fn post(&self, body: String) -> Result<ChannelMessageInfo, String> {
+    fn post(&self, body: String, reply_to: Option<u64>) -> Result<ChannelMessageInfo, String> {
         let result = self.request(
             "post",
             Method::ChannelPost(ChannelPostParams {
                 workspace_id: self.workspace_id.clone(),
                 channel: self.channel.clone(),
                 body,
-                reply_to: None,
+                reply_to,
                 origin_thread_id: None,
                 thread_token: None,
             }),
@@ -1015,6 +1110,7 @@ mod tests {
         reads: RefCell<Vec<Option<u64>>>,
         answers: RefCell<VecDeque<Result<Vec<ChannelMessageInfo>, String>>>,
         opened: RefCell<Vec<String>>,
+        posted: RefCell<Vec<(String, Option<u64>)>>,
     }
 
     impl FakeSource {
@@ -1040,7 +1136,8 @@ mod tests {
                 .map(|messages| ("w1".to_owned(), messages))
         }
 
-        fn post(&self, _body: String) -> Result<ChannelMessageInfo, String> {
+        fn post(&self, body: String, reply_to: Option<u64>) -> Result<ChannelMessageInfo, String> {
+            self.posted.borrow_mut().push((body, reply_to));
             Err("not in this test".into())
         }
 
@@ -1207,7 +1304,10 @@ mod tests {
         assert_eq!(screen(&mut view, 30, 5)[4], "> olá time");
         assert_eq!(
             view.handle_key(key(KeyCode::Enter)),
-            ChatAction::Send("olá time".into())
+            ChatAction::Send {
+                body: "olá time".into(),
+                reply_to: None
+            }
         );
         assert_eq!(screen(&mut view, 30, 5)[4], ">");
         assert_eq!(view.handle_key(key(KeyCode::Enter)), ChatAction::None);
@@ -1283,7 +1383,7 @@ mod tests {
         };
         let agent_row = rows
             .iter()
-            .position(|row| row.contains("@chief [t3]: olá"))
+            .position(|row| row.contains("@chief [t3] [↩]: olá"))
             .unwrap_or_else(|| panic!("{rows:#?}"));
 
         for row in 0..8 {
@@ -1295,6 +1395,96 @@ mod tests {
         session.handle_event(click(agent_row as u16));
 
         assert_eq!(*source.opened.borrow(), ["t3"]);
+    }
+
+    // AC4 (#14): the reply link of an agent message makes the draft a
+    // threaded reply, and the reply shows the message it answers.
+    #[test]
+    fn the_reply_link_sends_a_threaded_reply_shown_under_its_original() {
+        let answer = ChannelMessageInfo {
+            origin_thread_id: Some("t1".into()),
+            ..message(2, ChannelAuthorKind::Agent, "chief", "abacaxi\nmais")
+        };
+        let source = FakeSource::answering(vec![Ok(vec![human(1), answer.clone()])]);
+        let now = Instant::now();
+        let mut session = ChatSession::new("geral".into(), &source, time::UtcOffset::UTC, now);
+        let (mut terminal, _output) = terminal();
+        session.sync(now);
+        session.draw(&mut terminal).unwrap();
+        let rows = screen(&mut session.view.clone(), 40, 8);
+        let agent_row = rows
+            .iter()
+            .position(|row| row.contains("@chief [t1] [↩]: abacaxi"))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        let reply_column = rows[agent_row].find("↩").unwrap();
+        let reply_column = rows[agent_row][..reply_column].chars().count() as u16;
+        let click = |column: u16| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: agent_row as u16,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        session.handle_event(click(reply_column));
+
+        assert!(
+            source.opened.borrow().is_empty(),
+            "the reply link opens no thread"
+        );
+        let rows = screen(&mut session.view.clone(), 40, 8);
+        assert_eq!(rows[6], "↳ respondendo a @chief · esc cancela");
+        for ch in "e o resto?".chars() {
+            session.handle_event(Event::Key(key(KeyCode::Char(ch))));
+        }
+        session.handle_event(Event::Key(key(KeyCode::Enter)));
+        assert_eq!(
+            *source.posted.borrow(),
+            [("e o resto?".to_owned(), Some(2))]
+        );
+        // The post failed in this fake: the draft and its target come back.
+        assert_eq!(
+            screen(&mut session.view.clone(), 40, 8)[6],
+            "↳ respondendo a @chief · esc cancela"
+        );
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        session.view.draft.clear();
+        assert_eq!(
+            session.view.handle_key(ctrl_d),
+            ChatAction::None,
+            "ctrl-d keeps a pending reply"
+        );
+        session.handle_event(Event::Key(key(KeyCode::Esc)));
+        assert_eq!(screen(&mut session.view.clone(), 40, 8)[6], "─".repeat(40));
+        assert_eq!(session.view.handle_key(ctrl_d), ChatAction::Quit);
+        // A click elsewhere on the first line still opens the thread.
+        session.handle_event(click(1));
+        assert_eq!(*source.opened.borrow(), ["t1"]);
+
+        let mut view = view();
+        view.add_recent([
+            answer,
+            ChannelMessageInfo {
+                reply_to: Some(2),
+                ..message(3, ChannelAuthorKind::Human, "rafael", "e o resto?")
+            },
+            ChannelMessageInfo {
+                reply_to: Some(1),
+                ..message(4, ChannelAuthorKind::Human, "rafael", "fora da janela")
+            },
+        ]);
+        let rows = screen(&mut view, 40, 12);
+        let reply = rows
+            .iter()
+            .position(|row| row == "18:04 ● rafael: e o resto?")
+            .unwrap();
+        assert_eq!(rows[reply - 1], "  ↳ @chief: abacaxi");
+        let loose = rows
+            .iter()
+            .position(|row| row == "18:04 ● rafael: fora da janela")
+            .unwrap();
+        assert_eq!(rows[loose - 1], "  ↳ [1]");
     }
 
     #[test]

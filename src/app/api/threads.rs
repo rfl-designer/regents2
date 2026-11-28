@@ -140,6 +140,7 @@ fn thread_info(record: ThreadRecord, pane_id: Option<String>) -> ThreadInfo {
         },
         agent_status: None,
         session_id: record.session_id,
+        turn: record.turn,
         pane_id,
         created_at: record.created_at,
         updated_at: record.updated_at,

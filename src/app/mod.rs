@@ -140,6 +140,10 @@ pub struct App {
     /// Config directory of claude, where the transcripts of thread sessions
     /// are (Regents, ADR-0004).
     pub(crate) claude_dir: Option<std::path::PathBuf>,
+    /// Tests: a command line that runs every thread CLI, with the thread
+    /// command line as its arguments, so no test starts a real agent CLI.
+    #[cfg(test)]
+    pub(crate) test_thread_prefix: Option<Vec<String>>,
     /// Regents: the last reopen found no usable registered folder.
     folder_reopen_exhausted: bool,
     /// Regents: folders that the user closed last; the reopen skips them.
@@ -694,6 +698,8 @@ impl App {
             next_api_worktree_operation_id: 1,
             workspace_registry_path: crate::regents::workspace_registry_path(),
             claude_dir: crate::integration::claude_dir().ok(),
+            #[cfg(test)]
+            test_thread_prefix: None,
             folder_reopen_exhausted: false,
             reopen_excluded_folders: Vec::new(),
             disconnected_folders: HashSet::new(),

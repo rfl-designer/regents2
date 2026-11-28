@@ -163,6 +163,7 @@ impl ActiveSubscription {
                 Ok(event_subscription(EventKind::ChannelMessagePosted))
             }
             Subscription::ChannelRenamed {} => Ok(event_subscription(EventKind::ChannelRenamed)),
+            Subscription::ThreadResumed {} => Ok(event_subscription(EventKind::ThreadResumed)),
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,

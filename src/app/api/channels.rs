@@ -352,9 +352,19 @@ impl App {
             },
             time::OffsetDateTime::now_utc(),
         )?;
-        self.open_mention_threads(index, &state_dir, &channel, &posted, &agents);
+        // The reply comes first, then the events that it causes.
+        let (workspace_id, message) = self.announce_channel_message(index, posted.clone());
+        let replied_agent =
+            self.resume_replied_thread(index, &state_dir, &channel, &posted, &agents);
+        self.open_mention_threads(
+            index,
+            &state_dir,
+            &channel,
+            &posted,
+            &agents,
+            replied_agent.as_deref(),
+        );
         let channel_name = posted.channel.clone();
-        let (workspace_id, message) = self.announce_channel_message(index, posted);
         if !unknown.is_empty() {
             let names: Vec<String> = unknown.iter().map(|name| format!("@{name}")).collect();
             let verb = if names.len() == 1 {

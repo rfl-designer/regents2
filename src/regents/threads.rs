@@ -15,8 +15,10 @@ const DATABASE_FILE: &str = "threads.sqlite";
 /// `<id>.ansi` file per thread.
 const OUTPUT_DIR: &str = "thread-output";
 const ID_PREFIX: &str = "t";
+/// The SQL brings a database of any older version to this one: the table
+/// keeps its version 1 form and each version appends its changes.
 const SCHEMA: store::Schema = store::Schema {
-    version: 1,
+    version: 2,
     sql: "CREATE TABLE IF NOT EXISTS threads (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              agent TEXT NOT NULL,
@@ -35,7 +37,12 @@ const SCHEMA: store::Schema = store::Schema {
              session_id TEXT,
              created_at TEXT NOT NULL,
              updated_at TEXT NOT NULL
-         );",
+         );
+         -- Version 2: the turn of the CLI session, from 0, and the message
+         -- that started it (a resumed turn starts at a threaded reply).
+         ALTER TABLE threads ADD COLUMN turn INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE threads ADD COLUMN turn_message_id INTEGER;
+         UPDATE threads SET turn_message_id = origin_message_id;",
 };
 
 /// The life cycle of a thread.
@@ -144,6 +151,11 @@ pub(crate) struct ThreadRecord {
     /// Why the thread ended, when it did not end done.
     pub(crate) end_reason: Option<String>,
     pub(crate) session_id: Option<String>,
+    /// Turn of the CLI session, from 0: each resume adds one.
+    pub(crate) turn: u32,
+    /// The message that started the turn: the opening mention, or the
+    /// threaded reply that resumed the thread.
+    pub(crate) turn_message_id: Option<u64>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
@@ -190,18 +202,13 @@ impl ThreadRegistry {
         now: time::OffsetDateTime,
     ) -> Result<ThreadRecord, ThreadError> {
         let now = super::utc_seconds(now).map_err(ThreadError)?;
-        let origin_message = thread
-            .origin_message_id
-            .map(|id| {
-                i64::try_from(id).map_err(|_| ThreadError(format!("invalid message id {id}")))
-            })
-            .transpose()?;
+        let origin_message = thread.origin_message_id.map(sql_message_id).transpose()?;
         let connection = store::open_writable(&self.path, &SCHEMA)?;
         connection.execute(
             "INSERT INTO threads
                  (agent, cli, origin_kind, channel, origin_message_id, opener_thread_id, depth,
-                  isolation, state, session_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                  isolation, state, session_id, created_at, updated_at, turn_message_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?5)",
             params![
                 thread.agent,
                 thread.cli.as_str(),
@@ -229,9 +236,80 @@ impl ThreadRegistry {
             state: ThreadState::Active,
             end_reason: None,
             session_id: thread.session_id,
+            turn: 0,
+            turn_message_id: thread.origin_message_id,
             created_at: now.clone(),
             updated_at: now,
         })
+    }
+
+    /// The thread `id`, or `None` when the registry does not have it.
+    pub(crate) fn get(&self, id: &str) -> Result<Option<ThreadRecord>, ThreadError> {
+        let row = parse_id(id)?;
+        // `row` is a parsed number, so the clause is not injectable.
+        Ok(self.query(&format!("WHERE id = {row}"), 1)?.pop())
+    }
+
+    /// Compare-and-set of a resume: the thread `id` becomes active in the
+    /// next turn, started by the message `message_id`, only when it is still
+    /// done in the turn `turn`. `None` when another writer changed it first,
+    /// so two concurrent replies resume the thread once.
+    pub(crate) fn resume(
+        &self,
+        id: &str,
+        turn: u32,
+        message_id: u64,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<ThreadRecord>, ThreadError> {
+        let now = super::utc_seconds(now).map_err(ThreadError)?;
+        let row = parse_id(id)?;
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
+        let changed = connection.execute(
+            "UPDATE threads
+             SET state = ?1, end_reason = NULL, turn = turn + 1, turn_message_id = ?2,
+                 updated_at = ?3
+             WHERE id = ?4 AND state = ?5 AND turn = ?6",
+            params![
+                ThreadState::Active.as_str(),
+                sql_message_id(message_id)?,
+                now,
+                row,
+                ThreadState::Done.as_str(),
+                turn,
+            ],
+        )?;
+        drop(connection);
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get(id)
+    }
+
+    /// Undoes the resume of `previous`, whose CLI did not start: the thread
+    /// is done again in its previous turn, so the next reply resumes it.
+    pub(crate) fn undo_resume(
+        &self,
+        previous: &ThreadRecord,
+        now: time::OffsetDateTime,
+    ) -> Result<(), ThreadError> {
+        let now = super::utc_seconds(now).map_err(ThreadError)?;
+        let row = parse_id(&previous.id)?;
+        let anchor = previous.turn_message_id.map(sql_message_id).transpose()?;
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
+        connection.execute(
+            "UPDATE threads SET state = ?1, turn = ?2, turn_message_id = ?3, updated_at = ?4
+             WHERE id = ?5 AND state = ?6 AND turn = ?7",
+            params![
+                ThreadState::Done.as_str(),
+                previous.turn,
+                anchor,
+                now,
+                row,
+                ThreadState::Active.as_str(),
+                previous.turn + 1,
+            ],
+        )?;
+        Ok(())
     }
 
     /// Records a new state. `end_reason` says why a thread ended without
@@ -280,16 +358,20 @@ impl ThreadRegistry {
         self.query("ORDER BY id DESC", i64::try_from(limit).unwrap_or(i64::MAX))
     }
 
-    /// Threads in `order`, at most `limit` (-1: all).
-    fn query(&self, order: &str, limit: i64) -> Result<Vec<ThreadRecord>, ThreadError> {
+    /// Threads that match `clause` (a filter or an order), at most `limit`
+    /// (-1: all).
+    fn query(&self, clause: &str, limit: i64) -> Result<Vec<ThreadRecord>, ThreadError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let connection = store::open_read_only(&self.path)?;
+        // Only the server reads the registry, so a read can bring an older
+        // database to the current schema.
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
         let mut statement = connection.prepare(&format!(
             "SELECT id, agent, cli, origin_kind, channel, origin_message_id, opener_thread_id,
-                    depth, isolation, state, end_reason, session_id, created_at, updated_at
-             FROM threads {order} LIMIT ?1"
+                    depth, isolation, state, end_reason, session_id, created_at, updated_at,
+                    turn, turn_message_id
+             FROM threads {clause} LIMIT ?1"
         ))?;
         let rows = statement.query_map([limit], |row| {
             Ok(ThreadRecord {
@@ -312,6 +394,10 @@ impl ThreadRegistry {
                 session_id: row.get(11)?,
                 created_at: row.get(12)?,
                 updated_at: row.get(13)?,
+                turn: row.get(14)?,
+                turn_message_id: row
+                    .get::<_, Option<i64>>(15)?
+                    .and_then(|id| u64::try_from(id).ok()),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -348,6 +434,10 @@ pub(crate) fn read_output_from(dir: &Path, id: &str) -> Option<String> {
             .is_file()
     })?;
     std::fs::read_to_string(output_path(&root.join(super::folder::STATE_DIR), id)?).ok()
+}
+
+fn sql_message_id(id: u64) -> Result<i64, ThreadError> {
+    i64::try_from(id).map_err(|_| ThreadError(format!("invalid message id {id}")))
 }
 
 fn parse_id(id: &str) -> Result<i64, ThreadError> {
@@ -472,6 +562,8 @@ mod tests {
                 state: ThreadState::Active,
                 end_reason: None,
                 session_id: Some("session-3".into()),
+                turn: 0,
+                turn_message_id: Some(3),
                 created_at: "2026-11-27T18:04:05Z".into(),
                 updated_at: "2026-11-27T18:04:05Z".into(),
             }
@@ -631,6 +723,126 @@ mod tests {
                 .set_state(id, ThreadState::Done, None, at(1))
                 .is_err());
         }
+    }
+
+    #[test]
+    fn a_resume_is_a_compare_and_set_of_a_done_turn() {
+        let folder = TempFolder::new("threads-resume");
+        let registry = registry(&folder.0);
+        let created = registry.create(mention("chief", 1), at(0)).unwrap();
+        assert_eq!(
+            registry.resume(&created.id, 0, 4, at(1)).unwrap(),
+            None,
+            "active"
+        );
+        registry
+            .set_state(&created.id, ThreadState::Done, None, at(2))
+            .unwrap();
+
+        let resumed = registry.resume(&created.id, 0, 4, at(3)).unwrap().unwrap();
+
+        assert_eq!(resumed.state, ThreadState::Active);
+        assert_eq!((resumed.turn, resumed.turn_message_id), (1, Some(4)));
+        assert_eq!(resumed.origin_message_id, Some(1));
+        assert_eq!(resumed.session_id, created.session_id);
+        assert_eq!(
+            registry.resume(&created.id, 0, 5, at(4)).unwrap(),
+            None,
+            "a stale turn"
+        );
+        assert_eq!(registry.resume("t9", 0, 5, at(4)).unwrap(), None);
+
+        registry
+            .undo_resume(&created_done(&created), at(5))
+            .unwrap();
+        let undone = registry.get(&created.id).unwrap().unwrap();
+        assert_eq!(undone.state, ThreadState::Done);
+        assert_eq!((undone.turn, undone.turn_message_id), (0, Some(1)));
+    }
+
+    fn created_done(created: &ThreadRecord) -> ThreadRecord {
+        ThreadRecord {
+            state: ThreadState::Done,
+            ..created.clone()
+        }
+    }
+
+    #[test]
+    fn two_concurrent_resumes_resume_a_thread_once() {
+        let folder = TempFolder::new("threads-resume-race");
+        let created = registry(&folder.0)
+            .create(mention("chief", 1), at(0))
+            .unwrap();
+        registry(&folder.0)
+            .set_state(&created.id, ThreadState::Done, None, at(1))
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        let winners: Vec<Option<u64>> = (0..8u64)
+            .map(|reply| {
+                let (path, barrier, id) = (folder.0.clone(), barrier.clone(), created.id.clone());
+                std::thread::spawn(move || {
+                    // Each writer has its own connection, as two servers would.
+                    let registry = registry(&path);
+                    barrier.wait();
+                    registry
+                        .resume(&id, 0, 10 + reply, at(2))
+                        .unwrap()
+                        .and_then(|record| record.turn_message_id)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        let won: Vec<u64> = winners.into_iter().flatten().collect();
+        assert_eq!(won.len(), 1, "{won:?}");
+        let record = registry(&folder.0).get(&created.id).unwrap().unwrap();
+        assert_eq!((record.turn, record.turn_message_id), (1, Some(won[0])));
+    }
+
+    #[test]
+    fn a_version_1_registry_reads_back_at_turn_zero_of_its_mention() {
+        let folder = TempFolder::new("threads-upgrade");
+        let v1 = rusqlite::Connection::open(folder.0.join(DATABASE_FILE)).unwrap();
+        v1.execute_batch(
+            "CREATE TABLE threads (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT NOT NULL, cli TEXT NOT NULL,
+                 origin_kind TEXT NOT NULL DEFAULT 'channel', channel TEXT,
+                 origin_message_id INTEGER, opener_thread_id TEXT,
+                 depth INTEGER NOT NULL DEFAULT 0, isolation TEXT, state TEXT NOT NULL,
+                 end_reason TEXT, session_id TEXT, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL);
+             INSERT INTO threads (agent, cli, channel, origin_message_id, isolation, state,
+                                  session_id, created_at, updated_at)
+                 VALUES ('chief', 'claude', 'geral', 3, 'shared', 'done', 'sid', 'x', 'x');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(v1);
+
+        // Concurrent first opens migrate once.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let opens: Vec<_> = (0..4)
+            .map(|_| {
+                let (path, barrier) = (folder.0.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry(&path).list().map(|listed| listed.len())
+                })
+            })
+            .collect();
+        for open in opens {
+            assert_eq!(open.join().unwrap(), Ok(1));
+        }
+        let listed = registry(&folder.0).list().unwrap();
+
+        assert_eq!((listed[0].turn, listed[0].turn_message_id), (0, Some(3)));
+        assert!(registry(&folder.0)
+            .resume("t1", 0, 5, at(0))
+            .unwrap()
+            .is_some());
     }
 
     #[test]

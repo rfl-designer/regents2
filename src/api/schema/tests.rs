@@ -1571,6 +1571,7 @@ fn thread_info_keeps_optional_fields_out_and_tolerates_newer_servers() {
         agent_status: None,
         end_reason: None,
         session_id: None,
+        turn: 0,
         pane_id: None,
         created_at: "2026-11-27T18:04:05Z".into(),
         updated_at: "2026-11-27T18:04:06Z".into(),
@@ -1585,6 +1586,7 @@ fn thread_info_keeps_optional_fields_out_and_tolerates_newer_servers() {
             "origin": "channel",
             "depth": 0,
             "state": "done",
+            "turn": 0,
             "created_at": "2026-11-27T18:04:05Z",
             "updated_at": "2026-11-27T18:04:06Z",
         })
@@ -1598,6 +1600,7 @@ fn thread_info_keeps_optional_fields_out_and_tolerates_newer_servers() {
     assert_eq!(from_newer_server.cli, AgentCliKind::Unknown);
     assert_eq!(from_newer_server.origin, ThreadOriginKind::Channel);
     assert_eq!(from_newer_server.depth, 0);
+    assert_eq!(from_newer_server.turn, 0, "an older server sends no turn");
     let agent: AgentDefinitionInfo = serde_json::from_value(serde_json::json!({
         "name": "a", "cli": "gemini", "isolation": "vm", "approval": "ask", "reserved": false,
     }))

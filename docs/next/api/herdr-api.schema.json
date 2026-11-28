@@ -860,6 +860,39 @@
                 "channel"
               ],
               "type": "object"
+            },
+            {
+              "description": "A threaded reply resumed the done thread `thread_id` in its turn\n`turn`, started by the channel message `message_id`.",
+              "properties": {
+                "message_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "thread_id": {
+                  "type": "string"
+                },
+                "turn": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "thread_resumed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "thread_id",
+                "turn",
+                "message_id"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -892,7 +925,8 @@
             "pane_agent_status_changed",
             "layout_updated",
             "channel_message_posted",
-            "channel_renamed"
+            "channel_renamed",
+            "thread_resumed"
           ],
           "type": "string"
         },
@@ -4665,6 +4699,18 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "thread.resumed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -8366,6 +8412,39 @@
                 "channel"
               ],
               "type": "object"
+            },
+            {
+              "description": "A threaded reply resumed the done thread `thread_id` in its turn\n`turn`, started by the channel message `message_id`.",
+              "properties": {
+                "message_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "thread_id": {
+                  "type": "string"
+                },
+                "turn": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "thread_resumed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "thread_id",
+                "turn",
+                "message_id"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -8413,7 +8492,8 @@
             "pane_agent_status_changed",
             "layout_updated",
             "channel_message_posted",
-            "channel_renamed"
+            "channel_renamed",
+            "thread_resumed"
           ],
           "type": "string"
         },
@@ -11962,6 +12042,13 @@
             },
             "state": {
               "$ref": "#/schemas/success_response/$defs/ThreadState"
+            },
+            "turn": {
+              "default": 0,
+              "description": "Turn of the CLI session, from 0: each threaded reply that resumes\nthe thread adds one.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
             },
             "updated_at": {
               "type": "string"

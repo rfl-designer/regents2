@@ -3,17 +3,19 @@
 //! so it keeps output parsing and agent detection but never causes
 //! presentation work. The thread registry in the workspace folder records
 //! it. When the agent finishes its turn, the CLI process ends and the thread
-//! keeps its CLI session.
+//! keeps its CLI session. A threaded reply to a message of a done thread
+//! resumes that session in the next turn of the same thread (#14).
 
 use std::path::{Path, PathBuf};
 
+use crate::api::schema::{EventData, EventEnvelope, EventKind};
 use crate::app::actions::PaneStateUpdate;
 use crate::app::App;
 use crate::layout::PaneId;
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::regents::adapter;
-use crate::regents::agents::{AgentCli, AgentDefinition};
-use crate::regents::channel::{self, Capture, Channel, Message, ReadRange};
+use crate::regents::agents::{AgentCli, AgentDefinition, Isolation};
+use crate::regents::channel::{self, AuthorKind, Capture, Channel, Message, ReadRange};
 use crate::regents::threads::{
     self, NewThread, ThreadOrigin, ThreadProgress, ThreadState, ThreadStep,
 };
@@ -49,9 +51,12 @@ pub(crate) struct RunningThread {
     progress: ThreadProgress,
     cli: Option<AgentCli>,
     session_id: Option<String>,
-    /// Channel and message of the mention that opened the thread.
+    /// Channel of the mention that opened the thread.
     channel: Option<String>,
-    origin_message_id: Option<u64>,
+    /// Turn of the CLI session that runs, and the message that started it:
+    /// a post of the thread after it is the reply of the turn.
+    turn: u32,
+    turn_message_id: Option<u64>,
 }
 
 /// The first prompt of a thread opened by `message`: the mention and the
@@ -71,8 +76,9 @@ pub(crate) fn mention_prompt(channel: &Channel, message: &Message) -> String {
 }
 
 impl App {
-    /// Opens one thread for each agent that `message` mentions. A thread
-    /// that cannot open is logged; the message stays posted. A message posted
+    /// Opens one thread for each agent that `message` mentions, except
+    /// `replied_agent`, whose thread the message answers. A thread that
+    /// cannot open is logged; the message stays posted. A message posted
     /// from a thread opens none: delegation, with its opener and depth
     /// limit, is #18.
     pub(crate) fn open_mention_threads(
@@ -82,12 +88,16 @@ impl App {
         channel: &Channel,
         message: &Message,
         agents: &[AgentDefinition],
+        replied_agent: Option<&str>,
     ) {
         if message.mentions.is_empty() || message.origin_thread_id.is_some() {
             return;
         }
         let prompt = mention_prompt(channel, message);
         for name in &message.mentions {
+            if replied_agent == Some(name.as_str()) {
+                continue;
+            }
             let Some(agent) = agents.iter().find(|agent| &agent.name == name) else {
                 continue;
             };
@@ -144,6 +154,41 @@ impl App {
         let thread = registry
             .create(thread, time::OffsetDateTime::now_utc())
             .map_err(|err| err.to_string())?;
+        let (thread_id, agent, channel) = (
+            thread.id.clone(),
+            thread.agent.clone(),
+            thread.channel.clone(),
+        );
+        self.start_thread(ws_idx, state_dir, thread, argv)
+            .inspect_err(|reason| {
+                record_state(&registry, &thread_id, ThreadState::Failed, Some(reason));
+                self.refresh_folder_threads();
+                if let Some(channel) = &channel {
+                    self.post_system_message(
+                        Some(ws_idx),
+                        state_dir,
+                        channel,
+                        Some(&thread_id),
+                        format!("a thread de @{agent} não iniciou: {reason}"),
+                    );
+                }
+            })
+    }
+
+    /// Starts `argv` for the active thread `thread` in a background pane.
+    /// The error is why the CLI did not start.
+    fn start_thread(
+        &mut self,
+        ws_idx: usize,
+        state_dir: &Path,
+        thread: threads::ThreadRecord,
+        argv: &[String],
+    ) -> Result<PaneId, String> {
+        #[cfg(test)]
+        let argv = &match &self.test_thread_prefix {
+            Some(prefix) => prefix.iter().chain(argv).cloned().collect::<Vec<_>>(),
+            None => argv.to_vec(),
+        };
         let folder = state_dir.parent().unwrap_or(state_dir).to_path_buf();
         let workspace_stable_id = self.state.workspaces[ws_idx]
             .folder
@@ -176,27 +221,189 @@ impl App {
                         cli: thread.cli,
                         session_id: thread.session_id,
                         channel: thread.channel,
-                        origin_message_id: thread.origin_message_id,
+                        turn: thread.turn,
+                        turn_message_id: thread.turn_message_id,
                     },
                 );
                 Ok(pane_id)
             }
-            Err(err) => {
-                let reason = format!("cannot start {}: {err}", argv[0]);
-                record_state(&registry, &thread.id, ThreadState::Failed, Some(&reason));
-                self.refresh_folder_threads();
-                if let Some(channel) = &thread.channel {
-                    self.post_system_message(
-                        Some(ws_idx),
-                        state_dir,
-                        channel,
-                        Some(&thread.id),
-                        format!("a thread de @{} não iniciou: {reason}", thread.agent),
-                    );
-                }
-                Err(reason)
+            Err(err) => Err(format!("cannot start {}: {err}", argv[0])),
+        }
+    }
+
+    /// A threaded reply: `reply`, a human post that answers a message of an
+    /// agent thread, resumes that thread when it is done. The result is the
+    /// agent of the answered thread, which a mention in `reply` then does
+    /// not open again; `None` means that `reply` is not a threaded reply and
+    /// follows the normal routing. A thread that does not resume says why in
+    /// the channel. A post of a thread resumes nothing: delegation is #18.
+    pub(crate) fn resume_replied_thread(
+        &mut self,
+        ws_idx: usize,
+        state_dir: &Path,
+        channel: &Channel,
+        reply: &Message,
+        agents: &[AgentDefinition],
+    ) -> Option<String> {
+        let replied_id = reply.reply_to?;
+        if reply.origin_thread_id.is_some() {
+            return None;
+        }
+        let replied = channel
+            .read(ReadRange {
+                before: Some(replied_id.saturating_add(1)),
+                limit: Some(1),
+            })
+            .inspect_err(|err| tracing::warn!(%err, "cannot read the replied message"))
+            .ok()?
+            .pop()
+            .filter(|message| message.id == replied_id)?;
+        if replied.author.kind != AuthorKind::Agent {
+            return None;
+        }
+        let thread_id = replied.origin_thread_id?;
+        let refusal =
+            match self.resume_thread(ws_idx, state_dir, channel, reply, &thread_id, agents) {
+                Ok(_) => return Some(replied.author.id),
+                Err(refusal) => refusal,
+            };
+        let (body, link) = match &refusal {
+            Refusal::Running(body) | Refusal::Ended(body) => {
+                (body.clone(), Some(thread_id.as_str()))
+            }
+            Refusal::NoThread(body) => (body.clone(), None),
+        };
+        self.post_system_message(Some(ws_idx), state_dir, channel.name(), link, body);
+        // The thread runs: it reads the reply in the channel. Otherwise a
+        // mention in the reply opens a new thread.
+        matches!(refusal, Refusal::Running(_)).then_some(replied.author.id)
+    }
+
+    /// Resumes the done thread `thread_id` with `reply`. The error says why
+    /// it did not resume.
+    fn resume_thread(
+        &mut self,
+        ws_idx: usize,
+        state_dir: &Path,
+        channel: &Channel,
+        reply: &Message,
+        thread_id: &str,
+        agents: &[AgentDefinition],
+    ) -> Result<PaneId, Refusal> {
+        let registry = threads::registry(state_dir);
+        let record = registry
+            .get(thread_id)
+            .map_err(|err| Refusal::Ended(format!("a thread {thread_id} não foi retomada: {err}")))?
+            .ok_or_else(|| {
+                Refusal::NoThread(format!("a thread {thread_id} não existe neste workspace"))
+            })?;
+        let agent = record.agent.clone();
+        let new_thread = format!("mencione @{agent} para abrir uma thread nova");
+        let ended = |body: String| Err(Refusal::Ended(body));
+        match record.state {
+            ThreadState::Done => {}
+            ThreadState::Active | ThreadState::Queued => {
+                return Err(Refusal::Running(still_running(&agent, thread_id)));
+            }
+            // shortcut: an interrupted thread resumes only by `thread resume`
+            // (#19), which adds it to the compare-and-set of `resume`.
+            ThreadState::Interrupted => {
+                return ended(format!(
+                    "a thread {thread_id} de @{agent} foi interrompida; {new_thread}"
+                ));
+            }
+            ThreadState::Failed => {
+                return ended(format!(
+                    "a thread {thread_id} de @{agent} falhou e não é retomada; {new_thread}"
+                ));
+            }
+            ThreadState::Unknown => {
+                return ended(format!(
+                    "a thread {thread_id} de @{agent} tem um estado desconhecido e não é retomada"
+                ));
             }
         }
+        let not_resumed = |reason: &str| {
+            Refusal::Ended(format!(
+                "a thread {thread_id} de @{agent} não foi retomada: {reason}"
+            ))
+        };
+        // Message IDs are per channel: a turn anchor of another channel
+        // means nothing here.
+        if record.channel.as_deref() != Some(channel.name()) {
+            let home = record.channel.as_deref().unwrap_or_default();
+            return Err(not_resumed(&format!(
+                "the thread belongs to #{home}; reply there"
+            )));
+        }
+        let Some(definition) = agents.iter().find(|definition| definition.name == agent) else {
+            return ended(format!(
+                "@{agent} não é mais um agente deste workspace; a thread {thread_id} não é retomada"
+            ));
+        };
+        if record.cli != Some(definition.cli) {
+            return Err(not_resumed(
+                "the agent CLI changed after the thread started",
+            ));
+        }
+        match record.isolation {
+            Some(Isolation::Shared) => {}
+            // shortcut: no thread runs in a worktree yet; #24 resumes one in
+            // its own worktree and refuses one whose worktree is gone.
+            Some(Isolation::Worktree) => {
+                return Err(not_resumed("worktree threads cannot resume yet"));
+            }
+            None => return Err(not_resumed("the thread isolation is unknown")),
+        }
+        let prompt = resume_prompt(channel, reply, &record);
+        let session_id = record.session_id.clone().unwrap_or_default();
+        let Some(argv) = adapter::resume_argv(definition, &prompt, &session_id) else {
+            return Err(not_resumed(&format!(
+                "the {} CLI has no thread adapter yet",
+                definition.cli.as_str()
+            )));
+        };
+        let has_session = self
+            .claude_dir
+            .as_deref()
+            .is_some_and(|home| adapter::has_session(definition.cli, &session_id, home));
+        if !has_session {
+            return Err(not_resumed("the CLI session has no transcript"));
+        }
+        // shortcut: a resume ignores `max_active_threads`, as a mention does;
+        // the queue of #16 takes both.
+        let resumed = registry
+            .resume(
+                thread_id,
+                record.turn,
+                reply.id,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(|err| not_resumed(&err.to_string()))?
+            .ok_or_else(|| Refusal::Running(still_running(&agent, thread_id)))?;
+        let turn = resumed.turn;
+        let pane_id = self
+            .start_thread(ws_idx, state_dir, resumed, &argv)
+            .map_err(|reason| {
+                if let Err(err) = registry.undo_resume(&record, time::OffsetDateTime::now_utc()) {
+                    // No pane runs it: an active row would refuse every reply.
+                    tracing::warn!(thread = %thread_id, %err, "cannot undo the thread resume");
+                    record_state(&registry, thread_id, ThreadState::Done, None);
+                }
+                self.refresh_folder_threads();
+                not_resumed(&reason)
+            })?;
+        tracing::info!(thread = %thread_id, turn, message = reply.id, "resumed a thread");
+        self.emit_event(EventEnvelope {
+            event: EventKind::ThreadResumed,
+            data: EventData::ThreadResumed {
+                workspace_id: self.public_workspace_id(ws_idx),
+                thread_id: thread_id.to_owned(),
+                turn,
+                message_id: reply.id,
+            },
+        });
+        Ok(pane_id)
     }
 
     /// Starts `argv` in a new background pane of the workspace: a pane with
@@ -435,26 +642,36 @@ impl App {
         }
     }
 
-    /// Posts the last reply of a done thread in its channel as its agent,
-    /// when the thread did not post: from the CLI transcript, or from the
-    /// screen when the session has no transcript. Mentions in the reply open
-    /// no thread; to delegate, the agent posts.
+    /// Posts the last reply of a done thread turn in its channel as its
+    /// agent, when the thread did not post after the turn started: from the
+    /// CLI transcript, or from the screen when the session has no
+    /// transcript. Mentions in the reply open no thread; to delegate, the
+    /// agent posts.
     fn capture_reply(&mut self, pane_id: PaneId, thread: &RunningThread) {
-        let (Some(channel_name), Some(after)) = (&thread.channel, thread.origin_message_id) else {
+        let (Some(channel_name), Some(after)) = (&thread.channel, thread.turn_message_id) else {
             return;
         };
         let transcript_reply = match (thread.cli, &thread.session_id, &self.claude_dir) {
             (Some(cli), Some(session_id), Some(home)) => adapter::last_reply(cli, session_id, home),
             _ => None,
         };
+        if let Some(reply) = transcript_reply
+            .as_ref()
+            .filter(|reply| reply.turn < thread.turn)
+        {
+            // The last turn of the transcript is an earlier turn: its reply
+            // is already in the channel.
+            tracing::info!(thread = %thread.thread_id, turn = thread.turn,
+                transcript_turn = reply.turn, "the transcript has no reply of the thread turn");
+            return;
+        }
         let reply = transcript_reply.or_else(|| {
             let runtime = self.terminal_runtimes.get(&thread.terminal_id)?;
             let screen = runtime.recent_unwrapped_text_snapshot(OUTPUT_LINES).text;
-            // shortcut: a screen names no turn, so it is turn 0; read the
-            // turn from the screen when a thread without a transcript can
-            // have more turns (#17).
+            // Every turn prompt ends with the same line, so the screen reply
+            // is the one of the last turn; the registry names the turn.
             Some(adapter::TurnReply {
-                turn: 0,
+                turn: thread.turn,
                 text: adapter::screen_reply(&screen),
             })
         });
@@ -466,8 +683,6 @@ impl App {
                 "the thread turn has no text reply to capture");
             return;
         };
-        // shortcut: every turn starts after the mention that opened the
-        // thread; an absorbed mention (#17) must pass its own message ID.
         let capture = Capture {
             agent: thread.agent.clone(),
             thread_id: thread.thread_id.clone(),
@@ -690,6 +905,46 @@ fn output_argv(thread_id: &str) -> std::io::Result<Vec<String>> {
     ])
 }
 
+/// Why a threaded reply did not resume its thread: the system message to
+/// post.
+#[derive(Debug)]
+enum Refusal {
+    /// The thread runs or waits; it reads the reply in the channel.
+    Running(String),
+    /// The thread cannot continue; a mention opens a new thread.
+    Ended(String),
+    /// The registry has no such thread.
+    NoThread(String),
+}
+
+fn still_running(agent: &str, thread_id: &str) -> String {
+    format!("@{agent} ainda está na thread {thread_id}; a resposta fica no canal")
+}
+
+/// The prompt of the resume of `thread` by `reply`: the messages after the
+/// message that started the previous turn, without the posts of the thread,
+/// at most `adapter::RECENT_MESSAGES`.
+fn resume_prompt(channel: &Channel, reply: &Message, thread: &threads::ThreadRecord) -> String {
+    let previous = thread.turn_message_id.unwrap_or(0);
+    let new: Vec<Message> = match channel.read(ReadRange {
+        before: Some(reply.id.saturating_add(1)),
+        limit: Some(adapter::RECENT_MESSAGES),
+    }) {
+        Ok(recent) => recent
+            .into_iter()
+            .filter(|message| {
+                message.id > previous
+                    && message.origin_thread_id.as_deref() != Some(thread.id.as_str())
+            })
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "cannot read the channel for a resume prompt");
+            vec![reply.clone()]
+        }
+    };
+    adapter::resume_prompt(reply, &new)
+}
+
 fn record_state(
     registry: &threads::ThreadRegistry,
     thread_id: &str,
@@ -735,6 +990,8 @@ impl App {
                 state: ThreadState::Active,
                 end_reason: None,
                 session_id: None,
+                turn: 0,
+                turn_message_id: Some(1),
                 created_at: "2026-11-27T18:04:05Z".into(),
                 updated_at: "2026-11-27T18:04:05Z".into(),
             });
@@ -750,7 +1007,8 @@ impl App {
                     cli: Some(AgentCli::Claude),
                     session_id: None,
                     channel: Some("geral".into()),
-                    origin_message_id: Some(1),
+                    turn: 0,
+                    turn_message_id: Some(1),
                 },
             );
         }
@@ -790,6 +1048,12 @@ mod tests {
             app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
             app.workspace_registry_path = Some(base.0.join("config").join("workspaces.toml"));
             app.claude_dir = Some(base.0.join("claude"));
+            // The thread command line becomes the arguments of a long sleep.
+            app.test_thread_prefix = Some(
+                ["sh", "-c", "sleep 30", "fake-cli"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            );
             Self { app, base }
         }
 
@@ -1243,6 +1507,7 @@ contains = ["FAKE-WORKING"]
     #[tokio::test]
     async fn a_cli_that_cannot_start_fails_with_a_system_message() {
         let mut fixture = Fixture::new("spawn-fails");
+        fixture.app.test_thread_prefix = None;
         let (ws_idx, state_dir, _) = fixture.channel_workspace();
         let not_executable = fixture.base.0.join("fake-cli");
         std::fs::write(&not_executable, "#!/bin/sh\n").unwrap();
@@ -1665,6 +1930,786 @@ contains = ["FAKE-WORKING"]
         assert!(messages[1].mentions.is_empty());
         assert!(fixture.app.running_threads.is_empty());
         assert_eq!(Fixture::records(&state_dir).len(), 1);
+    }
+
+    /// `capture_key` of each captured message of `geral`, in posting order.
+    fn capture_keys(state_dir: &Path) -> Vec<String> {
+        let path = state_dir
+            .join("channels")
+            .join("geral")
+            .join("channel.sqlite");
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT capture_key FROM messages WHERE capture_key IS NOT NULL ORDER BY id")
+            .unwrap();
+        let keys = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        keys
+    }
+
+    // Characterization of the first turn (#14): the capture key of a
+    // transcript reply is the transcript turn.
+    #[tokio::test]
+    async fn the_capture_key_of_a_transcript_reply_is_its_transcript_turn() {
+        let mut fixture = Fixture::new("capture-key-transcript");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let first = fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("one-turn");
+        fixture.finish_turn(first);
+        let second = fixture.thread(ws_idx, &state_dir);
+        fixture.transcript("two-turns");
+
+        fixture.finish_turn(second);
+
+        assert_eq!(capture_keys(&state_dir), ["t1#0", "t2#1"]);
+    }
+
+    // Characterization of the first turn (#14): without a transcript, the
+    // screen reply after the last prompt echo is turn 0.
+    #[tokio::test]
+    async fn without_a_transcript_the_screen_reply_is_captured_as_turn_zero() {
+        let mut fixture = Fixture::new("capture-key-screen");
+        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        let terminal_id = &fixture.app.running_threads[&pane_id].terminal_id;
+        fixture
+            .app
+            .terminal_runtimes
+            .get(terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(
+                format!("{}\r\nresposta da tela\r\n", adapter::PROMPT_LAST_LINE).as_bytes(),
+            );
+
+        fixture.finish_turn(pane_id);
+
+        let messages = Fixture::messages(&state_dir);
+        assert_eq!(messages[1].body, "resposta da tela");
+        assert_eq!(messages[1].origin_thread_id.as_deref(), Some("t1"));
+        assert_eq!(capture_keys(&state_dir), ["t1#0"]);
+    }
+
+    // Threaded replies (#14). Each test drives `channel.post` with
+    // `reply_to`; the fake CLI prefix keeps the resumed command line as its
+    // arguments, so no test starts claude.
+
+    const TURN_ZERO_REPLY: &str = "pronto, linha 1\nlinha 2";
+
+    impl Fixture {
+        /// A done thread `t1` whose turn 0 reply, message 2, was captured
+        /// from its transcript.
+        fn done_thread(&mut self) -> (usize, PathBuf, String) {
+            let (ws_idx, state_dir, workspace_id) = self.channel_workspace();
+            let pane_id = self.thread(ws_idx, &state_dir);
+            self.transcript("one-turn");
+            self.finish_turn(pane_id);
+            let messages = Self::messages(&state_dir);
+            assert_eq!(messages[1].id, 2);
+            assert_eq!(messages[1].origin_thread_id.as_deref(), Some("t1"));
+            assert_eq!(Self::records(&state_dir)[0].state, ThreadState::Done);
+            (ws_idx, state_dir, workspace_id)
+        }
+
+        /// A human post of `body` that answers the message `reply_to`; its
+        /// message ID.
+        fn reply(&mut self, workspace_id: &str, reply_to: u64, body: &str) -> u64 {
+            let posted = self.request(
+                "channel.post",
+                json!({"workspace_id": workspace_id, "channel": "geral", "body": body,
+                       "reply_to": reply_to}),
+            );
+            assert!(posted.get("error").is_none(), "{posted}");
+            self.app.state.assert_invariants_for_test();
+            posted["result"]["message"]["id"].as_u64().unwrap()
+        }
+
+        /// The pane of the running thread `thread_id`.
+        fn running_pane(&self, thread_id: &str) -> PaneId {
+            self.app
+                .running_threads
+                .iter()
+                .find(|(_, thread)| thread.thread_id == thread_id)
+                .map(|(&pane_id, _)| pane_id)
+                .unwrap_or_else(|| panic!("{thread_id} is not running"))
+        }
+
+        /// The thread command line that the pane of `thread_id` runs, without
+        /// the fake CLI prefix.
+        fn running_argv(&self, thread_id: &str) -> Vec<String> {
+            let pane_id = self.running_pane(thread_id);
+            let terminal_id = &self.app.running_threads[&pane_id].terminal_id;
+            let argv = self.app.state.terminals[terminal_id]
+                .launch_argv
+                .clone()
+                .unwrap();
+            let prefix = self.app.test_thread_prefix.as_ref().map_or(0, Vec::len);
+            argv[prefix..].to_vec()
+        }
+
+        fn resumed_events(&self) -> Vec<EventData> {
+            self.app
+                .event_hub
+                .events_after(0)
+                .into_iter()
+                .filter(|(_, event)| event.event == EventKind::ThreadResumed)
+                .map(|(_, event)| event.data)
+                .collect()
+        }
+
+        fn agent_file(state_dir: &Path, front_matter: &str) {
+            std::fs::write(
+                state_dir.join("agents").join("chief-of-staff.md"),
+                format!("+++\n{front_matter}\n+++\nVocê é o Chief of Staff.\n"),
+            )
+            .unwrap();
+        }
+
+        fn sql(state_dir: &Path, statement: &str) {
+            rusqlite::Connection::open(state_dir.join("threads.sqlite"))
+                .unwrap()
+                .execute_batch(statement)
+                .unwrap();
+        }
+    }
+
+    /// Asserts that `reply` resumed nothing and said `refusal` in the
+    /// channel.
+    fn assert_refused(fixture: &Fixture, state_dir: &Path, refusal: &str) {
+        assert_eq!(
+            Fixture::system_bodies(state_dir).last().map(String::as_str),
+            Some(refusal)
+        );
+        let records = Fixture::records(state_dir);
+        assert_eq!(records.len(), 1, "no new thread: {records:?}");
+        assert_eq!(records[0].turn, 0);
+        assert!(fixture.resumed_events().is_empty());
+        let system = Fixture::messages(state_dir).pop().unwrap();
+        assert_eq!(system.origin_thread_id.as_deref(), Some("t1"));
+        assert!(system.mentions.is_empty(), "a refusal opens no thread");
+    }
+
+    // AC1: same thread ID, the session resumed by the adapter, no new thread.
+    #[tokio::test]
+    async fn a_reply_to_a_done_thread_resumes_the_same_thread_and_session() {
+        let mut fixture = Fixture::new("resume");
+        let (ws_idx, state_dir, workspace_id) = fixture.done_thread();
+
+        let reply = fixture.reply(&workspace_id, 2, "e o resto?");
+
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id, "t1");
+        assert_eq!(records[0].state, ThreadState::Active);
+        assert_eq!(records[0].turn, 1);
+        assert_eq!(records[0].turn_message_id, Some(reply));
+        assert_eq!(records[0].session_id.as_deref(), Some("sid"));
+        let argv = fixture.running_argv("t1");
+        assert_eq!(argv[..3], ["claude", "--resume", "sid"], "{argv:?}");
+        let prompt = argv.last().unwrap();
+        assert!(prompt.contains("e o resto?"), "{prompt}");
+        assert!(
+            !prompt.contains("pergunta"),
+            "only the new messages: {prompt}"
+        );
+        assert!(!prompt.contains(TURN_ZERO_REPLY), "{prompt}");
+        assert_eq!(
+            fixture.resumed_events(),
+            [EventData::ThreadResumed {
+                workspace_id: workspace_id.clone(),
+                thread_id: "t1".into(),
+                turn: 1,
+                message_id: reply,
+            }]
+        );
+        let order: Vec<EventKind> = fixture
+            .app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .map(|(_, event)| event.event)
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    EventKind::ChannelMessagePosted | EventKind::ThreadResumed
+                )
+            })
+            .collect();
+        assert_eq!(
+            order[order.len() - 2..],
+            [EventKind::ChannelMessagePosted, EventKind::ThreadResumed],
+            "the reply comes before the resume it causes"
+        );
+        let listed = fixture.request("thread.list", json!({"workspace_id": workspace_id}));
+        assert_eq!(listed["result"]["threads"][0]["turn"], 1, "{listed}");
+        assert_eq!(
+            listed["result"]["threads"][0]["state"], "active",
+            "{listed}"
+        );
+        assert_eq!(fixture.app.workspace_thread_infos(ws_idx)[0].turn, 1);
+        assert!(Fixture::system_bodies(&state_dir).is_empty());
+    }
+
+    // The turn 1 reply posts once, after the reply; turn 0 is not posted
+    // again.
+    #[tokio::test]
+    async fn the_resumed_turn_posts_its_own_reply_once() {
+        let mut fixture = Fixture::new("resume-capture");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        let reply = fixture.reply(&workspace_id, 2, "e o resto?");
+        let pane_id = fixture.running_pane("t1");
+        fixture.transcript("two-turns");
+
+        fixture.finish_turn(pane_id);
+
+        let messages = Fixture::messages(&state_dir);
+        let bodies: Vec<&str> = messages
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            [
+                "pergunta",
+                TURN_ZERO_REPLY,
+                "e o resto?",
+                "segundo turno @reviewer"
+            ]
+        );
+        assert!(messages[3].id > reply);
+        assert_eq!(capture_keys(&state_dir), ["t1#0", "t1#1"]);
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
+        assert_eq!(Fixture::records(&state_dir).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_turn_whose_transcript_has_no_new_turn_posts_nothing_again() {
+        let mut fixture = Fixture::new("resume-stale");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        fixture.reply(&workspace_id, 2, "e o resto?");
+        let pane_id = fixture.running_pane("t1");
+
+        // The transcript still ends with turn 0.
+        fixture.finish_turn(pane_id);
+
+        let replies = Fixture::messages(&state_dir)
+            .iter()
+            .filter(|message| message.body == TURN_ZERO_REPLY)
+            .count();
+        assert_eq!(replies, 1);
+        assert_eq!(capture_keys(&state_dir), ["t1#0"]);
+    }
+
+    #[tokio::test]
+    async fn without_a_transcript_the_resumed_screen_reply_has_the_registry_turn() {
+        let mut fixture = Fixture::new("resume-screen");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        fixture.reply(&workspace_id, 2, "e o resto?");
+        let pane_id = fixture.running_pane("t1");
+        std::fs::remove_dir_all(fixture.base.0.join("claude")).unwrap();
+        let terminal_id = &fixture.app.running_threads[&pane_id].terminal_id;
+        // claude 2.1.332 shows the old turn and its prompt echo on resume.
+        let screen = format!(
+            "{last}\r\nresposta antiga\r\n{last}\r\nresposta nova\r\n",
+            last = adapter::PROMPT_LAST_LINE
+        );
+        fixture
+            .app
+            .terminal_runtimes
+            .get(terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(screen.as_bytes());
+
+        fixture.finish_turn(pane_id);
+
+        let last = Fixture::messages(&state_dir).pop().unwrap();
+        assert_eq!(last.body, "resposta nova");
+        assert_eq!(capture_keys(&state_dir), ["t1#0", "t1#1"]);
+    }
+
+    // AC2: after the resume, a loose mention opens a new thread.
+    #[tokio::test]
+    async fn a_loose_mention_after_a_resume_opens_a_new_thread() {
+        let mut fixture = Fixture::new("resume-then-mention");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        fixture.reply(&workspace_id, 2, "e o resto?");
+
+        let posted = fixture.request(
+            "channel.post",
+            json!({"workspace_id": workspace_id, "channel": "geral", "body": "@chief outra coisa"}),
+        );
+
+        assert!(posted.get("error").is_none(), "{posted}");
+        fixture.app.state.assert_invariants_for_test();
+        let ids: Vec<String> = Fixture::records(&state_dir)
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(ids, ["t1", "t2"]);
+        assert_eq!(fixture.running_argv("t2")[1], "--session-id");
+    }
+
+    // AC3: a reply to a human message resumes no thread and routes normally.
+    #[tokio::test]
+    async fn a_reply_to_a_human_message_follows_the_normal_routing() {
+        let mut fixture = Fixture::new("reply-human");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+
+        fixture.reply(&workspace_id, 1, "sem menção");
+        assert_eq!(Fixture::records(&state_dir).len(), 1);
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
+        assert!(fixture.app.running_threads.is_empty());
+
+        fixture.reply(&workspace_id, 1, "@chief com menção");
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].state, ThreadState::Done, "t1 stays done");
+        assert_eq!(records[1].state, ThreadState::Active);
+        assert!(fixture.resumed_events().is_empty());
+        assert!(Fixture::system_bodies(&state_dir).is_empty());
+    }
+
+    // Table: a reply to a reply. A reply to the human reply routes normally;
+    // a reply to the agent reply of turn 1 resumes turn 2.
+    #[tokio::test]
+    async fn a_reply_to_a_human_reply_routes_normally_and_to_an_agent_reply_resumes_again() {
+        let mut fixture = Fixture::new("reply-chain");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        let first = fixture.reply(&workspace_id, 2, "e o resto?");
+        fixture.transcript("two-turns");
+        fixture.finish_turn(fixture.running_pane("t1"));
+        let turn_one = Fixture::messages(&state_dir).pop().unwrap();
+        assert_eq!(turn_one.origin_thread_id.as_deref(), Some("t1"));
+
+        fixture.reply(&workspace_id, first, "complemento");
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
+
+        let second = fixture.reply(&workspace_id, turn_one.id, "e agora?");
+        let record = &Fixture::records(&state_dir)[0];
+        assert_eq!(record.state, ThreadState::Active);
+        assert_eq!(record.turn, 2);
+        assert_eq!(record.turn_message_id, Some(second));
+        let prompt = fixture.running_argv("t1").pop().unwrap();
+        assert!(prompt.contains("complemento"), "new since turn 1: {prompt}");
+        assert!(!prompt.contains("e o resto?"), "turn 1 saw it: {prompt}");
+        assert!(
+            !prompt.contains("segundo turno"),
+            "a post of the thread: {prompt}"
+        );
+        assert_eq!(Fixture::records(&state_dir).len(), 1);
+    }
+
+    // Table: a reply to a system message routes normally.
+    #[tokio::test]
+    async fn a_reply_to_a_system_message_resumes_nothing() {
+        let mut fixture = Fixture::new("reply-system");
+        let (ws_idx, state_dir, workspace_id) = fixture.done_thread();
+        fixture.app.post_system_message(
+            Some(ws_idx),
+            &state_dir,
+            "geral",
+            Some("t1"),
+            "aviso".into(),
+        );
+
+        fixture.reply(&workspace_id, 3, "ok");
+
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
+        assert_eq!(Fixture::system_bodies(&state_dir), ["aviso"]);
+        assert!(fixture.resumed_events().is_empty());
+    }
+
+    // Table: a reply that mentions the answered agent and another one.
+    #[tokio::test]
+    async fn a_reply_that_mentions_agents_resumes_its_thread_and_opens_the_others() {
+        let mut fixture = Fixture::new("reply-mentions");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        std::fs::write(
+            state_dir.join("agents").join("reviewer.md"),
+            "+++\nname = \"reviewer\"\ncli = \"claude\"\n+++\n",
+        )
+        .unwrap();
+
+        fixture.reply(&workspace_id, 2, "@chief e @reviewer, vejam");
+
+        let records = Fixture::records(&state_dir);
+        let threads: Vec<(&str, &str, u32)> = records
+            .iter()
+            .map(|record| (record.id.as_str(), record.agent.as_str(), record.turn))
+            .collect();
+        assert_eq!(threads, [("t1", "chief", 1), ("t2", "reviewer", 0)]);
+    }
+
+    // Table: Active (and the concurrent loser).
+    #[tokio::test]
+    async fn a_reply_to_an_active_thread_stays_in_the_channel() {
+        let mut fixture = Fixture::new("reply-active");
+        let (ws_idx, state_dir, workspace_id) = fixture.channel_workspace();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        let token = fixture.app.running_threads[&pane_id].token.clone();
+        fixture.thread_post(&workspace_id, &token);
+
+        fixture.reply(&workspace_id, 2, "e o resto?");
+
+        assert_refused(
+            &fixture,
+            &state_dir,
+            "@chief ainda está na thread t1; a resposta fica no canal",
+        );
+        assert_eq!(fixture.app.running_threads.len(), 1);
+    }
+
+    // Table: two replies, one resume; the second says the thread runs.
+    #[tokio::test]
+    async fn two_replies_to_a_done_thread_resume_it_once() {
+        let mut fixture = Fixture::new("reply-twice");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+
+        fixture.reply(&workspace_id, 2, "primeira");
+        fixture.reply(&workspace_id, 2, "segunda");
+
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].turn, 1);
+        assert_eq!(fixture.app.running_threads.len(), 1);
+        assert_eq!(fixture.resumed_events().len(), 1);
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            ["@chief ainda está na thread t1; a resposta fica no canal"]
+        );
+    }
+
+    // Table: Queued, Interrupted, Failed and Unknown.
+    #[tokio::test]
+    async fn a_reply_to_a_thread_that_is_not_done_does_not_resume_it() {
+        let new_thread = "mencione @chief para abrir uma thread nova";
+        let cases = [
+            (
+                "queued",
+                "@chief ainda está na thread t1; a resposta fica no canal".to_owned(),
+            ),
+            (
+                "interrupted",
+                format!("a thread t1 de @chief foi interrompida; {new_thread}"),
+            ),
+            (
+                "failed",
+                format!("a thread t1 de @chief falhou e não é retomada; {new_thread}"),
+            ),
+            (
+                "paused",
+                "a thread t1 de @chief tem um estado desconhecido e não é retomada".to_owned(),
+            ),
+        ];
+        for (state, refusal) in cases {
+            let mut fixture = Fixture::new(&format!("reply-{state}"));
+            let (_, state_dir, workspace_id) = fixture.done_thread();
+            Fixture::sql(&state_dir, &format!("UPDATE threads SET state = '{state}'"));
+
+            fixture.reply(&workspace_id, 2, "e o resto?");
+
+            assert_refused(&fixture, &state_dir, &refusal);
+            assert!(fixture.app.running_threads.is_empty(), "{state}");
+        }
+    }
+
+    // Table: the agent was removed, its CLI changed or has no adapter.
+    #[tokio::test]
+    async fn a_reply_to_a_thread_whose_agent_cannot_resume_it_says_why() {
+        let cases = [
+            (None, "@chief não é mais um agente deste workspace; a thread t1 não é retomada"),
+            (
+                Some("name = \"chief\"\ncli = \"codex\""),
+                "a thread t1 de @chief não foi retomada: the agent CLI changed after the thread started",
+            ),
+        ];
+        for (index, (front_matter, refusal)) in cases.into_iter().enumerate() {
+            let mut fixture = Fixture::new(&format!("reply-agent-{index}"));
+            let (_, state_dir, workspace_id) = fixture.done_thread();
+            match front_matter {
+                Some(front_matter) => Fixture::agent_file(&state_dir, front_matter),
+                None => std::fs::remove_file(state_dir.join("agents").join("chief-of-staff.md"))
+                    .unwrap(),
+            }
+
+            fixture.reply(&workspace_id, 2, "e o resto?");
+
+            assert_refused(&fixture, &state_dir, refusal);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_thread_of_a_cli_without_an_adapter_says_so() {
+        let mut fixture = Fixture::new("reply-no-adapter");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        Fixture::sql(&state_dir, "UPDATE threads SET cli = 'codex'");
+        Fixture::agent_file(&state_dir, "name = \"chief\"\ncli = \"codex\"");
+
+        fixture.reply(&workspace_id, 2, "e o resto?");
+
+        assert_refused(
+            &fixture,
+            &state_dir,
+            "a thread t1 de @chief não foi retomada: the codex CLI has no thread adapter yet",
+        );
+    }
+
+    // Table: the transcript is gone, or the thread has no session.
+    #[tokio::test]
+    async fn a_reply_to_a_thread_without_a_transcript_says_so() {
+        for (index, fault) in ["transcript", "session"].into_iter().enumerate() {
+            let mut fixture = Fixture::new(&format!("reply-no-session-{index}"));
+            let (_, state_dir, workspace_id) = fixture.done_thread();
+            match fault {
+                "transcript" => std::fs::remove_dir_all(fixture.base.0.join("claude")).unwrap(),
+                _ => Fixture::sql(&state_dir, "UPDATE threads SET session_id = NULL"),
+            }
+
+            fixture.reply(&workspace_id, 2, "e o resto?");
+
+            assert_refused(
+                &fixture,
+                &state_dir,
+                "a thread t1 de @chief não foi retomada: the CLI session has no transcript",
+            );
+        }
+    }
+
+    // Table: a worktree thread (#24), or one of an unknown isolation.
+    #[tokio::test]
+    async fn a_reply_to_a_worktree_thread_does_not_resume_it_yet() {
+        let cases = [
+            ("'worktree'", "worktree threads cannot resume yet"),
+            ("NULL", "the thread isolation is unknown"),
+        ];
+        for (index, (isolation, reason)) in cases.into_iter().enumerate() {
+            let mut fixture = Fixture::new(&format!("reply-worktree-{index}"));
+            let (_, state_dir, workspace_id) = fixture.done_thread();
+            Fixture::sql(
+                &state_dir,
+                &format!("UPDATE threads SET isolation = {isolation}"),
+            );
+
+            fixture.reply(&workspace_id, 2, "e o resto?");
+
+            assert_refused(
+                &fixture,
+                &state_dir,
+                &format!("a thread t1 de @chief não foi retomada: {reason}"),
+            );
+        }
+    }
+
+    // A refused reply that mentions the agent of an ended thread opens a
+    // new thread, as the refusal says.
+    #[tokio::test]
+    async fn a_mention_in_a_reply_to_an_ended_thread_opens_a_new_thread() {
+        let mut fixture = Fixture::new("reply-failed-mention");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        Fixture::sql(&state_dir, "UPDATE threads SET state = 'failed'");
+
+        fixture.reply(&workspace_id, 2, "@chief tenta de novo");
+
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].state, ThreadState::Failed);
+        assert_eq!((records[1].id.as_str(), records[1].turn), ("t2", 0));
+        assert_eq!(fixture.running_argv("t2")[1], "--session-id");
+    }
+
+    // Message IDs are per channel: a reply in another channel than the one
+    // of the thread does not resume it.
+    #[tokio::test]
+    async fn a_reply_in_another_channel_than_the_thread_does_not_resume_it() {
+        let mut fixture = Fixture::new("reply-other-channel");
+        let (ws_idx, state_dir, workspace_id) = fixture.channel_workspace();
+        fixture.request(
+            "channel.create",
+            json!({"workspace_id": workspace_id, "channel": "dev"}),
+        );
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        let token = fixture.app.running_threads[&pane_id].token.clone();
+        let posted = fixture.request(
+            "channel.post",
+            json!({"workspace_id": workspace_id, "channel": "dev", "body": "em dev",
+                   "origin_thread_id": "t1", "thread_token": token}),
+        );
+        assert_eq!(posted["result"]["message"]["id"], 1, "{posted}");
+        fixture.finish_turn(pane_id);
+
+        let replied = fixture.request(
+            "channel.post",
+            json!({"workspace_id": workspace_id, "channel": "dev", "body": "e o resto?",
+                   "reply_to": 1}),
+        );
+
+        assert!(replied.get("error").is_none(), "{replied}");
+        fixture.app.state.assert_invariants_for_test();
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
+        assert_eq!(Fixture::records(&state_dir)[0].turn, 0);
+        let dev = channel::open(&state_dir, "dev")
+            .unwrap()
+            .read(ReadRange::default())
+            .unwrap();
+        assert_eq!(
+            dev.last().map(|message| message.body.as_str()),
+            Some(
+                "a thread t1 de @chief não foi retomada: the thread belongs to #geral; reply there"
+            )
+        );
+    }
+
+    // Table: the resumed CLI does not start; the thread stays resumable.
+    #[tokio::test]
+    async fn a_resume_whose_cli_cannot_start_leaves_the_thread_done() {
+        let mut fixture = Fixture::new("reply-spawn-fails");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        let prefix = fixture
+            .app
+            .test_thread_prefix
+            .replace(vec!["regents-fake-cli-not-in-path".into()]);
+
+        fixture.reply(&workspace_id, 2, "primeira");
+
+        let refusal = Fixture::system_bodies(&state_dir).pop().unwrap();
+        assert!(
+            refusal.starts_with(
+                "a thread t1 de @chief não foi retomada: cannot start regents-fake-cli-not-in-path"
+            ),
+            "{refusal}"
+        );
+        let record = &Fixture::records(&state_dir)[0];
+        assert_eq!(record.state, ThreadState::Done);
+        assert_eq!((record.turn, record.turn_message_id), (0, Some(1)));
+        assert!(fixture.app.running_threads.is_empty());
+        assert!(fixture.resumed_events().is_empty());
+
+        fixture.app.test_thread_prefix = prefix;
+        fixture.reply(&workspace_id, 2, "segunda");
+
+        assert_eq!(Fixture::records(&state_dir)[0].turn, 1);
+        let prompt = fixture.running_argv("t1").pop().unwrap();
+        assert!(
+            prompt.contains("primeira"),
+            "the failed reply is new: {prompt}"
+        );
+    }
+
+    // Table: the answered message names a thread that the registry lacks.
+    #[tokio::test]
+    async fn a_reply_to_a_message_of_an_unknown_thread_says_so() {
+        let mut fixture = Fixture::new("reply-unknown-thread");
+        let (_, state_dir, workspace_id) = fixture.done_thread();
+        channel::open(&state_dir, "geral")
+            .unwrap()
+            .post(
+                NewMessage {
+                    author: Author {
+                        kind: AuthorKind::Agent,
+                        id: "chief".into(),
+                    },
+                    body: "de outra thread".into(),
+                    reply_to: None,
+                    origin_thread_id: Some("t9".into()),
+                    mentions: Vec::new(),
+                },
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+
+        fixture.reply(&workspace_id, 3, "e o resto?");
+
+        let system = Fixture::messages(&state_dir).pop().unwrap();
+        assert_eq!(system.body, "a thread t9 não existe neste workspace");
+        assert_eq!(system.origin_thread_id, None, "no link to a missing thread");
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
+    }
+
+    // Table: the active thread limit does not apply to a resume yet (#16),
+    // and a resume keeps the delegation depth.
+    #[tokio::test]
+    async fn a_resume_ignores_the_active_limit_and_keeps_the_depth() {
+        let mut fixture = Fixture::new("reply-limit-depth");
+        let (ws_idx, state_dir, workspace_id) = fixture.done_thread();
+        let manifest = state_dir.join("workspace.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(text.contains("max_active_threads = 3"), "{text}");
+        std::fs::write(
+            &manifest,
+            text.replace("max_active_threads = 3", "max_active_threads = 1"),
+        )
+        .unwrap();
+        fixture.thread(ws_idx, &state_dir);
+        Fixture::sql(&state_dir, "UPDATE threads SET depth = 2 WHERE id = 1");
+
+        fixture.reply(&workspace_id, 2, "e o resto?");
+
+        let record = &Fixture::records(&state_dir)[0];
+        assert_eq!(record.state, ThreadState::Active);
+        assert_eq!(record.depth, 2);
+        assert_eq!(fixture.app.running_threads.len(), 2);
+    }
+
+    // Table: a reply posted by a thread resumes nothing (#18).
+    #[tokio::test]
+    async fn a_reply_posted_by_a_thread_resumes_nothing() {
+        let mut fixture = Fixture::new("reply-from-thread");
+        let (ws_idx, state_dir, workspace_id) = fixture.done_thread();
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        let token = fixture.app.running_threads[&pane_id].token.clone();
+
+        let posted = fixture.request(
+            "channel.post",
+            json!({"workspace_id": workspace_id, "channel": "geral", "body": "de t2",
+                   "reply_to": 2, "origin_thread_id": "t2", "thread_token": token}),
+        );
+
+        assert!(posted.get("error").is_none(), "{posted}");
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records[0].state, ThreadState::Done);
+        assert_eq!(records[0].turn, 0);
+        assert!(Fixture::system_bodies(&state_dir).is_empty());
+    }
+
+    // Identity: with adversarial pane, tab and workspace IDs before it, the
+    // resumed thread runs in the hidden panes of its own workspace.
+    #[tokio::test]
+    async fn a_resume_keeps_the_identity_invariants_of_an_adversarial_state() {
+        let mut fixture = Fixture::new("reply-adversarial");
+        fixture.app.state = crate::app::AppState::test_with_adversarial_identity_state();
+        fixture.app.state.assert_invariants_for_test();
+        let (ws_idx, _, workspace_id) = fixture.done_thread();
+        assert_ne!(ws_idx, 0);
+
+        fixture.reply(&workspace_id, 2, "e o resto?");
+
+        fixture.app.state.assert_invariants_for_test();
+        let pane_id = fixture.running_pane("t1");
+        assert_eq!(
+            fixture.app.find_pane(pane_id).map(|(index, _)| index),
+            Some(ws_idx)
+        );
+        assert!(fixture.app.state.workspaces[ws_idx]
+            .background_panes
+            .contains_key(&pane_id));
+        let listed = fixture.request("thread.list", json!({"workspace_id": workspace_id}));
+        assert_eq!(
+            listed["result"]["threads"][0]["pane_id"],
+            fixture.public_pane_id(pane_id),
+            "{listed}"
+        );
+        let events = fixture.resumed_events();
+        assert!(
+            matches!(&events[..], [EventData::ThreadResumed { workspace_id: id, .. }] if *id == workspace_id),
+            "{events:?}"
+        );
+        fixture.finish_turn(pane_id);
+        fixture.app.state.assert_invariants_for_test();
+        assert!(fixture.app.state.workspaces[ws_idx]
+            .background_panes
+            .is_empty());
     }
 
     #[test]

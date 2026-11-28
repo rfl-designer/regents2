@@ -112,6 +112,10 @@ pub struct ThreadInfo {
     /// Session of the agent CLI, to resume the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Turn of the CLI session, from 0: each threaded reply that resumes
+    /// the thread adds one.
+    #[serde(default)]
+    pub turn: u32,
     /// Pane that runs the CLI while the thread is active. The pane is in
     /// no tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]

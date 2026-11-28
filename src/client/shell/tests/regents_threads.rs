@@ -21,6 +21,7 @@ fn thread(id: &str, agent: &str, channel: &str, state: ThreadState) -> ThreadInf
         agent_status: None,
         end_reason: None,
         session_id: None,
+        turn: 0,
         pane_id: None,
         created_at: "2026-11-27T18:04:05Z".into(),
         updated_at: "2026-11-27T18:04:05Z".into(),

@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 /// Time that an access waits for a lock that another connection holds. The
 /// server is the only writer, so a lock is rare and short. The database I/O
@@ -20,25 +20,24 @@ pub(crate) struct Schema {
 /// Opens `path` for writing, creates it when it is missing and brings its
 /// schema to `schema.version`.
 pub(crate) fn open_writable(path: &Path, schema: &Schema) -> rusqlite::Result<Connection> {
-    let connection = Connection::open(path)?;
+    let mut connection = Connection::open(path)?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version < schema.version {
-        connection.execute_batch(&format!(
-            "BEGIN;\n{}\nPRAGMA user_version = {};\nCOMMIT;",
-            schema.sql, schema.version
-        ))?;
+    let version = |connection: &Connection| -> rusqlite::Result<i64> {
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))
+    };
+    if version(&connection)? < schema.version {
+        // Another connection can migrate first: read the version again
+        // under the write lock, so the ALTERs of `sql` run once.
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if version(&transaction)? < schema.version {
+            transaction.execute_batch(&format!(
+                "{}\nPRAGMA user_version = {};",
+                schema.sql, schema.version
+            ))?;
+        }
+        transaction.commit()?;
     }
-    Ok(connection)
-}
-
-/// Opens an existing database for reading.
-pub(crate) fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
     Ok(connection)
 }
 

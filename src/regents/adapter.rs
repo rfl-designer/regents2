@@ -1,7 +1,8 @@
-//! CLI adapters (Regents): they turn an agent definition and the initial
-//! prompt of a thread into the command line of the agent CLI, and read the
-//! last reply of a thread turn from the CLI session. Only `last_reply` reads
-//! files. Only the claude adapter exists in this slice.
+//! CLI adapters (Regents): they turn an agent definition and the prompt of a
+//! thread turn into the command line of the agent CLI (a new session or a
+//! resumed one), and read the last reply of a thread turn from the CLI
+//! session. Only `last_reply` and `has_session` read files. Only the claude
+//! adapter exists in this slice.
 
 use std::path::Path;
 
@@ -33,6 +34,15 @@ pub(crate) fn last_reply(cli: AgentCli, session_id: &str, cli_home: &Path) -> Op
             &std::fs::read_to_string(claude_transcript(cli_home, session_id)?).ok()?,
         ),
         AgentCli::Codex | AgentCli::Agy => None,
+    }
+}
+
+/// True when the CLI session `session_id` has a transcript under
+/// `cli_home`, so the CLI can resume it.
+pub(crate) fn has_session(cli: AgentCli, session_id: &str, cli_home: &Path) -> bool {
+    match cli {
+        AgentCli::Claude => claude_transcript(cli_home, session_id).is_some(),
+        AgentCli::Codex | AgentCli::Agy => false,
     }
 }
 
@@ -110,18 +120,38 @@ pub(crate) fn launch_argv(
     session_id: &str,
 ) -> Option<Vec<String>> {
     match agent.cli {
-        AgentCli::Claude => Some(claude_argv(agent, prompt, session_id)),
+        AgentCli::Claude => Some(claude_argv(agent, prompt, "--session-id", session_id)),
+        AgentCli::Codex | AgentCli::Agy => None,
+    }
+}
+
+/// The command line that resumes the CLI session `session_id` of a done
+/// thread of `agent` with `prompt`, or `None` when the CLI of the agent has
+/// no adapter yet.
+pub(crate) fn resume_argv(
+    agent: &AgentDefinition,
+    prompt: &str,
+    session_id: &str,
+) -> Option<Vec<String>> {
+    match agent.cli {
+        AgentCli::Claude => Some(claude_argv(agent, prompt, "--resume", session_id)),
         AgentCli::Codex | AgentCli::Agy => None,
     }
 }
 
 /// claude takes the role through `--append-system-prompt`, which keeps its
-/// own system prompt, and the first prompt as the positional argument of an
-/// interactive session.
-fn claude_argv(agent: &AgentDefinition, prompt: &str, session_id: &str) -> Vec<String> {
+/// own system prompt, and the prompt as the positional argument of an
+/// interactive session. The role and the model hold only for one run
+/// (claude 2.1.332), so a resume passes them again.
+fn claude_argv(
+    agent: &AgentDefinition,
+    prompt: &str,
+    session_flag: &str,
+    session_id: &str,
+) -> Vec<String> {
     let mut argv = vec![
         "claude".to_owned(),
-        "--session-id".to_owned(),
+        session_flag.to_owned(),
         session_id.to_owned(),
     ];
     if !agent.role.is_empty() {
@@ -176,6 +206,33 @@ pub(crate) fn initial_prompt(mention: &Message, recent: &[Message]) -> String {
     prompt.push_str(&format!(
         "\nPara ler mensagens mais antigas: regents channel read {channel} --before <id> --limit <n>\n\
          Para responder no canal: regents channel post {channel} \"<resposta>\"\n\
+         {PROMPT_LAST_LINE}\n"
+    ));
+    prompt
+}
+
+/// The prompt of a resumed thread: the threaded reply and the channel
+/// messages posted since the previous turn started (`new`, oldest first).
+/// The session already has the older context.
+pub(crate) fn resume_prompt(reply: &Message, new: &[Message]) -> String {
+    let channel = &reply.channel;
+    let mut prompt = format!(
+        "Responderam a uma mensagem sua no canal #{channel} do Regents.\n\n\
+         Resposta ({}):\n{}\n\n\
+         Mensagens novas do canal #{channel} desde o seu último turno, da mais antiga para a mais nova:\n",
+        author_label(reply),
+        reply.body,
+    );
+    for message in new {
+        prompt.push_str(&format!(
+            "[{}] {}: {}\n",
+            message.id,
+            author_label(message),
+            message.body
+        ));
+    }
+    prompt.push_str(&format!(
+        "\nPara responder no canal: regents channel post {channel} \"<resposta>\"\n\
          {PROMPT_LAST_LINE}\n"
     ));
     prompt
@@ -323,6 +380,59 @@ mod tests {
                 "opus",
                 "o prompt",
             ]
+        );
+    }
+
+    #[test]
+    fn a_resume_passes_the_session_the_role_and_the_model_again() {
+        let argv = resume_argv(&agent(AgentCli::Claude, Some("haiku")), "p", "sid").unwrap();
+
+        assert_eq!(
+            argv,
+            [
+                "claude",
+                "--resume",
+                "sid",
+                "--append-system-prompt",
+                "Você é o Chief of Staff.",
+                "--model",
+                "haiku",
+                "p",
+            ]
+        );
+        assert_eq!(resume_argv(&agent(AgentCli::Codex, None), "p", "sid"), None);
+    }
+
+    #[test]
+    fn a_session_exists_only_with_its_transcript() {
+        let home = crate::regents::store::TempFolder::new("adapter-has-session");
+        let project = home.0.join("projects").join("-tmp-projeto");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("sid.jsonl"), "").unwrap();
+
+        assert!(has_session(AgentCli::Claude, "sid", &home.0));
+        assert!(!has_session(AgentCli::Claude, "other", &home.0));
+        assert!(!has_session(AgentCli::Codex, "sid", &home.0));
+    }
+
+    #[test]
+    fn the_resume_prompt_carries_the_reply_and_only_the_new_messages() {
+        let reply = message(7, "e o resto?");
+        let new = [message(6, "nova"), reply.clone()];
+
+        let prompt = resume_prompt(&reply, &new);
+
+        assert!(
+            prompt.contains("(rafael, humano):\ne o resto?\n"),
+            "{prompt}"
+        );
+        let first = prompt.find("[6] rafael, humano: nova").unwrap();
+        let second = prompt.find("[7] rafael, humano: e o resto?").unwrap();
+        assert!(first < second, "{prompt}");
+        assert!(prompt.contains("regents channel post geral"), "{prompt}");
+        assert!(
+            prompt.trim_end().ends_with(PROMPT_LAST_LINE),
+            "the screen reply starts after its echo: {prompt}"
         );
     }
 

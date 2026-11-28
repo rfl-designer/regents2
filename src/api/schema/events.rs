@@ -86,6 +86,8 @@ pub enum Subscription {
     ChannelMessagePosted {},
     #[serde(rename = "channel.renamed")]
     ChannelRenamed {},
+    #[serde(rename = "thread.resumed")]
+    ThreadResumed {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -224,6 +226,7 @@ pub enum EventKind {
     LayoutUpdated,
     ChannelMessagePosted,
     ChannelRenamed,
+    ThreadResumed,
 }
 
 impl EventKind {
@@ -257,6 +260,7 @@ impl EventKind {
             EventKind::LayoutUpdated => "layout.updated",
             EventKind::ChannelMessagePosted => "channel.message_posted",
             EventKind::ChannelRenamed => "channel.renamed",
+            EventKind::ThreadResumed => "thread.resumed",
         }
     }
 }
@@ -291,6 +295,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::LayoutUpdated,
     EventKind::ChannelMessagePosted,
     EventKind::ChannelRenamed,
+    EventKind::ThreadResumed,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -572,5 +577,13 @@ pub enum EventData {
         workspace_id: String,
         from: String,
         channel: String,
+    },
+    /// A threaded reply resumed the done thread `thread_id` in its turn
+    /// `turn`, started by the channel message `message_id`.
+    ThreadResumed {
+        workspace_id: String,
+        thread_id: String,
+        turn: u32,
+        message_id: u64,
     },
 }
