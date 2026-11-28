@@ -1,4 +1,4 @@
-//! Regents threads and agent definitions: `thread.list` and
+//! Regents threads and agent definitions: `thread.list`, `thread.open` and
 //! `agent.definition.list` (ADR-0004). `agent.*` without `definition` is
 //! herdr's family for agent processes in panes.
 
@@ -14,6 +14,20 @@ cli_params! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub workspace_id: Option<String> => Field::new(None)
             .input(super::tabs::workspace_option("WORKSPACE_ID").order(0)),
+    }
+}
+
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct ThreadOpenParams => ThreadOpenProjection {
+        /// Workspace of the thread: its public ID or the stable ID from
+        /// `workspace.toml`. Absent means the active workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub workspace_id: Option<String> => Field::new(None)
+            .input(super::tabs::workspace_option("WORKSPACE_ID").order(0)),
+        /// Thread ID, for example `t1`.
+        pub thread_id: String => Field::new(String::new())
+            .input(crate::cli::thread_bindings::thread_id()),
     }
 }
 
@@ -89,6 +103,9 @@ pub struct ThreadInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<AgentIsolation>,
     pub state: ThreadState,
+    /// Detected state of the agent CLI while the thread is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<super::AgentStatus>,
     /// Why the thread ended, when it did not end done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,

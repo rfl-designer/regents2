@@ -17,7 +17,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::backend::Backend;
 use ratatui::buffer::Buffer;
@@ -30,6 +31,7 @@ use crate::api::client::{parse_response_value, ApiClient};
 use crate::api::schema::{
     ChannelAuthorKind, ChannelMessageInfo, ChannelPostParams, ChannelReadParams, EventData,
     EventEnvelope, EventsSubscribeParams, Method, Request, ResponseResult, Subscription,
+    ThreadOpenParams,
 };
 
 /// Messages that one history read returns: the most recent ones at start, or
@@ -283,7 +285,49 @@ impl ChatView {
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
+        Paragraph::new(Text::from(self.history_lines().0)).wrap(Wrap { trim: false })
+    }
+
+    /// The thread whose link is at `(column, row)` of `area`: a click on the
+    /// first line of an agent message opens the thread that posted it.
+    pub(crate) fn thread_at(&self, area: Rect, column: u16, row: u16) -> Option<String> {
+        let history = history_area(area);
+        let inside = column >= history.x
+            && column < history.right()
+            && row >= history.y
+            && row < history.bottom();
+        if !inside || self.messages.is_empty() {
+            return None;
+        }
+        let (lines, links) = self.history_lines();
+        let wrapped = |line: &Line<'_>| {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(history.width)
+        };
+        let total: usize = lines.iter().map(wrapped).sum();
+        let target = history_top(total, history.height, self.scroll_from_bottom)
+            + usize::from(row - history.y);
+        let mut top = 0;
+        for (index, line) in lines.iter().enumerate() {
+            let bottom = top + wrapped(line);
+            if target < bottom {
+                // Only the first row of the message is the link.
+                return (target == top)
+                    .then(|| links.iter().find(|(line, _)| *line == index))
+                    .flatten()
+                    .map(|(_, thread)| thread.clone());
+            }
+            top = bottom;
+        }
+        None
+    }
+
+    /// The history lines, and the index of the first line of each agent
+    /// message that links to its thread.
+    fn history_lines(&self) -> (Vec<Line<'_>>, Vec<(usize, String)>) {
         let dim = Style::default().add_modifier(Modifier::DIM);
+        let mut links = Vec::new();
         let mut lines = Vec::new();
         let mut last_date = None;
         for message in &self.messages {
@@ -312,12 +356,23 @@ impl ChatView {
                 ));
             }
             spans.push(author_span(message));
+            if let Some(thread) = message
+                .origin_thread_id
+                .as_ref()
+                .filter(|_| message.author.kind == ChannelAuthorKind::Agent)
+            {
+                links.push((lines.len(), thread.clone()));
+                spans.push(Span::styled(
+                    format!(" [{thread}]"),
+                    dim.add_modifier(Modifier::UNDERLINED),
+                ));
+            }
             spans.push(Span::raw(": "));
             spans.push(Span::raw(first));
             lines.push(Line::from(spans));
             lines.extend(body.map(|line| Line::raw(format!("  {line}"))));
         }
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false })
+        (lines, links)
     }
 
     /// Draws the view: a header with the channel name, the history, a
@@ -338,19 +393,10 @@ impl ChatView {
         }
         Paragraph::new(Line::from(header)).render(Rect { height: 1, ..area }, buffer);
 
-        let history = Rect {
-            y: area.y.saturating_add(1),
-            height: history_height(area.height),
-            ..area
-        };
+        let history = history_area(area);
         let paragraph = self.history_paragraph();
         let total = paragraph.line_count(history.width);
-        let scroll_from_bottom = self
-            .scroll_from_bottom
-            .min(total.saturating_sub(usize::from(history.height)));
-        let top = total
-            .saturating_sub(usize::from(history.height))
-            .saturating_sub(scroll_from_bottom);
+        let top = history_top(total, history.height, self.scroll_from_bottom);
         paragraph
             .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
             .render(history, buffer);
@@ -404,6 +450,20 @@ impl ChatView {
 /// input line.
 fn history_height(height: u16) -> u16 {
     height.saturating_sub(3)
+}
+
+fn history_area(area: Rect) -> Rect {
+    Rect {
+        y: area.y.saturating_add(1),
+        height: history_height(area.height),
+        ..area
+    }
+}
+
+/// First shown line of a history of `total` wrapped lines.
+fn history_top(total: usize, height: u16, scroll_from_bottom: usize) -> usize {
+    let hidden = total.saturating_sub(usize::from(height));
+    hidden.saturating_sub(scroll_from_bottom.min(hidden))
 }
 
 fn author_span(message: &ChannelMessageInfo) -> Span<'static> {
@@ -468,6 +528,8 @@ pub(crate) trait ChatSource {
         limit: u32,
     ) -> Result<(String, Vec<ChannelMessageInfo>), String>;
     fn post(&self, body: String) -> Result<ChannelMessageInfo, String>;
+    /// Shows the thread `thread_id` of the channel's workspace as a popup.
+    fn open_thread(&self, thread_id: &str) -> Result<(), String>;
     /// The channel has a new name; later reads and posts use it.
     fn rename(&mut self, _channel: &str) {}
 }
@@ -579,6 +641,15 @@ impl<S: ChatSource> ChatSession<S> {
                         }
                     },
                     ChatAction::None => {}
+                }
+            }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                let (width, height) = self.view.viewport;
+                let area = Rect::new(0, 0, width, height);
+                if let Some(thread) = self.view.thread_at(area, mouse.column, mouse.row) {
+                    let notice = self.source.open_thread(&thread).err();
+                    self.view.set_notice(notice);
+                    self.dirty = true;
                 }
             }
             Event::Mouse(mouse) => self.dirty |= self.view.handle_mouse(mouse),
@@ -735,6 +806,17 @@ impl ChatSource for ApiSource {
             ResponseResult::ChannelMessagePosted { message, .. } => Ok(message),
             result => Err(format!("unexpected api result: {result:?}")),
         }
+    }
+
+    fn open_thread(&self, thread_id: &str) -> Result<(), String> {
+        self.request(
+            "open-thread",
+            Method::ThreadOpen(ThreadOpenParams {
+                workspace_id: self.workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+            }),
+        )
+        .map(|_| ())
     }
 
     fn rename(&mut self, channel: &str) {
@@ -924,13 +1006,14 @@ mod tests {
     struct FakeSource {
         reads: RefCell<Vec<Option<u64>>>,
         answers: RefCell<VecDeque<Result<Vec<ChannelMessageInfo>, String>>>,
+        opened: RefCell<Vec<String>>,
     }
 
     impl FakeSource {
         fn answering(answers: Vec<Result<Vec<ChannelMessageInfo>, String>>) -> Self {
             Self {
-                reads: RefCell::default(),
                 answers: RefCell::new(answers.into()),
+                ..Self::default()
             }
         }
     }
@@ -951,6 +1034,11 @@ mod tests {
 
         fn post(&self, _body: String) -> Result<ChannelMessageInfo, String> {
             Err("not in this test".into())
+        }
+
+        fn open_thread(&self, thread_id: &str) -> Result<(), String> {
+            self.opened.borrow_mut().push(thread_id.to_owned());
+            Ok(())
         }
     }
 
@@ -1128,6 +1216,48 @@ mod tests {
         view.set_viewport(30, 6);
         view.handle_key(key(KeyCode::Home));
         assert_eq!(view.wants_older(), Some(11));
+    }
+
+    #[test]
+    fn a_click_on_the_first_line_of_an_agent_message_opens_its_thread() {
+        let answer = ChannelMessageInfo {
+            origin_thread_id: Some("t3".into()),
+            ..message(2, ChannelAuthorKind::Agent, "chief", "olá\nsegunda linha")
+        };
+        let stray = ChannelMessageInfo {
+            // A human message names no thread link, even with an origin.
+            origin_thread_id: Some("t9".into()),
+            ..human(3)
+        };
+        let source = FakeSource::answering(vec![Ok(vec![human(1), answer, stray])]);
+        let now = Instant::now();
+        let mut session = ChatSession::new("geral".into(), &source, time::UtcOffset::UTC, now);
+        let (mut terminal, _output) = terminal();
+        session.sync(now);
+        session.draw(&mut terminal).unwrap();
+        let rows = screen(&mut session.view.clone(), 40, 8);
+        let click = |row: u16| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let agent_row = rows
+            .iter()
+            .position(|row| row.contains("@chief [t3]: olá"))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+
+        for row in 0..8 {
+            if row != agent_row as u16 {
+                session.handle_event(click(row));
+            }
+        }
+        assert!(source.opened.borrow().is_empty(), "{rows:#?}");
+        session.handle_event(click(agent_row as u16));
+
+        assert_eq!(*source.opened.borrow(), ["t3"]);
     }
 
     #[test]

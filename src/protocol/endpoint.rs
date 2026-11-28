@@ -248,6 +248,7 @@ mod tests {
             agents: Vec::new(),
             commands: Vec::new(),
             workspace_add_command: None,
+            thread_popup: false,
         }
     }
 

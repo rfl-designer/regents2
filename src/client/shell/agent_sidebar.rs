@@ -67,7 +67,11 @@ pub(super) fn render_agent_panel(
         return;
     }
 
-    let rows = agent_rows(snapshot, config, None);
+    let mut rows: Vec<PanelRow> = agent_rows(snapshot, config, None)
+        .into_iter()
+        .map(PanelRow::Agent)
+        .collect();
+    rows.extend(thread_rows(snapshot));
     render_agent_list(
         buffer,
         area,
@@ -79,12 +83,125 @@ pub(super) fn render_agent_panel(
         config,
         agent_scroll,
         hits,
-        |row| row.rows.len(),
-        |buffer, rect, row, hits| {
-            hits.agents.push((rect, row.pane_id.clone()));
-            render_agent_row(buffer, rect, row, config);
+        |row| match row {
+            PanelRow::Agent(row) => row.rows.len(),
+            PanelRow::Channel(_) | PanelRow::Thread(_) => 1,
+        },
+        |buffer, rect, row, hits| match row {
+            PanelRow::Agent(row) => {
+                hits.agents.push((rect, row.pane_id.clone()));
+                render_agent_row(buffer, rect, row, config);
+            }
+            PanelRow::Channel(channel) => put_text(
+                buffer,
+                rect.x.saturating_add(1),
+                rect.y,
+                rect.width.saturating_sub(1),
+                channel,
+                Style::default().fg(config.palette.overlay0),
+            ),
+            PanelRow::Thread(row) => {
+                hits.threads
+                    .push((rect, row.workspace_id.clone(), row.thread_id.clone()));
+                render_thread_row(buffer, rect, row, config);
+            }
         },
     );
+}
+
+/// A row of the agents section: an agent pane, or (Regents) a channel group
+/// header and the threads under it.
+pub(super) enum PanelRow {
+    Agent(AgentRow),
+    Channel(String),
+    Thread(ThreadRow),
+}
+
+pub(super) struct ThreadRow {
+    workspace_id: String,
+    thread_id: String,
+    agent: String,
+    status: crate::api::schema::AgentStatus,
+    state_text: &'static str,
+}
+
+/// Regents: the threads of the focused workspace, grouped by channel. The
+/// channel of the newest thread comes first, and the newest thread first in
+/// each group.
+pub(super) fn thread_rows(snapshot: &ClientShellSnapshot) -> Vec<PanelRow> {
+    use crate::api::schema::{AgentStatus, ThreadState};
+
+    let Some(workspace) = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.focused)
+    else {
+        return Vec::new();
+    };
+    let group = |thread: &crate::api::schema::ThreadInfo| match &thread.channel {
+        Some(channel) => format!("#{channel}"),
+        None => "direct".to_owned(),
+    };
+    let mut groups: Vec<String> = Vec::new();
+    for thread in &workspace.threads {
+        let name = group(thread);
+        if !groups.contains(&name) {
+            groups.push(name);
+        }
+    }
+    let mut rows = Vec::new();
+    for name in groups {
+        let threads = workspace
+            .threads
+            .iter()
+            .filter(|thread| group(thread) == name);
+        rows.push(PanelRow::Channel(name.clone()));
+        for thread in threads {
+            let (status, state_text) = match thread.state {
+                ThreadState::Active => {
+                    let status = thread.agent_status.unwrap_or(AgentStatus::Unknown);
+                    (status, sidebar_status_text(status))
+                }
+                ThreadState::Done => (AgentStatus::Done, "done"),
+                ThreadState::Queued => (AgentStatus::Unknown, "queued"),
+                ThreadState::Interrupted => (AgentStatus::Unknown, "interrupted"),
+                ThreadState::Failed => (AgentStatus::Unknown, "failed"),
+                ThreadState::Unknown => (AgentStatus::Unknown, "unknown"),
+            };
+            rows.push(PanelRow::Thread(ThreadRow {
+                workspace_id: workspace.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                agent: thread.agent.clone(),
+                status,
+                state_text,
+            }));
+        }
+    }
+    rows
+}
+
+fn render_thread_row(buffer: &mut Buffer, rect: Rect, row: &ThreadRow, config: &ClientShellConfig) {
+    let palette = &config.palette;
+    let color = status_color(row.status, palette);
+    let spans = vec![
+        ratatui::text::Span::raw("   "),
+        ratatui::text::Span::styled(
+            status_icon(row.status, config.status_indicators),
+            Style::default().fg(color),
+        ),
+        ratatui::text::Span::styled(
+            format!(" @{} ", row.agent),
+            Style::default()
+                .fg(palette.subtext0)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ratatui::text::Span::styled(
+            format!("{} ", row.thread_id),
+            Style::default().fg(palette.overlay0),
+        ),
+        ratatui::text::Span::styled(row.state_text, Style::default().fg(color)),
+    ];
+    Paragraph::new(Line::from(spans)).render(rect, buffer);
 }
 
 pub(super) fn render_agent_panel_header(

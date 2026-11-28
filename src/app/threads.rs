@@ -26,6 +26,12 @@ use crate::regents::{THREAD_ID_ENV_VAR, THREAD_TOKEN_ENV_VAR};
 const WORKSPACE_ID_ENV_VAR: &str = "REGENTS_WORKSPACE_ID";
 
 const PANE_CLOSED: &str = "its pane closed";
+/// Newest threads of each workspace in the thread index.
+/// shortcut: older threads are not in the index; page through `thread.list`
+/// when the index must show the whole history.
+pub(crate) const INDEX_THREADS: usize = 50;
+/// Lines of the last output that an ended thread keeps.
+const OUTPUT_LINES: usize = 1000;
 const SERVER_HANDOFF: &str = "the server handed off to a new process";
 
 /// A thread whose agent CLI runs.
@@ -139,7 +145,10 @@ impl App {
             (THREAD_TOKEN_ENV_VAR.to_owned(), token.clone()),
             (WORKSPACE_ID_ENV_VAR.to_owned(), workspace_stable_id),
         ];
-        match self.spawn_background_pane(ws_idx, folder, argv, env) {
+        let title = Some(format!("@{} · {}", thread.agent, thread.id));
+        let launched = self.spawn_background_pane(ws_idx, folder, argv, env, title);
+        self.refresh_folder_threads();
+        match launched {
             Ok((pane_id, terminal_id)) => {
                 self.running_threads.insert(
                     pane_id,
@@ -157,6 +166,7 @@ impl App {
             Err(err) => {
                 let reason = format!("cannot start {}: {err}", argv[0]);
                 record_state(&registry, &thread.id, ThreadState::Failed, Some(&reason));
+                self.refresh_folder_threads();
                 Err(reason)
             }
         }
@@ -170,6 +180,7 @@ impl App {
         cwd: PathBuf,
         argv: &[String],
         extra_env: Vec<(String, String)>,
+        title: Option<String>,
     ) -> std::io::Result<(PaneId, TerminalId)> {
         let workspace = self
             .state
@@ -198,10 +209,10 @@ impl App {
             self.render_dirty.clone(),
         )?;
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
-        self.state.terminals.insert(
-            terminal_id.clone(),
-            TerminalState::new(terminal_id.clone(), cwd).with_launch_argv(argv.to_vec()),
-        );
+        let mut terminal =
+            TerminalState::new(terminal_id.clone(), cwd).with_launch_argv(argv.to_vec());
+        terminal.manual_label = title;
+        self.state.terminals.insert(terminal_id.clone(), terminal);
         self.state.workspaces[ws_idx].insert_background_pane(
             reserved,
             pane_id,
@@ -220,6 +231,8 @@ impl App {
             let Some(thread) = self.running_threads.get_mut(&update.pane_id) else {
                 continue;
             };
+            // The thread index shows the agent state of a hidden pane.
+            self.render_dirty.request_generic();
             if thread.progress.observe(update.state) == ThreadStep::Done {
                 self.end_thread(update.pane_id, ThreadState::Done, None);
             }
@@ -281,6 +294,7 @@ impl App {
                 Some(SERVER_HANDOFF),
             );
         }
+        self.refresh_folder_threads();
     }
 
     /// Records the final state, removes the background pane and stops its
@@ -289,12 +303,27 @@ impl App {
         let Some(thread) = self.running_threads.remove(&pane_id) else {
             return;
         };
+        if let Some(runtime) = self.terminal_runtimes.get(&thread.terminal_id) {
+            let output = runtime.recent_ansi_snapshot(OUTPUT_LINES).text;
+            if let Err(err) = threads::write_output(&thread.state_dir, &thread.thread_id, &output) {
+                tracing::warn!(thread = %thread.thread_id, %err, "cannot record the thread output");
+            }
+        }
+        if self
+            .state
+            .popup_pane
+            .as_ref()
+            .is_some_and(|popup| popup.thread && popup.pane_id == pane_id)
+        {
+            self.close_popup_pane();
+        }
         record_state(
             &threads::registry(&thread.state_dir),
             &thread.thread_id,
             state,
             reason,
         );
+        self.refresh_folder_threads();
         for workspace in &mut self.state.workspaces {
             workspace.remove_background_pane(pane_id);
         }
@@ -340,6 +369,170 @@ impl App {
     }
 }
 
+/// Why `thread.open` cannot show a thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadPopupError {
+    /// Another popup is open; a thread popup only replaces a thread popup.
+    PopupOpen,
+    NotFound,
+    /// The thread is not running and recorded no output.
+    NoOutput,
+    CannotStart,
+}
+
+impl App {
+    /// Lists the thread registry of each connected open folder workspace
+    /// again. It reads one database per folder workspace: call it after a
+    /// registry write and with the folder checks, never from render.
+    pub(crate) fn refresh_folder_threads(&mut self) {
+        let records: std::collections::HashMap<String, Vec<threads::ThreadRecord>> = self
+            .state
+            .workspaces
+            .iter()
+            .filter_map(|workspace| workspace.folder.as_ref())
+            .filter(|binding| !self.disconnected_folders.contains(&binding.id))
+            .map(|binding| {
+                let state_dir = binding.root.join(crate::regents::folder::STATE_DIR);
+                let list = threads::registry(&state_dir)
+                    .recent(INDEX_THREADS)
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(%err, "cannot list the threads of a workspace");
+                        Vec::new()
+                    });
+                (binding.id.clone(), list)
+            })
+            .collect();
+        if records != self.folder_threads {
+            self.folder_threads = records;
+            self.render_dirty.request_generic();
+        }
+    }
+
+    /// The `INDEX_THREADS` newest threads of the workspace at `index`, newest
+    /// first, as of the last refresh. It reads no file, so snapshot code can
+    /// call it.
+    pub(crate) fn workspace_thread_records(&self, index: usize) -> &[threads::ThreadRecord] {
+        self.state
+            .workspaces
+            .get(index)
+            .and_then(|workspace| workspace.folder.as_ref())
+            .and_then(|binding| self.folder_threads.get(&binding.id))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Detected agent state of the running thread `thread_id` of the
+    /// workspace whose state directory is `state_dir`.
+    pub(crate) fn running_thread_agent_state(
+        &self,
+        state_dir: &Path,
+        thread_id: &str,
+    ) -> Option<crate::detect::AgentState> {
+        let thread = self
+            .running_threads
+            .values()
+            .find(|thread| thread.thread_id == thread_id && thread.state_dir == state_dir)?;
+        self.state
+            .terminals
+            .get(&thread.terminal_id)
+            .map(|terminal| terminal.state)
+    }
+
+    /// True when the open popup shows a thread: the pane of a running thread
+    /// or the output of an ended one. A click outside closes it, and another
+    /// thread replaces it.
+    pub(crate) fn popup_shows_thread(&self) -> bool {
+        self.state.popup_pane.as_ref().is_some_and(|popup| {
+            popup.thread
+                || self
+                    .state
+                    .terminals
+                    .get(&popup.terminal_id)
+                    .and_then(|terminal| terminal.launch_argv.as_deref())
+                    .is_some_and(|argv| {
+                        matches!(argv, [_, group, command, _]
+                            if group == "thread"
+                                && command == crate::cli::thread_bindings::OUTPUT_COMMAND)
+                    })
+        })
+    }
+
+    /// Shows the thread `thread_id` as a popup over the layout: the pane of a
+    /// running thread, or the recorded output of an ended one, read only.
+    /// Closing the popup of a running thread keeps the thread.
+    pub(crate) fn open_thread_popup(
+        &mut self,
+        state_dir: &Path,
+        thread_id: &str,
+    ) -> Result<(), ThreadPopupError> {
+        if self.state.popup_pane.is_some() {
+            if !self.popup_shows_thread() {
+                return Err(ThreadPopupError::PopupOpen);
+            }
+            self.close_popup_pane();
+        }
+        let running = self
+            .running_threads
+            .iter()
+            .find(|(_, thread)| thread.thread_id == thread_id && thread.state_dir == state_dir)
+            .map(|(&pane_id, thread)| (pane_id, thread.terminal_id.clone()));
+        if let Some((pane_id, terminal_id)) = running {
+            self.state.popup_pane = Some(crate::app::state::PopupPaneState {
+                pane_id,
+                terminal_id,
+                width: None,
+                height: None,
+                thread: true,
+            });
+            self.state.mode = crate::app::Mode::Terminal;
+            self.render_dirty.request_generic();
+            self.render_notify.notify_one();
+            return Ok(());
+        }
+        if !threads::has_output(state_dir, thread_id) {
+            let known = threads::registry(state_dir)
+                .list()
+                .is_ok_and(|records| records.iter().any(|record| record.id == thread_id));
+            return Err(if known {
+                ThreadPopupError::NoOutput
+            } else {
+                ThreadPopupError::NotFound
+            });
+        }
+        let argv = output_argv(thread_id).map_err(|_| ThreadPopupError::CannotStart)?;
+        let folder = state_dir.parent().unwrap_or(state_dir).to_path_buf();
+        self.spawn_popup_argv_command(
+            &argv,
+            Some(folder),
+            Vec::new(),
+            crate::app::popup::PopupGeometry::default(),
+        )
+        .map_err(|err| {
+            tracing::warn!(thread = %thread_id, %err, "cannot open the thread output popup");
+            ThreadPopupError::CannotStart
+        })
+    }
+}
+
+/// Command line of the popup of an ended thread: the running binary's
+/// `thread output` command, in the workspace folder.
+fn output_argv(thread_id: &str) -> std::io::Result<Vec<String>> {
+    // Unit tests run in the test binary, which must not start itself again.
+    #[cfg(test)]
+    let program = std::path::PathBuf::from(if cfg!(windows) {
+        "C:\\Windows\\System32\\whoami.exe"
+    } else {
+        "/usr/bin/true"
+    });
+    #[cfg(not(test))]
+    let program = crate::platform::launch_executable()?;
+    Ok(vec![
+        program.display().to_string(),
+        "thread".into(),
+        crate::cli::thread_bindings::OUTPUT_COMMAND.into(),
+        thread_id.into(),
+    ])
+}
+
 fn record_state(
     registry: &threads::ThreadRegistry,
     thread_id: &str,
@@ -349,6 +542,60 @@ fn record_state(
     if let Err(err) = registry.set_state(thread_id, state, reason, time::OffsetDateTime::now_utc())
     {
         tracing::warn!(thread = %thread_id, %err, "cannot record the thread state");
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// Registers each background pane of the workspace at `ws_idx` as a
+    /// running thread of `#geral` in the thread index, for render profiles.
+    pub(crate) fn register_test_threads(&mut self, ws_idx: usize) {
+        let root = PathBuf::from("/bench");
+        let state_dir = root.join(crate::regents::folder::STATE_DIR);
+        let workspace = &mut self.state.workspaces[ws_idx];
+        workspace.folder = Some(crate::regents::folder::FolderBinding {
+            id: "bench".into(),
+            root,
+        });
+        let panes: Vec<(PaneId, TerminalId)> = workspace
+            .background_panes
+            .iter()
+            .map(|(&pane_id, pane)| (pane_id, pane.attached_terminal_id.clone()))
+            .collect();
+        let mut records = Vec::new();
+        for (number, (pane_id, terminal_id)) in panes.into_iter().enumerate() {
+            let id = format!("t{}", number + 1);
+            records.push(threads::ThreadRecord {
+                id: id.clone(),
+                agent: "chief".into(),
+                cli: Some(crate::regents::agents::AgentCli::Claude),
+                origin: ThreadOrigin::Channel,
+                channel: Some("geral".into()),
+                origin_message_id: Some(1),
+                opener_thread_id: None,
+                depth: 0,
+                isolation: Some(crate::regents::agents::Isolation::Shared),
+                state: ThreadState::Active,
+                end_reason: None,
+                session_id: None,
+                created_at: "2026-11-27T18:04:05Z".into(),
+                updated_at: "2026-11-27T18:04:05Z".into(),
+            });
+            self.running_threads.insert(
+                pane_id,
+                RunningThread {
+                    state_dir: state_dir.clone(),
+                    thread_id: id,
+                    agent: "chief".into(),
+                    token: String::new(),
+                    terminal_id,
+                    progress: ThreadProgress::default(),
+                },
+            );
+        }
+        // The index is newest first.
+        records.reverse();
+        self.folder_threads.insert("bench".into(), records);
     }
 }
 
@@ -515,6 +762,114 @@ mod tests {
         assert_eq!(got["result"]["agent"]["tab_id"], "", "{got}");
         assert_eq!(read["result"]["read"]["pane_id"], public_pane_id, "{read}");
         assert_eq!(focus["error"]["code"], "agent_not_in_tab", "{focus}");
+    }
+
+    #[tokio::test]
+    async fn a_running_thread_opens_as_a_popup_that_closes_without_ending_it() {
+        let mut fixture = Fixture::new("popup-running");
+        let (ws_idx, state_dir) = fixture.workspace("projeto");
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        let terminal_id = fixture.app.running_threads[&pane_id].terminal_id.clone();
+        let public_pane_id = fixture.public_pane_id(pane_id);
+        fixture.request(
+            "pane.report_agent",
+            json!({"pane_id": public_pane_id, "source": "custom:test", "agent": "claude",
+                   "state": "blocked"}),
+        );
+
+        let listed = fixture.request("thread.list", json!({}));
+        let indexed = fixture.app.workspace_thread_infos(ws_idx);
+        let opened = fixture.request("thread.open", json!({"thread_id": "t1"}));
+
+        assert_eq!(
+            listed["result"]["threads"][0]["agent_status"], "blocked",
+            "{listed}"
+        );
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(
+            indexed[0].agent_status,
+            Some(crate::api::schema::AgentStatus::Blocked)
+        );
+        assert!(opened.get("error").is_none(), "{opened}");
+        let popup = fixture.app.state.popup_pane.as_ref().unwrap();
+        assert!(popup.thread);
+        assert_eq!(popup.pane_id, pane_id);
+        assert_eq!(
+            fixture.app.state.terminals[&terminal_id]
+                .manual_label
+                .as_deref(),
+            Some("@chief · t1")
+        );
+        fixture.app.state.assert_invariants_for_test();
+
+        let closed = fixture.request("popup.close", json!({}));
+
+        assert!(closed.get("error").is_none(), "{closed}");
+        assert!(fixture.app.state.popup_pane.is_none());
+        assert!(fixture.app.running_threads.contains_key(&pane_id));
+        assert!(fixture.app.terminal_runtimes.get(&terminal_id).is_some());
+        assert!(fixture.app.state.terminals.contains_key(&terminal_id));
+        assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Active);
+    }
+
+    #[tokio::test]
+    async fn an_ended_thread_keeps_its_output_and_opens_it_read_only() {
+        let mut fixture = Fixture::new("popup-ended");
+        let (ws_idx, state_dir) = fixture.workspace("projeto");
+        let pane_id = fixture.thread(ws_idx, &state_dir);
+        fixture.request("thread.open", json!({"thread_id": "t1"}));
+        let public_pane_id = fixture.public_pane_id(pane_id);
+
+        fixture.request("pane.close", json!({"pane_id": public_pane_id}));
+
+        assert!(
+            fixture.app.state.popup_pane.is_none(),
+            "the popup closes with its thread"
+        );
+        assert!(threads::has_output(&state_dir, "t1"));
+        let indexed = fixture.app.workspace_thread_infos(ws_idx);
+        assert_eq!(indexed[0].state, crate::api::schema::ThreadState::Failed);
+        assert_eq!(indexed[0].agent_status, None);
+
+        let opened = fixture.request("thread.open", json!({"thread_id": "t1"}));
+        let output_popup = fixture
+            .app
+            .state
+            .popup_pane
+            .as_ref()
+            .map(|popup| popup.thread);
+        let shows_thread = fixture.app.popup_shows_thread();
+        let reopened = fixture.request("thread.open", json!({"thread_id": "t1"}));
+        let unknown = fixture.request("thread.open", json!({"thread_id": "t7"}));
+
+        assert!(opened.get("error").is_none(), "{opened}");
+        assert_eq!(
+            output_popup,
+            Some(false),
+            "the output runs in its own popup"
+        );
+        assert!(shows_thread, "the output popup is a thread popup");
+        assert!(reopened.get("error").is_none(), "{reopened}");
+        assert_eq!(unknown["error"]["code"], "thread_not_found", "{unknown}");
+    }
+
+    #[tokio::test]
+    async fn the_thread_index_follows_the_registry_newest_first() {
+        let mut fixture = Fixture::new("index");
+        let (ws_idx, state_dir) = fixture.workspace("projeto");
+        assert!(fixture.app.workspace_thread_infos(ws_idx).is_empty());
+        fixture.thread(ws_idx, &state_dir);
+        fixture.thread(ws_idx, &state_dir);
+        fixture.thread(ws_idx, &state_dir);
+
+        let ids: Vec<_> = fixture
+            .app
+            .workspace_thread_infos(ws_idx)
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect();
+
+        assert_eq!(ids, ["t3", "t2", "t1"]);
     }
 
     #[test]

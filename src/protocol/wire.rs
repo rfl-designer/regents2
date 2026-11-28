@@ -953,6 +953,11 @@ pub struct ClientShellSnapshot {
     /// itself (herdr) or is older than this field.
     #[serde(default)]
     pub workspace_add_command: Option<String>,
+    /// Regents: the open popup shows a thread (its running pane or its
+    /// recorded output), so a click outside it closes it with `popup.close`.
+    /// Optional for older servers.
+    #[serde(default)]
+    pub thread_popup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1052,6 +1057,11 @@ pub struct ClientShellWorkspace {
     /// servers.
     #[serde(default)]
     pub unread_channels: Vec<String>,
+    /// Newest threads of the focused Regents folder workspace, newest first,
+    /// as `thread.list` projects them; empty for the other workspaces.
+    /// Optional for older servers.
+    #[serde(default)]
+    pub threads: Vec<crate::api::schema::ThreadInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2856,6 +2866,7 @@ mod tests {
                 disconnected: false,
                 channels: Vec::new(),
                 unread_channels: Vec::new(),
+                threads: Vec::new(),
             }],
             tabs: vec![ClientShellTab {
                 tab_id: "w1:t1".into(),
@@ -2886,6 +2897,7 @@ mod tests {
                 description: Some("deploy".into()),
             }],
             workspace_add_command: None,
+            thread_popup: false,
         }));
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =

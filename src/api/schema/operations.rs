@@ -209,6 +209,7 @@ mod tests {
             "plugin.pane.focus",
             "plugin.pane.close",
             "channel.open",
+            "thread.open",
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();

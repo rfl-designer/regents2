@@ -467,8 +467,9 @@ impl App {
         Ok((index, state_dir))
     }
 
-    /// Lists the channels of each connected open folder workspace again. It
-    /// reads one directory per folder workspace: call it with the folder
+    /// Lists the channels and the threads of each connected open folder
+    /// workspace again. It reads one directory and one database per folder
+    /// workspace: call it with the folder
     /// checks (load, list, bind and the periodic check), never from render.
     pub(crate) fn refresh_folder_channels(&mut self) {
         let channels: std::collections::HashMap<String, Vec<String>> = self
@@ -486,6 +487,7 @@ impl App {
             self.folder_channels = channels;
             self.render_dirty.request_generic();
         }
+        self.refresh_folder_threads();
     }
 
     /// Channel names of the workspace at `index`, as of the last refresh. It

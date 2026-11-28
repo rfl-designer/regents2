@@ -20,6 +20,9 @@ pub(crate) struct PopupPaneState {
     pub terminal_id: crate::terminal::TerminalId,
     pub width: Option<crate::popup_size::PopupSize>,
     pub height: Option<crate::popup_size::PopupSize>,
+    /// Regents: the popup shows the background pane of a running thread.
+    /// Closing it keeps the pane and its CLI process.
+    pub thread: bool,
 }
 
 use crate::terminal_theme::{HostAppearance, TerminalTheme};

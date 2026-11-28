@@ -44,6 +44,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
             disconnected: false,
             channels: Vec::new(),
             unread_channels: Vec::new(),
+            threads: Vec::new(),
         }],
         tabs: vec![ClientShellTab {
             tab_id: "tab_1".into(),
@@ -68,6 +69,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
         agents: Vec::new(),
         commands: Vec::new(),
         workspace_add_command: None,
+        thread_popup: false,
     }
 }
 
@@ -268,5 +270,6 @@ mod mobile;
 mod mouse_selection;
 mod popup_focus_projection;
 mod regents_channels;
+mod regents_threads;
 mod regents_workspaces;
 mod startup_overlays;

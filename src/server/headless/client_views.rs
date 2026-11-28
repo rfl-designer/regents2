@@ -228,6 +228,7 @@ impl HeadlessServer {
         matches!(
             method,
             Method::ChannelOpen(_)
+                | Method::ThreadOpen(_)
                 | Method::CommandInvoke(_)
                 | Method::PaneClose(_)
                 | Method::PaneEditScrollback(_)
@@ -251,6 +252,7 @@ impl HeadlessServer {
             method,
             Method::AgentFocus(_)
                 | Method::ChannelOpen(_)
+                | Method::ThreadOpen(_)
                 | Method::CommandInvoke(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)
@@ -293,6 +295,7 @@ impl HeadlessServer {
             method,
             Method::AgentFocus(_)
                 | Method::ChannelOpen(_)
+                | Method::ThreadOpen(_)
                 | Method::CommandInvoke(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)

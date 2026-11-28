@@ -20,8 +20,10 @@ impl App {
         self.state
             .direct_attach_resize_locks
             .remove(&popup.terminal_id);
-        self.state.terminals.remove(&popup.terminal_id);
-        self.shutdown_terminal_runtime(popup.terminal_id);
+        if !popup.thread {
+            self.state.terminals.remove(&popup.terminal_id);
+            self.shutdown_terminal_runtime(popup.terminal_id);
+        }
         self.state.mode = if self.state.active.is_some() {
             Mode::Terminal
         } else {
@@ -164,6 +166,7 @@ impl App {
             terminal_id,
             width: geometry.width,
             height: geometry.height,
+            thread: false,
         });
         self.state.mode = Mode::Terminal;
         Ok(())
@@ -188,6 +191,7 @@ impl App {
             terminal_id: terminal_id.clone(),
             width: None,
             height: None,
+            thread: false,
         });
         (pane_id, terminal_id)
     }
@@ -219,6 +223,7 @@ mod tests {
             terminal_id,
             width: None,
             height: None,
+            thread: false,
         });
         app
     }

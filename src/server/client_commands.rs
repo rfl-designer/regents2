@@ -259,6 +259,16 @@ mod tests {
             actual.remove("channel.open").as_deref(),
             Some("c948931542fbc12dde5cd828d95843ce75bc82a21a5e1e744ef8a12b87dd3161")
         );
+        // Regents (#11): the sidebar opens a thread as a popup, and a click
+        // outside a thread popup closes it.
+        assert_eq!(
+            actual.remove("thread.open").as_deref(),
+            Some("24743b6fd220acc48c6f23dd18c1f757d7cd978a55008e7c6dfa02cdcc387c58")
+        );
+        assert_eq!(
+            actual.remove("popup.close").as_deref(),
+            Some("776d774a3cfd2da2ce9d937ac58549e6022f0c265832c67c7dd9bf300955d304")
+        );
 
         assert_eq!(
             actual, expected,

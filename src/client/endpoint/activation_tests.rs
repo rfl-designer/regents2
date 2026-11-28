@@ -68,6 +68,7 @@ fn test_snapshot(boot_id: &str, revision: u64) -> crate::protocol::ClientShellSn
         agents: Vec::new(),
         commands: Vec::new(),
         workspace_add_command: None,
+        thread_popup: false,
     }
 }
 
@@ -440,6 +441,7 @@ fn activation_requires_an_exact_snapshot_surface_revision_pair() {
         agents: Vec::new(),
         commands: Vec::new(),
         workspace_add_command: None,
+        thread_popup: false,
     };
     assert_eq!(
         activation.receive_snapshot(&target, 7, &snapshot),

@@ -157,6 +157,10 @@ pub struct App {
     /// Regents: next periodic check of the open workspace folders; `None`
     /// until the first check.
     next_folder_connection_check: Option<Instant>,
+    /// Regents: the thread registry of each connected open folder workspace,
+    /// by folder ID. Refreshed with `folder_channels` and after each thread
+    /// registry write, never during render.
+    folder_threads: HashMap<String, Vec<crate::regents::threads::ThreadRecord>>,
     /// Regents: threads whose agent CLI runs, by their background pane.
     pub(crate) running_threads: HashMap<crate::layout::PaneId, threads::RunningThread>,
     /// Regents: thread panes whose CLI process the server stopped; their
@@ -690,6 +694,7 @@ impl App {
             reopen_excluded_folders: Vec::new(),
             disconnected_folders: HashSet::new(),
             folder_channels: HashMap::new(),
+            folder_threads: HashMap::new(),
             unread_channels: HashMap::new(),
             next_folder_connection_check: None,
             running_threads: HashMap::new(),

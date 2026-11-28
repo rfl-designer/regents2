@@ -146,6 +146,12 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
             run_json_request(thread_bindings::agent_request(&args[2..]))?
         }
         "agent" => agent::run_agent_command(&args[2..])?,
+        "thread"
+            if crate::build_info::is_regents()
+                && args.get(2).map(String::as_str) == Some(thread_bindings::OUTPUT_COMMAND) =>
+        {
+            thread_bindings::run_output(&args[3..])?
+        }
         "thread" if crate::build_info::is_regents() => {
             run_json_request(thread_bindings::thread_request(&args[2..]))?
         }

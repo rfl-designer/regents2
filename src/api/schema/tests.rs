@@ -1563,6 +1563,7 @@ fn thread_info_keeps_optional_fields_out_and_tolerates_newer_servers() {
         depth: 0,
         isolation: None,
         state: ThreadState::Done,
+        agent_status: None,
         end_reason: None,
         session_id: None,
         pane_id: None,

@@ -4763,6 +4763,25 @@
           },
           "type": "object"
         },
+        "ThreadOpenParams": {
+          "properties": {
+            "thread_id": {
+              "description": "Thread ID, for example `t1`.",
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Workspace of the thread: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "thread_id"
+          ],
+          "type": "object"
+        },
         "ToastHerdrPosition": {
           "enum": [
             "top-left",
@@ -6901,6 +6920,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/ThreadListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "thread.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ThreadOpenParams"
             }
           },
           "required": [
@@ -11827,6 +11862,17 @@
             "agent": {
               "description": "Name of the agent that the thread runs.",
               "type": "string"
+            },
+            "agent_status": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Detected state of the agent CLI while the thread is active."
             },
             "channel": {
               "description": "Channel of the mention that opened the thread.",

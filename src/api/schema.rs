@@ -131,7 +131,7 @@ operations::define_operations! {
     PaneClearAgentAuthority(PaneClearAgentAuthorityParams) => "pane.clear_agent_authority", true, false;
     PaneReleaseAgent(PaneReleaseAgentParams) => "pane.release_agent", true, false;
     PaneClose(PaneTarget) => "pane.close", true, true;
-    PopupClose(EmptyParams) => "popup.close", true, false;
+    PopupClose(EmptyParams) => "popup.close", true, true;
     EventsSubscribe(EventsSubscribeParams) => "events.subscribe", false, false;
     EventsWait(EventsWaitParams) => "events.wait", false, false;
     PaneWaitForOutput(PaneWaitForOutputParams) => "pane.wait_for_output", false, false;
@@ -157,6 +157,7 @@ operations::define_operations! {
     ChannelPost(ChannelPostParams) => "channel.post", false, false;
     ChannelRead(ChannelReadParams) => "channel.read", false, false;
     ThreadList(ThreadListParams) => "thread.list", false, false;
+    ThreadOpen(ThreadOpenParams) => "thread.open", true, true;
     AgentDefinitionList(AgentDefinitionListParams) => "agent.definition.list", false, false;
     ChannelOpen(ChannelOpenParams) => "channel.open", true, true;
     ChannelCreate(ChannelCreateParams) => "channel.create", false, false;

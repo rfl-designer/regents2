@@ -644,6 +644,45 @@ async fn render_scale_profile() {
 async fn thread_render_scale_profile() {
     print_profiles("hidden thread panes (one visible pane)", background_threads);
     print_snapshot_encoding_profiles("hidden thread panes", background_threads);
+    print_thread_index_profiles();
+}
+
+/// The same hidden thread panes registered as running threads, so the client
+/// snapshot carries the thread index and the agents section draws its rows.
+fn print_thread_index_profiles() {
+    println!("registered threads: snapshot construction + client composition");
+    println!("     threads  snapshot_us  snapshot_vs_1x  pipeline_median_us  pipeline_vs_1x");
+    let mut baseline = None;
+    for count in CARDINALITIES {
+        let mut pipeline = RenderPipeline::new(background_threads(count));
+        pipeline.app.state.ensure_test_terminals();
+        pipeline.app.register_test_threads(0);
+        let snapshot = || super::client_shell::snapshot(&pipeline.app, "bench-boot", 1, None, None);
+        for _ in 0..WARMUP_COUNT {
+            black_box(snapshot());
+        }
+        let construction = summarize(
+            (0..SAMPLE_COUNT)
+                .map(|_| {
+                    let started = Instant::now();
+                    black_box(snapshot());
+                    started.elapsed()
+                })
+                .collect(),
+        );
+        let projected = snapshot();
+        assert_eq!(projected.workspaces[0].threads.len(), count);
+        pipeline.client.set_snapshot(Box::new(projected));
+        let total = profile_pipeline(pipeline).total;
+        let (snapshot_1x, total_1x) = *baseline.get_or_insert((construction, total));
+        println!(
+            "  {count:>10}  {:>11}  {:>14.2}  {:>18}  {:>14.2}",
+            construction.median_us,
+            construction.median_us as f64 / snapshot_1x.median_us.max(1) as f64,
+            total.median_us,
+            total.median_us as f64 / total_1x.median_us.max(1) as f64,
+        );
+    }
 }
 
 /// Dirty-row collection while output scrolls a large pane, the host's hot path

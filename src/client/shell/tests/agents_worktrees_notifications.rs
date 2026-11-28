@@ -120,6 +120,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
         disconnected: false,
         channels: Vec::new(),
         unread_channels: Vec::new(),
+        threads: Vec::new(),
     });
     state.set_snapshot(Box::new(snapshot));
     state.set_pane_surface(surface());

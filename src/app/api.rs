@@ -212,11 +212,12 @@ impl App {
 
         let mut worktree_restore_updates = Vec::new();
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
+            // A thread popup closes with its thread, below.
             if self
                 .state
                 .popup_pane
                 .as_ref()
-                .is_some_and(|popup| popup.pane_id == *pane_id)
+                .is_some_and(|popup| !popup.thread && popup.pane_id == *pane_id)
             {
                 self.close_popup_pane();
                 return Vec::new();
@@ -1287,6 +1288,9 @@ impl App {
             }
             Method::ThreadList(params) => {
                 return self.handle_thread_list(request.id, params);
+            }
+            Method::ThreadOpen(params) => {
+                return self.handle_thread_open(request.id, params);
             }
             Method::AgentDefinitionList(params) => {
                 return self.handle_agent_definition_list(request.id, params);

@@ -73,8 +73,16 @@ pub(super) fn snapshot_with_completions(
                     .and_then(|(tab_workspace_index, tab_index)| {
                         (tab_workspace_index == workspace_index).then_some(tab_index)
                     });
+            let focused = focused_workspace_id.as_deref() == Some(workspace_id.as_str());
             protocol::ClientShellWorkspace {
-                focused: focused_workspace_id.as_deref() == Some(workspace_id.as_str()),
+                // Every render builds the snapshot, and the sidebar shows only
+                // the threads of the focused workspace.
+                threads: if focused {
+                    app.workspace_thread_infos(workspace_index)
+                } else {
+                    Vec::new()
+                },
+                focused,
                 workspace_id,
                 active_tab_id,
                 new_workspace_cwd: app
@@ -268,6 +276,7 @@ pub(super) fn snapshot_with_completions(
         agents,
         commands: app.client_shell_command_manifest(),
         workspace_add_command: app.workspace_add_command(),
+        thread_popup: app.popup_shows_thread(),
     };
     (shell, completions)
 }
@@ -633,6 +642,42 @@ fn split_hit_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_focused_workspace_carries_its_threads() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut threads = crate::workspace::Workspace::test_new("threads");
+        let reserved = threads.reserve_background_pane_number();
+        threads.insert_background_pane(
+            reserved,
+            crate::layout::PaneId::alloc(),
+            crate::pane::PaneState::new(crate::terminal::TerminalId::alloc()),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("other"), threads];
+        app.state.active = Some(0);
+        app.register_test_threads(1);
+        let thread_counts = |app: &crate::app::App| {
+            snapshot(app, "boot", 1, None, None)
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.threads.len())
+                .collect::<Vec<_>>()
+        };
+
+        let unfocused = thread_counts(&app);
+        app.state.active = Some(1);
+        let focused = thread_counts(&app);
+
+        assert_eq!(unfocused, [0, 0]);
+        assert_eq!(focused, [0, 1]);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_metadata_skips_scroll_reads_and_preserves_public_session_data() {

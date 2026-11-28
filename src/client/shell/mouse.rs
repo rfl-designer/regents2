@@ -914,6 +914,24 @@ impl ClientShellState {
             return;
         }
         if let Some(hit) = self.hits.popup.clone() {
+            let thread_popup = self
+                .snapshot
+                .as_deref()
+                .is_some_and(|snapshot| snapshot.thread_popup);
+            if thread_popup
+                && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && !super::contains(hit.rect, point)
+            {
+                // Regents: a thread popup closes on a click outside it; the
+                // thread keeps running.
+                self.push_endpoint_method(
+                    crate::api::schema::Method::PopupClose(
+                        crate::api::schema::EmptyParams::default(),
+                    ),
+                    outcome,
+                );
+                return;
+            }
             if super::contains(hit.inner_rect, point) {
                 match mouse.kind {
                     MouseEventKind::Down(button) => {
@@ -2158,6 +2176,25 @@ impl ClientShellState {
                         crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
                             pane_id,
                         }),
+                        outcome,
+                    );
+                    return;
+                }
+                let thread = self
+                    .hits
+                    .threads
+                    .iter()
+                    .find(|(rect, _, _)| super::contains(*rect, point))
+                    .map(|(_, workspace_id, thread_id)| (workspace_id.clone(), thread_id.clone()));
+                if let Some((workspace_id, thread_id)) = thread {
+                    self.mode = ClientShellMode::Terminal;
+                    self.push_endpoint_method(
+                        crate::api::schema::Method::ThreadOpen(
+                            crate::api::schema::ThreadOpenParams {
+                                workspace_id: Some(workspace_id),
+                                thread_id,
+                            },
+                        ),
                         outcome,
                     );
                     return;

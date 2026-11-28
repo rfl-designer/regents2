@@ -11,6 +11,9 @@ use super::store;
 use crate::detect::AgentState;
 
 const DATABASE_FILE: &str = "threads.sqlite";
+/// Folder of `.regents` with the last output of each ended thread, one
+/// `<id>.ansi` file per thread.
+const OUTPUT_DIR: &str = "thread-output";
 const ID_PREFIX: &str = "t";
 const SCHEMA: store::Schema = store::Schema {
     version: 1,
@@ -269,16 +272,26 @@ impl ThreadRegistry {
 
     /// Every thread, oldest first. Without a registry file there is none.
     pub(crate) fn list(&self) -> Result<Vec<ThreadRecord>, ThreadError> {
+        self.query("ORDER BY id ASC", -1)
+    }
+
+    /// The `limit` newest threads, newest first.
+    pub(crate) fn recent(&self, limit: usize) -> Result<Vec<ThreadRecord>, ThreadError> {
+        self.query("ORDER BY id DESC", i64::try_from(limit).unwrap_or(i64::MAX))
+    }
+
+    /// Threads in `order`, at most `limit` (-1: all).
+    fn query(&self, order: &str, limit: i64) -> Result<Vec<ThreadRecord>, ThreadError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
         let connection = store::open_read_only(&self.path)?;
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&format!(
             "SELECT id, agent, cli, origin_kind, channel, origin_message_id, opener_thread_id,
                     depth, isolation, state, end_reason, session_id, created_at, updated_at
-             FROM threads ORDER BY id ASC",
-        )?;
-        let rows = statement.query_map([], |row| {
+             FROM threads {order} LIMIT ?1"
+        ))?;
+        let rows = statement.query_map([limit], |row| {
             Ok(ThreadRecord {
                 id: format!("{ID_PREFIX}{}", row.get::<_, i64>(0)?),
                 agent: row.get(1)?,
@@ -303,6 +316,38 @@ impl ThreadRegistry {
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+}
+
+fn output_path(state_dir: &Path, id: &str) -> Option<PathBuf> {
+    // Only a valid ID names a file, so an ID cannot leave the folder.
+    parse_id(id).ok()?;
+    Some(state_dir.join(OUTPUT_DIR).join(format!("{id}.ansi")))
+}
+
+/// Records `text`, the last output of the thread `id`, as it ended.
+pub(crate) fn write_output(state_dir: &Path, id: &str, text: &str) -> std::io::Result<()> {
+    let path = output_path(state_dir, id)
+        .ok_or_else(|| std::io::Error::other(format!("invalid thread id {id:?}")))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)
+}
+
+pub(crate) fn has_output(state_dir: &Path, id: &str) -> bool {
+    output_path(state_dir, id).is_some_and(|path| path.is_file())
+}
+
+/// The recorded output of the thread `id` of the workspace folder that
+/// holds `dir`.
+pub(crate) fn read_output_from(dir: &Path, id: &str) -> Option<String> {
+    let root = dir.ancestors().find(|ancestor| {
+        ancestor
+            .join(super::folder::STATE_DIR)
+            .join(super::folder::MANIFEST_FILE)
+            .is_file()
+    })?;
+    std::fs::read_to_string(output_path(&root.join(super::folder::STATE_DIR), id)?).ok()
 }
 
 fn parse_id(id: &str) -> Result<i64, ThreadError> {
@@ -490,6 +535,52 @@ mod tests {
         assert_eq!(listed[0].session_id.as_deref(), Some("session-1"));
         assert_eq!(listed[0].updated_at, "2026-11-27T18:04:10Z");
         assert_eq!(listed[1], second);
+    }
+
+    #[test]
+    fn the_output_of_a_thread_reads_back_from_inside_the_folder() {
+        let folder = TempFolder::new("threads-output");
+        let state_dir = folder.0.join(super::super::folder::STATE_DIR);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join(super::super::folder::MANIFEST_FILE), "").unwrap();
+        let inside = folder.0.join("src");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(!has_output(&state_dir, "t1"));
+
+        write_output(&state_dir, "t1", "\x1b[1mfeito\x1b[0m").unwrap();
+
+        assert!(has_output(&state_dir, "t1"));
+        assert_eq!(
+            read_output_from(&inside, "t1").as_deref(),
+            Some("\x1b[1mfeito\x1b[0m")
+        );
+        assert_eq!(read_output_from(&inside, "t2"), None);
+        for invalid in ["../t1", "t1/../t1", "x"] {
+            assert!(write_output(&state_dir, invalid, "x").is_err());
+            assert_eq!(read_output_from(&inside, invalid), None);
+        }
+    }
+
+    #[test]
+    fn recent_reads_the_newest_threads_first() {
+        let folder = TempFolder::new("threads-recent");
+        let registry = registry(&folder.0);
+        for message in 1..=3 {
+            registry.create(mention("chief", message), at(0)).unwrap();
+        }
+
+        let ids = |limit| -> Vec<String> {
+            registry
+                .recent(limit)
+                .unwrap()
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect()
+        };
+
+        assert_eq!(ids(2), ["t3", "t2"]);
+        assert_eq!(ids(9), ["t3", "t2", "t1"]);
+        assert_eq!(registry.list().unwrap().len(), 3);
     }
 
     #[test]
