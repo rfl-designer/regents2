@@ -22,6 +22,7 @@ fn thread(id: &str, agent: &str, channel: &str, state: ThreadState) -> ThreadInf
         end_reason: None,
         session_id: None,
         turn: 0,
+        queue_position: None,
         pane_id: None,
         created_at: "2026-11-27T18:04:05Z".into(),
         updated_at: "2026-11-27T18:04:05Z".into(),
@@ -201,4 +202,64 @@ fn a_blocked_thread_stands_out_in_the_index_until_it_works_again() {
 
     assert_ne!(blocked, working);
     assert_eq!(working, idle, "only a block changes the agent color");
+}
+
+#[test]
+fn a_queued_thread_shows_its_place_and_that_the_queue_waits_for_an_approval() {
+    let queued = |id: &str, position| ThreadInfo {
+        queue_position: Some(position),
+        ..thread(id, "reviewer", "geral", ThreadState::Queued)
+    };
+    let mut waiting = state_with_threads(
+        vec![
+            queued("t3", 2),
+            queued("t2", 1),
+            thread("t1", "chief", "geral", ThreadState::Active),
+        ],
+        surface(),
+    );
+    let lines = sidebar_lines(&mut waiting);
+    let line = |lines: &[String], text: &str| {
+        lines
+            .iter()
+            .find(|line| line.contains(text))
+            .cloned()
+            .unwrap_or_else(|| panic!("no {text} row: {lines:#?}"))
+    };
+    assert!(
+        line(&lines, "@reviewer t2").contains("queue 1"),
+        "{lines:#?}"
+    );
+    assert!(
+        line(&lines, "@reviewer t3").contains("queue 2"),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("approval")),
+        "{lines:#?}"
+    );
+
+    let blocked = ThreadInfo {
+        agent_status: Some(AgentStatus::Blocked),
+        ..thread("t1", "chief", "geral", ThreadState::Active)
+    };
+    let mut blocked = state_with_threads(vec![queued("t2", 1), blocked], surface());
+    let lines = sidebar_lines(&mut blocked);
+    let note = lines
+        .iter()
+        .position(|line| line.contains("queue awaits approval"))
+        .unwrap_or_else(|| panic!("no approval note: {lines:#?}"));
+    let geral = lines
+        .iter()
+        .position(|line| line.contains("#geral"))
+        .unwrap();
+    assert_eq!(
+        note + 1,
+        geral,
+        "the note comes before the threads: {lines:#?}"
+    );
+    assert!(
+        line(&lines, "@reviewer t2").contains("queue 1"),
+        "{lines:#?}"
+    );
 }

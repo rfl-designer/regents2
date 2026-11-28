@@ -13,11 +13,9 @@ const CHANNELS_DIR: &str = "channels";
 const DATABASE_FILE: &str = "channel.sqlite";
 /// Author ID of the system messages.
 const SYSTEM_AUTHOR: &str = "regents";
-/// The SQL brings a database of any older version to this one: the table
-/// keeps its version 1 form and each version appends its changes.
 const SCHEMA: store::Schema = store::Schema {
-    version: 2,
-    sql: "CREATE TABLE IF NOT EXISTS messages (
+    steps: &[
+        "CREATE TABLE IF NOT EXISTS messages (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              author_kind TEXT NOT NULL,
              author_id TEXT NOT NULL,
@@ -27,10 +25,11 @@ const SCHEMA: store::Schema = store::Schema {
              -- JSON array of the mentioned agent names.
              mentions TEXT NOT NULL DEFAULT '[]',
              created_at TEXT NOT NULL
-         );
-         -- Version 2: `<thread>#<turn>` of a captured reply, NULL for a post.
-         ALTER TABLE messages ADD COLUMN capture_key TEXT;
+         );",
+        // Version 2: `<thread>#<turn>` of a captured reply, NULL for a post.
+        "ALTER TABLE messages ADD COLUMN capture_key TEXT;
          CREATE UNIQUE INDEX messages_capture_key ON messages(capture_key);",
+    ],
 };
 
 /// The channel that a chat pane shows: the pane runs the chat view of this

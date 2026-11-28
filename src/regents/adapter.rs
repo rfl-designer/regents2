@@ -111,6 +111,12 @@ pub(crate) fn screen_reply(screen: &str) -> Option<String> {
     (!reply.is_empty()).then(|| reply.to_owned())
 }
 
+/// True when threads of `cli` can start: `launch_argv` and `resume_argv`
+/// give a command line.
+pub(crate) fn has_thread_adapter(cli: AgentCli) -> bool {
+    matches!(cli, AgentCli::Claude)
+}
+
 /// The command line of a new thread of `agent`, or `None` when the CLI of the
 /// agent has no adapter yet. `session_id` names the CLI session, so the thread
 /// can resume it later (`claude --resume <id>`).

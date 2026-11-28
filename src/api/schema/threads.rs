@@ -116,6 +116,10 @@ pub struct ThreadInfo {
     /// the thread adds one.
     #[serde(default)]
     pub turn: u32,
+    /// Place of a queued thread in the thread queue of its workspace, from
+    /// 1. Absent for the other states and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<u32>,
     /// Pane that runs the CLI while the thread is active. The pane is in
     /// no tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]

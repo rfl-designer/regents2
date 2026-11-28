@@ -71,11 +71,11 @@ Uma execução de um agente. Uma thread pode ser de canal (aberta por menção, 
 _Avoid_: Job, task, sessão
 
 **Conversa direta**:
-Thread que você abre com um agente, fora de um canal, num pane visível em que você usa a CLI do agente diretamente.
+Thread que você abre com um agente, fora de um canal, num pane visível em que você usa a CLI do agente diretamente. Uma conversa direta não ocupa vaga do limite de threads ativas e não entra na fila de threads.
 _Avoid_: DM, chat privado
 
 **Thread ativa**:
-Thread que ainda não terminou. Quando o mesmo agente recebe uma nova menção no mesmo canal, a thread ativa decide se absorve a menção ou se o Regents abre uma thread nova.
+Thread cuja CLI executa agora, também quando ela espera uma aprovação. Uma thread na fila não é ativa. Cada thread ativa de canal ocupa uma vaga do limite de threads ativas (`max_active_threads` em `workspace.toml`). Quando o mesmo agente recebe uma nova menção no mesmo canal, a thread ativa decide se absorve a menção ou se o Regents abre uma thread nova.
 _Avoid_: Thread aberta, thread viva
 
 **Thread interrompida**:
@@ -83,7 +83,7 @@ Thread ativa que parou porque o Regents reiniciou. Ela só continua quando algu�
 _Avoid_: Thread morta, falha
 
 **Fila de threads**:
-Threads que esperam porque o workspace está no limite de threads ativas.
+Threads que esperam porque o workspace está no limite de threads ativas. A fila é FIFO. Uma menção nova ao agente de uma thread da fila, no mesmo canal, não abre uma thread nova: a thread da fila absorve a menção. Um resume também passa pela fila.
 _Avoid_: Backlog, pendentes
 
 **Cadeia de delegação**:

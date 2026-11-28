@@ -168,6 +168,9 @@ pub struct App {
     /// by folder ID. Refreshed with `folder_channels` and after each thread
     /// registry write, never during render.
     folder_threads: HashMap<String, Vec<crate::regents::threads::ThreadRecord>>,
+    /// Folder workspaces whose threads of a stopped server this process
+    /// already marked interrupted.
+    recovered_thread_folders: HashSet<String>,
     /// Regents: threads whose agent CLI runs, by their background pane.
     pub(crate) running_threads: HashMap<crate::layout::PaneId, threads::RunningThread>,
     /// Regents: thread panes whose CLI process the server stopped; their
@@ -705,6 +708,7 @@ impl App {
             disconnected_folders: HashSet::new(),
             folder_channels: HashMap::new(),
             folder_threads: HashMap::new(),
+            recovered_thread_folders: HashSet::new(),
             unread_channels: HashMap::new(),
             next_folder_connection_check: None,
             running_threads: HashMap::new(),

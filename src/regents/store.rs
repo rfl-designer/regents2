@@ -10,11 +10,11 @@ use rusqlite::Connection;
 /// runs on the server loop: keep this small until it moves to a worker.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// The schema of a database: `sql` creates version `version` from an empty
-/// database. `PRAGMA user_version` records the version.
+/// The schema of a database: `steps[n]` brings version `n` to `n + 1`, so
+/// the version is the number of steps and an empty database is version 0.
+/// `PRAGMA user_version` records the version.
 pub(crate) struct Schema {
-    pub(crate) version: i64,
-    pub(crate) sql: &'static str,
+    pub(crate) steps: &'static [&'static str],
 }
 
 /// Opens `path` for writing, creates it when it is missing and brings its
@@ -25,15 +25,21 @@ pub(crate) fn open_writable(path: &Path, schema: &Schema) -> rusqlite::Result<Co
     let version = |connection: &Connection| -> rusqlite::Result<i64> {
         connection.query_row("PRAGMA user_version", [], |row| row.get(0))
     };
-    if version(&connection)? < schema.version {
+    let target = schema.steps.len() as i64;
+    if version(&connection)? < target {
         // Another connection can migrate first: read the version again
-        // under the write lock, so the ALTERs of `sql` run once.
+        // under the write lock, so each step runs once.
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if version(&transaction)? < schema.version {
+        let current = usize::try_from(version(&transaction)?).unwrap_or(0);
+        if let Some(steps) = schema
+            .steps
+            .get(current..)
+            .filter(|steps| !steps.is_empty())
+        {
             transaction.execute_batch(&format!(
-                "{}\nPRAGMA user_version = {};",
-                schema.sql, schema.version
+                "{}\nPRAGMA user_version = {target};",
+                steps.join("\n")
             ))?;
         }
         transaction.commit()?;

@@ -85,7 +85,7 @@ pub(super) fn render_agent_panel(
         hits,
         |row| match row {
             PanelRow::Agent(row) => row.rows.len(),
-            PanelRow::Channel(_) | PanelRow::Thread(_) => 1,
+            PanelRow::Channel(_) | PanelRow::Thread(_) | PanelRow::QueueAwaitsApproval => 1,
         },
         |buffer, rect, row, hits| match row {
             PanelRow::Agent(row) => {
@@ -105,6 +105,17 @@ pub(super) fn render_agent_panel(
                     .push((rect, row.workspace_id.clone(), row.thread_id.clone()));
                 render_thread_row(buffer, rect, row, config);
             }
+            PanelRow::QueueAwaitsApproval => put_text(
+                buffer,
+                rect.x.saturating_add(1),
+                rect.y,
+                rect.width.saturating_sub(1),
+                "queue awaits approval",
+                Style::default().fg(status_color(
+                    crate::api::schema::AgentStatus::Blocked,
+                    &config.palette,
+                )),
+            ),
         },
     );
 }
@@ -115,6 +126,9 @@ pub(super) enum PanelRow {
     Agent(AgentRow),
     Channel(String),
     Thread(ThreadRow),
+    /// Regents: a blocked thread holds a slot while threads wait in the
+    /// queue.
+    QueueAwaitsApproval,
 }
 
 pub(super) struct ThreadRow {
@@ -122,7 +136,7 @@ pub(super) struct ThreadRow {
     thread_id: String,
     agent: String,
     status: crate::api::schema::AgentStatus,
-    state_text: &'static str,
+    state_text: std::borrow::Cow<'static, str>,
 }
 
 /// Regents: the threads of the focused workspace, grouped by channel. The
@@ -142,6 +156,13 @@ pub(super) fn thread_rows(snapshot: &ClientShellSnapshot) -> Vec<PanelRow> {
         Some(channel) => format!("#{channel}"),
         None => "direct".to_owned(),
     };
+    let queued = workspace
+        .threads
+        .iter()
+        .any(|thread| thread.state == ThreadState::Queued);
+    let blocked = workspace.threads.iter().any(|thread| {
+        thread.state == ThreadState::Active && thread.agent_status == Some(AgentStatus::Blocked)
+    });
     let mut groups: Vec<String> = Vec::new();
     for thread in &workspace.threads {
         let name = group(thread);
@@ -150,6 +171,9 @@ pub(super) fn thread_rows(snapshot: &ClientShellSnapshot) -> Vec<PanelRow> {
         }
     }
     let mut rows = Vec::new();
+    if queued && blocked {
+        rows.push(PanelRow::QueueAwaitsApproval);
+    }
     for name in groups {
         let threads = workspace
             .threads
@@ -167,6 +191,12 @@ pub(super) fn thread_rows(snapshot: &ClientShellSnapshot) -> Vec<PanelRow> {
                 ThreadState::Interrupted => (AgentStatus::Unknown, "interrupted"),
                 ThreadState::Failed => (AgentStatus::Unknown, "failed"),
                 ThreadState::Unknown => (AgentStatus::Unknown, "unknown"),
+            };
+            // The place in the queue takes the place of the state: it fits
+            // a narrow sidebar.
+            let state_text = match (thread.state, thread.queue_position) {
+                (ThreadState::Queued, Some(position)) => format!("queue {position}").into(),
+                _ => state_text.into(),
             };
             rows.push(PanelRow::Thread(ThreadRow {
                 workspace_id: workspace.workspace_id.clone(),
@@ -207,7 +237,7 @@ fn render_thread_row(buffer: &mut Buffer, rect: Rect, row: &ThreadRow, config: &
             format!("{} ", row.thread_id),
             Style::default().fg(palette.overlay0),
         ),
-        ratatui::text::Span::styled(row.state_text, state_style),
+        ratatui::text::Span::styled(row.state_text.clone(), state_style),
     ];
     Paragraph::new(Line::from(spans)).render(rect, buffer);
 }

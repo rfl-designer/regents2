@@ -12033,6 +12033,15 @@
                 "null"
               ]
             },
+            "queue_position": {
+              "description": "Place of a queued thread in the thread queue of its workspace, from\n1. Absent for the other states and from older servers.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "session_id": {
               "description": "Session of the agent CLI, to resume the thread.",
               "type": [

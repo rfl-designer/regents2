@@ -359,7 +359,6 @@ impl App {
         self.open_mention_threads(
             index,
             &state_dir,
-            &channel,
             &posted,
             &agents,
             replied_agent.as_deref(),
@@ -506,8 +505,9 @@ impl App {
     }
 
     /// Lists the channels and the threads of each connected open folder
-    /// workspace again. It reads one directory and one database per folder
-    /// workspace: call it with the folder
+    /// workspace again, and drains their thread queues. It reads one
+    /// directory, one manifest and one database per folder workspace: call
+    /// it with the folder
     /// checks (load, list, bind and the periodic check), never from render.
     pub(crate) fn refresh_folder_channels(&mut self) {
         let channels: std::collections::HashMap<String, Vec<String>> = self
@@ -526,6 +526,7 @@ impl App {
             self.render_dirty.request_generic();
         }
         self.refresh_folder_threads();
+        self.check_folder_thread_queues();
     }
 
     /// Channel names of the workspace at `index`, as of the last refresh. It

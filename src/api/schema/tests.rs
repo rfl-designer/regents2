@@ -1572,6 +1572,7 @@ fn thread_info_keeps_optional_fields_out_and_tolerates_newer_servers() {
         end_reason: None,
         session_id: None,
         turn: 0,
+        queue_position: None,
         pane_id: None,
         created_at: "2026-11-27T18:04:05Z".into(),
         updated_at: "2026-11-27T18:04:06Z".into(),

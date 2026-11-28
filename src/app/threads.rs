@@ -14,10 +14,10 @@ use crate::app::App;
 use crate::layout::PaneId;
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::regents::adapter;
-use crate::regents::agents::{AgentCli, AgentDefinition, Isolation};
+use crate::regents::agents::{self, AgentCli, AgentDefinition, Isolation};
 use crate::regents::channel::{self, AuthorKind, Capture, Channel, Message, ReadRange};
 use crate::regents::threads::{
-    self, NewThread, ThreadOrigin, ThreadProgress, ThreadState, ThreadStep,
+    self, Admission, NewThread, ThreadOrigin, ThreadProgress, ThreadRecord, ThreadState, ThreadStep,
 };
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 
@@ -35,6 +35,11 @@ pub(crate) const INDEX_THREADS: usize = 50;
 /// Lines of the last output that an ended thread keeps.
 const OUTPUT_LINES: usize = 1000;
 const SERVER_HANDOFF: &str = "the server handed off to a new process";
+const SERVER_RESTARTED: &str = "the server that ran it stopped";
+const WORKSPACE_CLOSED: &str = "the workspace closed";
+/// Most queued threads that one drain takes: each step starts a thread or
+/// ends one that cannot start, and the next admission point goes on.
+const MAX_DRAIN_STEPS: usize = 64;
 
 /// A thread whose agent CLI runs.
 #[derive(Debug)]
@@ -76,16 +81,15 @@ pub(crate) fn mention_prompt(channel: &Channel, message: &Message) -> String {
 }
 
 impl App {
-    /// Opens one thread for each agent that `message` mentions, except
-    /// `replied_agent`, whose thread the message answers. A thread that
-    /// cannot open is logged; the message stays posted. A message posted
-    /// from a thread opens none: delegation, with its opener and depth
-    /// limit, is #18.
+    /// Admits one thread for each agent that `message` mentions, except
+    /// `replied_agent`, whose thread the message answers, then drains the
+    /// queue. A thread that cannot be admitted is logged; the message stays
+    /// posted. A message posted from a thread opens none: delegation, with
+    /// its opener and depth limit, is #18.
     pub(crate) fn open_mention_threads(
         &mut self,
         ws_idx: usize,
         state_dir: &Path,
-        channel: &Channel,
         message: &Message,
         agents: &[AgentDefinition],
         replied_agent: Option<&str>,
@@ -93,7 +97,6 @@ impl App {
         if message.mentions.is_empty() || message.origin_thread_id.is_some() {
             return;
         }
-        let prompt = mention_prompt(channel, message);
         for name in &message.mentions {
             if replied_agent == Some(name.as_str()) {
                 continue;
@@ -101,22 +104,23 @@ impl App {
             let Some(agent) = agents.iter().find(|agent| &agent.name == name) else {
                 continue;
             };
-            if let Err(err) = self.open_thread(ws_idx, state_dir, agent, &prompt, message) {
-                tracing::warn!(agent = %agent.name, %err, "cannot open a thread");
+            if let Err(err) = self.admit_mention(ws_idx, state_dir, agent, message) {
+                tracing::warn!(agent = %agent.name, %err, "cannot admit a thread");
             }
         }
+        self.drain_thread_queue(state_dir);
     }
 
-    fn open_thread(
+    /// The admission of a mention of `agent`: a new queued thread, or the
+    /// mention moves the anchor of its queued thread in the channel.
+    fn admit_mention(
         &mut self,
         ws_idx: usize,
         state_dir: &Path,
         agent: &AgentDefinition,
-        prompt: &str,
         origin: &Message,
-    ) -> Result<PaneId, String> {
-        let session_id = adapter::new_session_id();
-        let Some(argv) = adapter::launch_argv(agent, prompt, &session_id) else {
+    ) -> Result<(), String> {
+        if !adapter::has_thread_adapter(agent.cli) {
             let reason = format!("the {} CLI has no thread adapter yet", agent.cli.as_str());
             self.post_system_message(
                 Some(ws_idx),
@@ -126,7 +130,7 @@ impl App {
                 format!("a thread de @{} não iniciou: {reason}", agent.name),
             );
             return Err(reason);
-        };
+        }
         let thread = NewThread {
             agent: agent.name.clone(),
             cli: agent.cli,
@@ -136,13 +140,234 @@ impl App {
             opener_thread_id: None,
             depth: 0,
             // Worktree isolation is #24: every thread runs in the folder.
-            isolation: crate::regents::agents::Isolation::Shared,
-            session_id: Some(session_id),
+            isolation: Isolation::Shared,
+            session_id: Some(adapter::new_session_id()),
         };
-        self.launch_thread(ws_idx, state_dir, thread, &argv)
+        let admission = threads::registry(state_dir)
+            .admit_mention(thread, time::OffsetDateTime::now_utc())
+            .map_err(|err| err.to_string())?;
+        if let Admission::Absorbed(thread_id) = &admission {
+            tracing::info!(thread = %thread_id, message = origin.id, "a queued thread absorbed a mention");
+        }
+        self.refresh_folder_threads();
+        Ok(())
     }
 
-    /// Records `thread` and starts `argv` for it in a background pane.
+    /// Starts the queued threads of the workspace whose state directory is
+    /// `state_dir`, oldest first, while fewer than `max_active_threads` take
+    /// a slot. Every end of a thread calls it, and so do the admissions and
+    /// the folder checks. It reads the manifest and the registry: never call
+    /// it from render. A closed workspace fails its queued threads; a
+    /// disconnected one keeps them.
+    pub(crate) fn drain_thread_queue(&mut self, state_dir: &Path) {
+        let Some(ws_idx) = self.folder_workspace_index(state_dir) else {
+            self.fail_queued_threads(state_dir, WORKSPACE_CLOSED);
+            return;
+        };
+        if self.is_disconnected_workspace(ws_idx) {
+            return;
+        }
+        let root = state_dir.parent().unwrap_or(state_dir);
+        let limit = match crate::regents::folder::read_manifest(root) {
+            Ok(manifest) => manifest.max_active_threads,
+            Err(err) => {
+                tracing::warn!(%err, "the thread queue waits for a valid workspace.toml");
+                return;
+            }
+        };
+        let registry = threads::registry(state_dir);
+        for _ in 0..MAX_DRAIN_STEPS {
+            match registry.promote_next(limit, time::OffsetDateTime::now_utc()) {
+                Ok(Some((queued, promoted))) => {
+                    self.start_queued_turn(ws_idx, state_dir, queued, promoted);
+                }
+                Ok(None) => return,
+                Err(err) => {
+                    tracing::warn!(%err, "cannot take a thread from the queue");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The open workspace whose folder has the state directory `state_dir`.
+    fn folder_workspace_index(&self, state_dir: &Path) -> Option<usize> {
+        self.state.workspaces.iter().position(|workspace| {
+            workspace.folder.as_ref().is_some_and(|binding| {
+                binding.root.join(crate::regents::folder::STATE_DIR) == state_dir
+            })
+        })
+    }
+
+    /// Starts the turn of `promoted`, a thread that just left the queue as
+    /// `queued`. A new thread that cannot start fails; a resume that cannot
+    /// start is done again in its previous turn. Both say why in the channel.
+    fn start_queued_turn(
+        &mut self,
+        ws_idx: usize,
+        state_dir: &Path,
+        queued: ThreadRecord,
+        promoted: ThreadRecord,
+    ) {
+        let resumed = queued.turn_message_id.is_some();
+        let (thread_id, agent, channel, turn) = (
+            promoted.id.clone(),
+            promoted.agent.clone(),
+            promoted.channel.clone(),
+            promoted.turn,
+        );
+        let started = queued_turn_argv(state_dir, &queued)
+            .and_then(|argv| self.start_thread(ws_idx, state_dir, promoted, &argv));
+        let registry = threads::registry(state_dir);
+        let body = match started {
+            Ok(_) if resumed => {
+                let message_id = queued.queued_message_id.unwrap_or_default();
+                tracing::info!(thread = %thread_id, turn, message = message_id, "resumed a thread");
+                self.emit_event(EventEnvelope {
+                    event: EventKind::ThreadResumed,
+                    data: EventData::ThreadResumed {
+                        workspace_id: self.public_workspace_id(ws_idx),
+                        thread_id,
+                        turn,
+                        message_id,
+                    },
+                });
+                return;
+            }
+            Ok(_) => return,
+            Err(reason) if resumed => {
+                if let Err(err) = registry.undo_resume(&queued, time::OffsetDateTime::now_utc()) {
+                    // No pane runs it: an active row would take a slot.
+                    tracing::warn!(thread = %thread_id, %err, "cannot undo the thread resume");
+                    record_state(&registry, &thread_id, ThreadState::Done, None);
+                }
+                format!("a thread {thread_id} de @{agent} não foi retomada: {reason}")
+            }
+            Err(reason) => {
+                record_state(&registry, &thread_id, ThreadState::Failed, Some(&reason));
+                format!("a thread de @{agent} não iniciou: {reason}")
+            }
+        };
+        self.refresh_folder_threads();
+        if let Some(channel) = &channel {
+            self.post_system_message(Some(ws_idx), state_dir, channel, Some(&thread_id), body);
+        }
+    }
+
+    /// Ends the queued threads of `state_dir` as failed with `reason`, and
+    /// says so in their channels.
+    fn fail_queued_threads(&mut self, state_dir: &Path, reason: &str) {
+        let failed = threads::registry(state_dir)
+            .fail_queued(reason, time::OffsetDateTime::now_utc())
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "cannot end the queued threads");
+                Vec::new()
+            });
+        for (thread_id, agent, channel) in &failed {
+            if let Some(channel) = channel {
+                self.post_system_message(
+                    None,
+                    state_dir,
+                    channel,
+                    Some(thread_id),
+                    format!("a thread de @{agent} falhou: {reason}"),
+                );
+            }
+        }
+        if !failed.is_empty() {
+            self.refresh_folder_threads();
+        }
+    }
+
+    /// The folder checks of the thread queue. The first check of a folder
+    /// in this process marks interrupted the active threads that no pane of
+    /// this process runs: the server that ran them stopped. Then each queue
+    /// drains, so a higher limit applies at the next check.
+    pub(crate) fn check_folder_thread_queues(&mut self) {
+        let folders: Vec<(String, PathBuf)> = self
+            .state
+            .workspaces
+            .iter()
+            .filter_map(|workspace| workspace.folder.as_ref())
+            .filter(|binding| !self.disconnected_folders.contains(&binding.id))
+            .map(|binding| {
+                (
+                    binding.id.clone(),
+                    binding.root.join(crate::regents::folder::STATE_DIR),
+                )
+            })
+            .collect();
+        for (folder_id, state_dir) in folders {
+            if self.recovered_thread_folders.insert(folder_id) {
+                self.interrupt_orphan_threads(&state_dir);
+            }
+            self.drain_thread_queue(&state_dir);
+        }
+    }
+
+    /// Marks interrupted the threads of `state_dir` that take a slot but
+    /// that no pane of this process runs.
+    fn interrupt_orphan_threads(&mut self, state_dir: &Path) {
+        let registry = threads::registry(state_dir);
+        let orphans: Vec<ThreadRecord> = registry
+            .slot_threads()
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "cannot list the active threads");
+                Vec::new()
+            })
+            .into_iter()
+            .filter(|record| self.running_thread_pane_id(state_dir, &record.id).is_none())
+            .collect();
+        for record in orphans {
+            self.interrupt_thread(
+                state_dir,
+                &record.id,
+                &record.agent,
+                record.channel.as_deref(),
+                SERVER_RESTARTED,
+            );
+        }
+        self.refresh_folder_threads();
+    }
+
+    /// Compare-and-set of an interruption: the thread becomes interrupted
+    /// with `reason` and says so in its channel, once, when it is still
+    /// active.
+    fn interrupt_thread(
+        &mut self,
+        state_dir: &Path,
+        thread_id: &str,
+        agent: &str,
+        channel: Option<&str>,
+        reason: &str,
+    ) {
+        match threads::registry(state_dir).interrupt(
+            thread_id,
+            reason,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                tracing::warn!(thread = %thread_id, %err, "cannot record the thread interruption");
+                return;
+            }
+        }
+        let Some(channel) = channel else {
+            return;
+        };
+        self.post_system_message(
+            self.folder_workspace_index(state_dir),
+            state_dir,
+            channel,
+            Some(thread_id),
+            format!("a thread de @{agent} foi interrompida: {reason}"),
+        );
+    }
+
+    /// Records `thread` as active outside the queue and starts `argv` for it
+    /// in a background pane: tests only, as a thread that holds a slot.
+    #[cfg(test)]
     fn launch_thread(
         &mut self,
         ws_idx: usize,
@@ -154,24 +379,11 @@ impl App {
         let thread = registry
             .create(thread, time::OffsetDateTime::now_utc())
             .map_err(|err| err.to_string())?;
-        let (thread_id, agent, channel) = (
-            thread.id.clone(),
-            thread.agent.clone(),
-            thread.channel.clone(),
-        );
+        let thread_id = thread.id.clone();
         self.start_thread(ws_idx, state_dir, thread, argv)
             .inspect_err(|reason| {
                 record_state(&registry, &thread_id, ThreadState::Failed, Some(reason));
                 self.refresh_folder_threads();
-                if let Some(channel) = &channel {
-                    self.post_system_message(
-                        Some(ws_idx),
-                        state_dir,
-                        channel,
-                        Some(&thread_id),
-                        format!("a thread de @{agent} não iniciou: {reason}"),
-                    );
-                }
             })
     }
 
@@ -249,24 +461,15 @@ impl App {
         if reply.origin_thread_id.is_some() {
             return None;
         }
-        let replied = channel
-            .read(ReadRange {
-                before: Some(replied_id.saturating_add(1)),
-                limit: Some(1),
-            })
-            .inspect_err(|err| tracing::warn!(%err, "cannot read the replied message"))
-            .ok()?
-            .pop()
-            .filter(|message| message.id == replied_id)?;
+        let replied = read_message(channel, replied_id)?;
         if replied.author.kind != AuthorKind::Agent {
             return None;
         }
         let thread_id = replied.origin_thread_id?;
-        let refusal =
-            match self.resume_thread(ws_idx, state_dir, channel, reply, &thread_id, agents) {
-                Ok(_) => return Some(replied.author.id),
-                Err(refusal) => refusal,
-            };
+        let refusal = match self.resume_thread(state_dir, channel, reply, &thread_id, agents) {
+            Ok(_) => return Some(replied.author.id),
+            Err(refusal) => refusal,
+        };
         let (body, link) = match &refusal {
             Refusal::Running(body) | Refusal::Ended(body) => {
                 (body.clone(), Some(thread_id.as_str()))
@@ -279,17 +482,17 @@ impl App {
         matches!(refusal, Refusal::Running(_)).then_some(replied.author.id)
     }
 
-    /// Resumes the done thread `thread_id` with `reply`. The error says why
-    /// it did not resume.
+    /// The admission of the resume of the done thread `thread_id` by
+    /// `reply`: the thread enters the queue for its next turn, and the drain
+    /// starts it. The error says why it did not resume.
     fn resume_thread(
         &mut self,
-        ws_idx: usize,
         state_dir: &Path,
         channel: &Channel,
         reply: &Message,
         thread_id: &str,
         agents: &[AgentDefinition],
-    ) -> Result<PaneId, Refusal> {
+    ) -> Result<(), Refusal> {
         let registry = threads::registry(state_dir);
         let record = registry
             .get(thread_id)
@@ -355,14 +558,13 @@ impl App {
             }
             None => return Err(not_resumed("the thread isolation is unknown")),
         }
-        let prompt = resume_prompt(channel, reply, &record);
-        let session_id = record.session_id.clone().unwrap_or_default();
-        let Some(argv) = adapter::resume_argv(definition, &prompt, &session_id) else {
+        if !adapter::has_thread_adapter(definition.cli) {
             return Err(not_resumed(&format!(
                 "the {} CLI has no thread adapter yet",
                 definition.cli.as_str()
             )));
-        };
+        }
+        let session_id = record.session_id.clone().unwrap_or_default();
         let has_session = self
             .claude_dir
             .as_deref()
@@ -370,10 +572,18 @@ impl App {
         if !has_session {
             return Err(not_resumed("the CLI session has no transcript"));
         }
-        // shortcut: a resume ignores `max_active_threads`, as a mention does;
-        // the queue of #16 takes both.
-        let resumed = registry
-            .resume(
+        // At most one queued thread per agent and channel.
+        match registry.queued_thread(&agent, channel.name()) {
+            Ok(Some(queued)) => {
+                return Err(Refusal::Running(format!(
+                    "@{agent} já tem a thread {queued} na fila; a resposta fica no canal"
+                )));
+            }
+            Ok(None) => {}
+            Err(err) => return Err(not_resumed(&err.to_string())),
+        }
+        registry
+            .admit_resume(
                 thread_id,
                 record.turn,
                 reply.id,
@@ -381,29 +591,9 @@ impl App {
             )
             .map_err(|err| not_resumed(&err.to_string()))?
             .ok_or_else(|| Refusal::Running(still_running(&agent, thread_id)))?;
-        let turn = resumed.turn;
-        let pane_id = self
-            .start_thread(ws_idx, state_dir, resumed, &argv)
-            .map_err(|reason| {
-                if let Err(err) = registry.undo_resume(&record, time::OffsetDateTime::now_utc()) {
-                    // No pane runs it: an active row would refuse every reply.
-                    tracing::warn!(thread = %thread_id, %err, "cannot undo the thread resume");
-                    record_state(&registry, thread_id, ThreadState::Done, None);
-                }
-                self.refresh_folder_threads();
-                not_resumed(&reason)
-            })?;
-        tracing::info!(thread = %thread_id, turn, message = reply.id, "resumed a thread");
-        self.emit_event(EventEnvelope {
-            event: EventKind::ThreadResumed,
-            data: EventData::ThreadResumed {
-                workspace_id: self.public_workspace_id(ws_idx),
-                thread_id: thread_id.to_owned(),
-                turn,
-                message_id: reply.id,
-            },
-        });
-        Ok(pane_id)
+        self.refresh_folder_threads();
+        self.drain_thread_queue(state_dir);
+        Ok(())
     }
 
     /// Starts `argv` in a new background pane of the workspace: a pane with
@@ -565,26 +755,14 @@ impl App {
     /// Marks every running thread interrupted, for a live handoff that does
     /// not carry thread panes (#19). Their runtimes stop with the old server.
     pub(crate) fn interrupt_running_threads(&mut self) {
-        for (pane_id, thread) in std::mem::take(&mut self.running_threads) {
-            record_state(
-                &threads::registry(&thread.state_dir),
+        for (_, thread) in std::mem::take(&mut self.running_threads) {
+            self.interrupt_thread(
+                &thread.state_dir,
                 &thread.thread_id,
-                ThreadState::Interrupted,
-                Some(SERVER_HANDOFF),
+                &thread.agent,
+                thread.channel.as_deref(),
+                SERVER_HANDOFF,
             );
-            if let Some(channel) = &thread.channel {
-                let ws_idx = self.find_pane(pane_id).map(|(ws_idx, _)| ws_idx);
-                self.post_system_message(
-                    ws_idx,
-                    &thread.state_dir,
-                    channel,
-                    Some(&thread.thread_id),
-                    format!(
-                        "a thread de @{} foi interrompida: {SERVER_HANDOFF}",
-                        thread.agent
-                    ),
-                );
-            }
         }
         self.refresh_folder_threads();
     }
@@ -640,6 +818,8 @@ impl App {
             self.expected_thread_exits.insert(pane_id);
             self.shutdown_terminal_runtime(thread.terminal_id);
         }
+        // The slot is free.
+        self.drain_thread_queue(&thread.state_dir);
     }
 
     /// Posts the last reply of a done thread turn in its channel as its
@@ -945,6 +1125,49 @@ fn resume_prompt(channel: &Channel, reply: &Message, thread: &threads::ThreadRec
     adapter::resume_prompt(reply, &new)
 }
 
+/// The message `id` of `channel`.
+fn read_message(channel: &Channel, id: u64) -> Option<Message> {
+    channel
+        .read(ReadRange {
+            before: Some(id.saturating_add(1)),
+            limit: Some(1),
+        })
+        .inspect_err(|err| tracing::warn!(%err, "cannot read a channel message"))
+        .ok()?
+        .pop()
+        .filter(|message| message.id == id)
+}
+
+/// The command line of the turn of `queued`, a thread as it left the
+/// queue: its prompt is made again from its anchor. A thread that ran
+/// before resumes its CLI session.
+fn queued_turn_argv(state_dir: &Path, queued: &ThreadRecord) -> Result<Vec<String>, String> {
+    let (Some(channel_name), Some(anchor_id)) = (&queued.channel, queued.queued_message_id) else {
+        return Err("the queued thread has no channel message".to_owned());
+    };
+    let channel = channel::open(state_dir, channel_name).map_err(|err| err.to_string())?;
+    let anchor = read_message(&channel, anchor_id)
+        .ok_or_else(|| format!("the message {anchor_id} of #{channel_name} is gone"))?;
+    let agents = agents::list(state_dir);
+    let definition = agents
+        .iter()
+        .find(|definition| definition.name == queued.agent)
+        .ok_or_else(|| format!("@{} is no longer an agent of the workspace", queued.agent))?;
+    let session_id = queued.session_id.clone().unwrap_or_default();
+    let argv = if queued.turn_message_id.is_some() {
+        let prompt = resume_prompt(&channel, &anchor, queued);
+        adapter::resume_argv(definition, &prompt, &session_id)
+    } else {
+        adapter::launch_argv(definition, &mention_prompt(&channel, &anchor), &session_id)
+    };
+    argv.ok_or_else(|| {
+        format!(
+            "the {} CLI has no thread adapter yet",
+            definition.cli.as_str()
+        )
+    })
+}
+
 fn record_state(
     registry: &threads::ThreadRegistry,
     thread_id: &str,
@@ -992,6 +1215,8 @@ impl App {
                 session_id: None,
                 turn: 0,
                 turn_message_id: Some(1),
+                queue_position: None,
+                queued_message_id: None,
                 created_at: "2026-11-27T18:04:05Z".into(),
                 updated_at: "2026-11-27T18:04:05Z".into(),
             });
@@ -1499,16 +1724,30 @@ contains = ["FAKE-WORKING"]
         let indexed = new.app.workspace_thread_infos(ws_idx);
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].agent_status, None, "no stuck highlight");
+        assert_eq!(
+            indexed[0].state,
+            crate::api::schema::ThreadState::Interrupted
+        );
         assert_eq!(new.listed_status(), Value::Null);
         assert!(new.app.running_threads.is_empty());
-        assert_eq!(Fixture::system_bodies(&state_dir), [BLOCKED_MESSAGE]);
+        let interrupted = format!("a thread de @chief foi interrompida: {SERVER_RESTARTED}");
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            [BLOCKED_MESSAGE.to_owned(), interrupted.clone()]
+        );
+
+        // A later folder check says nothing again.
+        new.app.refresh_folder_connections();
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            [BLOCKED_MESSAGE.to_owned(), interrupted]
+        );
     }
 
     #[tokio::test]
     async fn a_cli_that_cannot_start_fails_with_a_system_message() {
         let mut fixture = Fixture::new("spawn-fails");
-        fixture.app.test_thread_prefix = None;
-        let (ws_idx, state_dir, _) = fixture.channel_workspace();
+        let (ws_idx, state_dir, workspace_id) = fixture.channel_workspace();
         let not_executable = fixture.base.0.join("fake-cli");
         std::fs::write(&not_executable, "#!/bin/sh\n").unwrap();
         let cases = [
@@ -1517,28 +1756,13 @@ contains = ["FAKE-WORKING"]
         ];
 
         for (index, program) in cases.iter().enumerate() {
-            let launched = fixture.app.launch_thread(
-                ws_idx,
-                &state_dir,
-                NewThread {
-                    agent: "chief".into(),
-                    cli: AgentCli::Claude,
-                    origin: ThreadOrigin::Channel,
-                    channel: Some("geral".into()),
-                    origin_message_id: Some(1),
-                    opener_thread_id: None,
-                    depth: 0,
-                    isolation: Isolation::Shared,
-                    session_id: None,
-                },
-                std::slice::from_ref(program),
-            );
-            let reason = launched.expect_err(program);
+            fixture.app.test_thread_prefix = Some(vec![program.clone()]);
+            fixture.mention(&workspace_id, "geral", "@chief faça");
             fixture.app.state.assert_invariants_for_test();
 
             let record = &Fixture::records(&state_dir)[index];
             assert_eq!(record.state, ThreadState::Failed, "{program}");
-            assert_eq!(record.end_reason.as_deref(), Some(reason.as_str()));
+            let reason = record.end_reason.clone().unwrap();
             assert!(
                 reason.starts_with(&format!("cannot start {program}")),
                 "{reason}"
@@ -2627,29 +2851,106 @@ contains = ["FAKE-WORKING"]
         assert_eq!(Fixture::records(&state_dir)[0].state, ThreadState::Done);
     }
 
-    // Table: the active thread limit does not apply to a resume yet (#16),
-    // and a resume keeps the delegation depth.
+    // Table: a resume takes the same queue as a mention (#16), and keeps
+    // the delegation depth.
     #[tokio::test]
-    async fn a_resume_ignores_the_active_limit_and_keeps_the_depth() {
+    async fn a_resume_waits_in_the_queue_and_keeps_the_depth() {
         let mut fixture = Fixture::new("reply-limit-depth");
         let (ws_idx, state_dir, workspace_id) = fixture.done_thread();
-        let manifest = state_dir.join("workspace.toml");
-        let text = std::fs::read_to_string(&manifest).unwrap();
-        assert!(text.contains("max_active_threads = 3"), "{text}");
-        std::fs::write(
-            &manifest,
-            text.replace("max_active_threads = 3", "max_active_threads = 1"),
-        )
-        .unwrap();
-        fixture.thread(ws_idx, &state_dir);
+        Fixture::set_limit(&state_dir, 1);
+        let holder = fixture.thread(ws_idx, &state_dir);
         Fixture::sql(&state_dir, "UPDATE threads SET depth = 2 WHERE id = 1");
 
-        fixture.reply(&workspace_id, 2, "e o resto?");
+        let reply = fixture.reply(&workspace_id, 2, "e o resto?");
+
+        let record = &Fixture::records(&state_dir)[0];
+        assert_eq!(record.state, ThreadState::Queued);
+        assert_eq!((record.turn, record.queue_position), (0, Some(1)));
+        assert_eq!(fixture.app.running_threads.len(), 1);
+        assert!(fixture.resumed_events().is_empty(), "no turn started yet");
+        assert!(Fixture::system_bodies(&state_dir).is_empty());
+
+        fixture.finish_turn(holder);
 
         let record = &Fixture::records(&state_dir)[0];
         assert_eq!(record.state, ThreadState::Active);
+        assert_eq!((record.turn, record.turn_message_id), (1, Some(reply)));
         assert_eq!(record.depth, 2);
-        assert_eq!(fixture.app.running_threads.len(), 2);
+        assert_eq!(
+            fixture.running_argv("t1")[..3],
+            ["claude", "--resume", "sid"]
+        );
+        let prompt = fixture.running_argv("t1").pop().unwrap();
+        assert!(prompt.contains("e o resto?"), "{prompt}");
+        assert_eq!(
+            fixture.resumed_events(),
+            [EventData::ThreadResumed {
+                workspace_id,
+                thread_id: "t1".into(),
+                turn: 1,
+                message_id: reply,
+            }]
+        );
+        fixture.assert_queue_invariants(&state_dir, 1);
+    }
+
+    // Table: a resume while the agent has another queued thread in the
+    // channel; at most one queued thread per agent and channel.
+    #[tokio::test]
+    async fn a_resume_is_refused_while_its_agent_has_a_queued_thread_in_the_channel() {
+        let mut fixture = Fixture::new("reply-pair-queued");
+        let (ws_idx, state_dir, workspace_id) = fixture.done_thread();
+        Fixture::set_limit(&state_dir, 1);
+        fixture.thread(ws_idx, &state_dir);
+        fixture.mention(&workspace_id, "geral", "@chief outra coisa");
+        assert_eq!(Fixture::records(&state_dir)[2].state, ThreadState::Queued);
+
+        fixture.reply(&workspace_id, 2, "e o resto?");
+
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records.len(), 3);
+        assert_eq!((records[0].state, records[0].turn), (ThreadState::Done, 0));
+        assert_eq!(
+            Fixture::system_bodies(&state_dir)
+                .last()
+                .map(String::as_str),
+            Some("@chief já tem a thread t3 na fila; a resposta fica no canal")
+        );
+        fixture.assert_queue_invariants(&state_dir, 1);
+    }
+
+    // Table: a queued resume whose CLI cannot start is done again in its
+    // previous turn, and the next queued thread starts.
+    #[tokio::test]
+    async fn a_queued_resume_that_cannot_start_is_done_again_and_the_queue_goes_on() {
+        let mut fixture = Fixture::new("reply-queued-spawn-fails");
+        let (ws_idx, state_dir, workspace_id) = fixture.done_thread();
+        Fixture::agent(&state_dir, "reviewer");
+        Fixture::set_limit(&state_dir, 1);
+        let holder = fixture.thread(ws_idx, &state_dir);
+        fixture.reply(&workspace_id, 2, "e o resto?");
+        fixture.mention(&workspace_id, "geral", "@reviewer veja");
+        // The agent of the resume leaves before its turn leaves the queue.
+        std::fs::remove_file(state_dir.join("agents").join("chief-of-staff.md")).unwrap();
+        let public_pane_id = fixture.public_pane_id(holder);
+
+        fixture.request("pane.close", json!({"pane_id": public_pane_id}));
+
+        let records = Fixture::records(&state_dir);
+        assert_eq!((records[0].state, records[0].turn), (ThreadState::Done, 0));
+        assert_eq!(records[0].turn_message_id, Some(1));
+        assert!(
+            Fixture::system_bodies(&state_dir).contains(
+                &"a thread t1 de @chief não foi retomada: @chief is no longer an agent of the workspace"
+                    .to_owned()
+            ),
+            "{:?}",
+            Fixture::system_bodies(&state_dir)
+        );
+        assert!(fixture.resumed_events().is_empty());
+        assert_eq!(records[2].state, ThreadState::Active, "the next one starts");
+        fixture.running_pane("t3");
+        fixture.assert_queue_invariants(&state_dir, 1);
     }
 
     // Table: a reply posted by a thread resumes nothing (#18).
@@ -2710,6 +3011,600 @@ contains = ["FAKE-WORKING"]
         assert!(fixture.app.state.workspaces[ws_idx]
             .background_panes
             .is_empty());
+    }
+
+    // The thread queue (#16). Each test drives mentions through
+    // `channel.post`; the fake CLI prefix makes every thread a long sleep.
+
+    impl Fixture {
+        /// Writes `max_active_threads = limit` in `workspace.toml`.
+        fn set_limit(state_dir: &Path, limit: u32) {
+            let path = state_dir.join("workspace.toml");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("max_active_threads"))
+                .unwrap()
+                .to_owned();
+            std::fs::write(
+                &path,
+                text.replace(&line, &format!("max_active_threads = {limit}")),
+            )
+            .unwrap();
+        }
+
+        /// A claude agent `name` in the workspace.
+        fn agent(state_dir: &Path, name: &str) {
+            std::fs::write(
+                state_dir.join("agents").join(format!("{name}.md")),
+                format!("+++\nname = \"{name}\"\ncli = \"claude\"\n+++\n"),
+            )
+            .unwrap();
+        }
+
+        /// A human post of `body` in `channel`; its message ID.
+        fn mention(&mut self, workspace_id: &str, channel: &str, body: &str) -> u64 {
+            let posted = self.request(
+                "channel.post",
+                json!({"workspace_id": workspace_id, "channel": channel, "body": body}),
+            );
+            assert!(posted.get("error").is_none(), "{posted}");
+            posted["result"]["message"]["id"].as_u64().unwrap()
+        }
+
+        /// IDs of the active threads, and of the queued ones in queue order.
+        fn queue(state_dir: &Path) -> (Vec<String>, Vec<String>) {
+            let records = Self::records(state_dir);
+            let active = records
+                .iter()
+                .filter(|record| record.state == ThreadState::Active)
+                .map(|record| record.id.clone())
+                .collect();
+            let mut queued: Vec<&threads::ThreadRecord> = records
+                .iter()
+                .filter(|record| record.state == ThreadState::Queued)
+                .collect();
+            queued.sort_by_key(|record| record.queue_position);
+            (
+                active,
+                queued.iter().map(|record| record.id.clone()).collect(),
+            )
+        }
+
+        /// The invariants of the queue of `state_dir` with the limit
+        /// `limit`, and the identity invariants of the app.
+        fn assert_queue_invariants(&self, state_dir: &Path, limit: usize) {
+            self.app.state.assert_invariants_for_test();
+            let records = Self::records(state_dir);
+            let (active, queued) = Self::queue(state_dir);
+            let mut running: Vec<String> = self
+                .app
+                .running_threads
+                .values()
+                .filter(|thread| thread.state_dir == state_dir)
+                .map(|thread| thread.thread_id.clone())
+                .collect();
+            running.sort_by_key(|id| id[1..].parse::<u32>().unwrap());
+            assert_eq!(
+                running, active,
+                "a pane runs each active thread, and only those"
+            );
+            assert!(queued.iter().all(|id| !running.contains(id)));
+            let positions: Vec<Option<u32>> = records
+                .iter()
+                .filter(|record| record.state == ThreadState::Queued)
+                .map(|record| record.queue_position)
+                .collect();
+            let mut sorted = positions.clone();
+            sorted.sort();
+            let expected: Vec<Option<u32>> = (1..=positions.len() as u32).map(Some).collect();
+            assert_eq!(sorted, expected, "queue positions");
+            let mut pairs: Vec<(String, Option<String>)> = records
+                .iter()
+                .filter(|record| record.state == ThreadState::Queued)
+                .map(|record| (record.agent.clone(), record.channel.clone()))
+                .collect();
+            let count = pairs.len();
+            pairs.sort();
+            pairs.dedup();
+            assert_eq!(
+                pairs.len(),
+                count,
+                "one queued thread per agent and channel"
+            );
+            if !queued.is_empty() {
+                assert!(active.len() >= limit, "a free slot while {queued:?} waits");
+            }
+        }
+    }
+
+    /// A workspace with the agents chief and reviewer, the limit `limit`,
+    /// and the channel `geral`.
+    fn queue_workspace(fixture: &mut Fixture, limit: u32) -> (usize, PathBuf, String) {
+        let (ws_idx, state_dir, workspace_id) = fixture.channel_workspace();
+        Fixture::agent(&state_dir, "reviewer");
+        Fixture::set_limit(&state_dir, limit);
+        (ws_idx, state_dir, workspace_id)
+    }
+
+    // AC1, AC2, AC4: with limit 1 the second mention waits, `thread.list`
+    // and the index show it queued with its place, and it starts at done.
+    #[tokio::test]
+    async fn with_limit_one_the_second_mention_waits_and_starts_at_done() {
+        let mut fixture = Fixture::new("queue-done");
+        let (ws_idx, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        fixture.mention(&workspace_id, "geral", "@reviewer dois");
+
+        assert_eq!(
+            Fixture::queue(&state_dir),
+            (vec!["t1".into()], vec!["t2".into()])
+        );
+        let listed = fixture.request("thread.list", json!({"workspace_id": workspace_id}));
+        assert_eq!(
+            listed["result"]["threads"][1]["state"], "queued",
+            "{listed}"
+        );
+        assert_eq!(
+            listed["result"]["threads"][1]["queue_position"], 1,
+            "{listed}"
+        );
+        assert_eq!(listed["result"]["threads"][0].get("queue_position"), None);
+        let indexed = fixture.app.workspace_thread_infos(ws_idx);
+        assert_eq!(indexed[0].state, crate::api::schema::ThreadState::Queued);
+        assert_eq!(indexed[0].queue_position, Some(1));
+        fixture.assert_queue_invariants(&state_dir, 1);
+
+        fixture.finish_turn(fixture.running_pane("t1"));
+
+        assert_eq!(Fixture::queue(&state_dir), (vec!["t2".into()], vec![]));
+        let prompt = fixture.running_argv("t2").pop().unwrap();
+        assert!(prompt.contains("@reviewer dois"), "{prompt}");
+        assert_eq!(fixture.running_argv("t2")[1], "--session-id");
+        fixture.assert_queue_invariants(&state_dir, 1);
+    }
+
+    // Absorption: one queued thread per agent and channel; the anchor moves,
+    // the origin stays, and the prompt is made at the exit from the queue.
+    #[tokio::test]
+    async fn a_queued_thread_absorbs_a_new_mention_of_its_agent_in_its_channel() {
+        let mut fixture = Fixture::new("queue-absorb");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        fixture.request(
+            "channel.create",
+            json!({"workspace_id": workspace_id, "channel": "dev"}),
+        );
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        let first = fixture.mention(&workspace_id, "geral", "@reviewer primeiro");
+        let second = fixture.mention(&workspace_id, "geral", "@reviewer segundo");
+        fixture.mention(&workspace_id, "dev", "@reviewer em dev");
+
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert_eq!(records[1].origin_message_id, Some(first));
+        assert_eq!(records[1].queued_message_id, Some(second));
+        assert_eq!(
+            records[2].channel.as_deref(),
+            Some("dev"),
+            "another channel queues"
+        );
+        fixture.assert_queue_invariants(&state_dir, 1);
+
+        fixture.finish_turn(fixture.running_pane("t1"));
+
+        let prompt = fixture.running_argv("t2").pop().unwrap();
+        assert!(prompt.contains("@reviewer segundo"), "{prompt}");
+        assert!(
+            prompt.contains("@reviewer primeiro"),
+            "within the 20: {prompt}"
+        );
+        let record = &Fixture::records(&state_dir)[1];
+        assert_eq!((record.turn, record.turn_message_id), (0, Some(second)));
+        assert_eq!(record.origin_message_id, Some(first));
+        fixture.assert_queue_invariants(&state_dir, 1);
+    }
+
+    // Known limit of the absorption shortcut: the prompt holds the 20
+    // messages up to the newest mention, so an older absorbed mention can
+    // fall out of it.
+    #[tokio::test]
+    async fn an_absorbed_older_mention_can_fall_out_of_the_prompt() {
+        let mut fixture = Fixture::new("queue-absorb-limit");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        fixture.mention(&workspace_id, "geral", "@reviewer primeiro");
+        for number in 0..adapter::RECENT_MESSAGES {
+            fixture.mention(&workspace_id, "geral", &format!("conversa {number}"));
+        }
+        fixture.mention(&workspace_id, "geral", "@reviewer segundo");
+
+        fixture.finish_turn(fixture.running_pane("t1"));
+
+        let prompt = fixture.running_argv("t2").pop().unwrap();
+        assert!(prompt.contains("@reviewer segundo"), "{prompt}");
+        assert!(!prompt.contains("@reviewer primeiro"), "{prompt}");
+        assert_eq!(Fixture::records(&state_dir).len(), 2);
+    }
+
+    // Every end of a slot drains the queue: exit, close pane and detach.
+    #[tokio::test]
+    async fn every_end_of_an_active_thread_starts_the_next_queued_one() {
+        for end in ["exit", "close", "detach", "blocked-exit"] {
+            let _manifest = FakeManifest::install(&format!("queue-end-{end}"));
+            let mut fixture = Fixture::new(&format!("queue-end-{end}"));
+            let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+            fixture.mention(&workspace_id, "geral", "@chief um");
+            fixture.mention(&workspace_id, "geral", "@reviewer dois");
+            let pane_id = fixture.running_pane("t1");
+
+            match end {
+                "exit" => fixture.exit(pane_id),
+                "close" => {
+                    let public_pane_id = fixture.public_pane_id(pane_id);
+                    fixture.request("pane.close", json!({"pane_id": public_pane_id}));
+                }
+                "detach" => {
+                    let terminal_id = fixture.app.running_threads[&pane_id].terminal_id.clone();
+                    fixture
+                        .app
+                        .end_threads_of_detached_terminals(&[terminal_id]);
+                }
+                _ => {
+                    // A blocked thread holds its slot until it ends.
+                    fixture.show(pane_id, FAKE_BLOCKED);
+                    assert_eq!(Fixture::queue(&state_dir).1, ["t2"]);
+                    fixture.exit(pane_id);
+                }
+            }
+
+            assert_eq!(
+                Fixture::records(&state_dir)[0].state,
+                ThreadState::Failed,
+                "{end}"
+            );
+            assert_eq!(
+                Fixture::queue(&state_dir),
+                (vec!["t2".into()], vec![]),
+                "{end}"
+            );
+            fixture.assert_queue_invariants(&state_dir, 1);
+        }
+    }
+
+    // A queued thread that cannot start fails, says so, and the next one
+    // starts in the same drain.
+    #[tokio::test]
+    async fn a_queued_thread_that_cannot_start_fails_and_the_next_one_starts() {
+        let mut fixture = Fixture::new("queue-start-fails");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        Fixture::agent(&state_dir, "ghost");
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        fixture.mention(&workspace_id, "geral", "@ghost dois");
+        fixture.mention(&workspace_id, "geral", "@reviewer três");
+        std::fs::remove_file(state_dir.join("agents").join("ghost.md")).unwrap();
+
+        fixture.finish_turn(fixture.running_pane("t1"));
+
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records[1].state, ThreadState::Failed);
+        assert_eq!(
+            records[1].end_reason.as_deref(),
+            Some("@ghost is no longer an agent of the workspace")
+        );
+        assert_eq!(
+            Fixture::system_bodies(&state_dir),
+            ["a thread de @ghost não iniciou: @ghost is no longer an agent of the workspace"]
+        );
+        assert_eq!(Fixture::queue(&state_dir), (vec!["t3".into()], vec![]));
+        fixture.assert_queue_invariants(&state_dir, 1);
+    }
+
+    // A change of the limit applies at the next admission point: a higher
+    // limit starts queued threads at the folder check, and a lower one
+    // stops nothing.
+    #[tokio::test]
+    async fn a_new_limit_applies_to_the_next_threads() {
+        let mut fixture = Fixture::new("queue-limit");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        fixture.mention(&workspace_id, "geral", "@reviewer dois");
+
+        Fixture::set_limit(&state_dir, 2);
+        fixture.app.refresh_folder_connections();
+
+        assert_eq!(
+            Fixture::queue(&state_dir),
+            (vec!["t1".into(), "t2".into()], vec![])
+        );
+
+        Fixture::set_limit(&state_dir, 1);
+        fixture.app.refresh_folder_connections();
+        fixture.mention(&workspace_id, "geral", "@chief três");
+        assert_eq!(
+            Fixture::queue(&state_dir),
+            (vec!["t1".into(), "t2".into()], vec!["t3".into()]),
+            "a lower limit stops nothing"
+        );
+        fixture.finish_turn(fixture.running_pane("t1"));
+        assert_eq!(
+            Fixture::queue(&state_dir).1,
+            ["t3"],
+            "two still hold a slot"
+        );
+        fixture.finish_turn(fixture.running_pane("t2"));
+        assert_eq!(Fixture::queue(&state_dir), (vec!["t3".into()], vec![]));
+        fixture.assert_queue_invariants(&state_dir, 1);
+    }
+
+    // `max_active_threads = 0` is invalid: the folder check reads no limit,
+    // so the queue waits and starts nothing.
+    #[tokio::test]
+    async fn a_limit_of_zero_starts_nothing() {
+        let mut fixture = Fixture::new("queue-zero");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        fixture.mention(&workspace_id, "geral", "@reviewer dois");
+        Fixture::set_limit(&state_dir, 0);
+
+        fixture.finish_turn(fixture.running_pane("t1"));
+
+        assert_eq!(Fixture::queue(&state_dir), (vec![], vec!["t2".into()]));
+        let root = state_dir.parent().unwrap();
+        let err = crate::regents::folder::read_manifest(root).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("max_active_threads is 0, the minimum is 1"),
+            "{err}"
+        );
+    }
+
+    // A closed workspace fails its queued threads.
+    #[tokio::test]
+    async fn closing_the_workspace_fails_its_queued_threads() {
+        let mut fixture = Fixture::new("queue-close-ws");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        fixture.mention(&workspace_id, "geral", "@reviewer dois");
+
+        let closed = fixture.request("workspace.close", json!({"workspace_id": workspace_id}));
+
+        assert!(closed.get("error").is_none(), "{closed}");
+        let records = Fixture::records(&state_dir);
+        assert_eq!(records[0].end_reason.as_deref(), Some(PANE_CLOSED));
+        assert_eq!(records[1].state, ThreadState::Failed);
+        assert_eq!(records[1].end_reason.as_deref(), Some(WORKSPACE_CLOSED));
+        assert!(Fixture::system_bodies(&state_dir)
+            .contains(&format!("a thread de @reviewer falhou: {WORKSPACE_CLOSED}")));
+        assert!(fixture.app.running_threads.is_empty());
+    }
+
+    // A disconnected folder keeps its queue: it drains when it reconnects.
+    #[tokio::test]
+    async fn a_disconnected_folder_keeps_its_queue() {
+        let mut fixture = Fixture::new("queue-disconnected");
+        let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        fixture.mention(&workspace_id, "geral", "@chief um");
+        fixture.mention(&workspace_id, "geral", "@reviewer dois");
+        let manifest = state_dir.join("workspace.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::rename(&manifest, state_dir.join("moved.toml")).unwrap();
+        fixture.app.refresh_folder_connections();
+
+        fixture.exit(fixture.running_pane("t1"));
+
+        assert_eq!(Fixture::queue(&state_dir), (vec![], vec!["t2".into()]));
+        std::fs::write(&manifest, text).unwrap();
+        fixture.app.refresh_folder_connections();
+        assert_eq!(Fixture::queue(&state_dir), (vec!["t2".into()], vec![]));
+    }
+
+    // Restart and handoff: the queue stays in the registry, and the new
+    // server drains it after it marks the threads of the old one
+    // interrupted, once.
+    #[tokio::test]
+    async fn a_new_server_drains_the_queue_after_a_restart_or_a_handoff() {
+        for handoff in [false, true] {
+            let mut old = Fixture::new(&format!("queue-restart-old-{handoff}"));
+            let (_, state_dir, workspace_id) = queue_workspace(&mut old, 1);
+            old.mention(&workspace_id, "geral", "@chief um");
+            old.mention(&workspace_id, "geral", "@reviewer dois");
+            old.mention(&workspace_id, "geral", "@chief três");
+            if handoff {
+                old.app.interrupt_running_threads();
+                assert_eq!(
+                    Fixture::queue(&state_dir).1,
+                    ["t2", "t3"],
+                    "the old server drains nothing"
+                );
+            }
+            shutdown_test_runtimes(&mut old.app);
+            let folder = state_dir.parent().unwrap().to_path_buf();
+
+            let mut new = Fixture::new(&format!("queue-restart-new-{handoff}"));
+            let added = new.request(
+                "workspace.add",
+                json!({"path": folder.display().to_string(), "focus": true}),
+            );
+
+            assert_eq!(added["result"]["type"], "workspace_added", "{added}");
+            let records = Fixture::records(&state_dir);
+            assert_eq!(records[0].state, ThreadState::Interrupted);
+            let reason = if handoff {
+                SERVER_HANDOFF
+            } else {
+                SERVER_RESTARTED
+            };
+            assert_eq!(
+                Fixture::system_bodies(&state_dir),
+                [format!("a thread de @chief foi interrompida: {reason}")],
+                "one interruption message"
+            );
+            assert_eq!(
+                Fixture::queue(&state_dir),
+                (vec!["t2".into()], vec!["t3".into()])
+            );
+            new.assert_queue_invariants(&state_dir, 1);
+        }
+    }
+
+    // Identity: with adversarial pane, tab and workspace IDs before it, the
+    // queue starts its threads in the hidden panes of its own workspace.
+    #[tokio::test]
+    async fn the_queue_keeps_the_identity_invariants_of_an_adversarial_state() {
+        let mut fixture = Fixture::new("queue-adversarial");
+        fixture.app.state = crate::app::AppState::test_with_adversarial_identity_state();
+        fixture.app.state.assert_invariants_for_test();
+        let (ws_idx, state_dir, workspace_id) = queue_workspace(&mut fixture, 1);
+        assert_ne!(ws_idx, 0);
+        fixture.mention(&workspace_id, "geral", "@chief um @reviewer dois");
+        fixture.assert_queue_invariants(&state_dir, 1);
+
+        fixture.finish_turn(fixture.running_pane("t1"));
+
+        fixture.assert_queue_invariants(&state_dir, 1);
+        let pane_id = fixture.running_pane("t2");
+        assert_eq!(
+            fixture.app.find_pane(pane_id).map(|(index, _)| index),
+            Some(ws_idx)
+        );
+        assert!(fixture.app.state.workspaces[ws_idx]
+            .background_panes
+            .contains_key(&pane_id));
+        fixture.finish_turn(pane_id);
+        fixture.assert_queue_invariants(&state_dir, 1);
+        assert!(fixture.app.state.workspaces[ws_idx]
+            .background_panes
+            .is_empty());
+    }
+
+    /// The reference model of the queue: FIFO, a slot counter and the
+    /// absorption rule.
+    #[derive(Default)]
+    struct QueueModel {
+        next_id: u32,
+        limit: usize,
+        /// Active thread numbers, oldest first.
+        active: Vec<u32>,
+        queue: std::collections::VecDeque<(u32, &'static str, &'static str)>,
+    }
+
+    impl QueueModel {
+        fn mention(&mut self, agent: &'static str, channel: &'static str) {
+            if !self
+                .queue
+                .iter()
+                .any(|(_, a, c)| *a == agent && *c == channel)
+            {
+                self.next_id += 1;
+                self.queue.push_back((self.next_id, agent, channel));
+            }
+            self.drain();
+        }
+
+        fn end(&mut self, index: usize) {
+            self.active.remove(index);
+            self.drain();
+        }
+
+        fn drain(&mut self) {
+            while self.active.len() < self.limit {
+                let Some((id, _, _)) = self.queue.pop_front() else {
+                    return;
+                };
+                self.active.push(id);
+            }
+        }
+
+        fn ids(&self) -> (Vec<String>, Vec<String>) {
+            let mut active = self.active.clone();
+            active.sort();
+            (
+                active.iter().map(|id| format!("t{id}")).collect(),
+                self.queue
+                    .iter()
+                    .map(|(id, _, _)| format!("t{id}"))
+                    .collect(),
+            )
+        }
+    }
+
+    // The model and the server take the same deterministic events and must
+    // agree after each one; the invariants hold after each one.
+    #[tokio::test]
+    async fn the_queue_follows_its_reference_model() {
+        const AGENTS: [&str; 3] = ["chief", "reviewer", "coder"];
+        const CHANNELS: [&str; 2] = ["geral", "dev"];
+        for seed in [1_u64, 7, 42] {
+            let mut fixture = Fixture::new(&format!("queue-model-{seed}"));
+            let (_, state_dir, workspace_id) = queue_workspace(&mut fixture, 2);
+            Fixture::agent(&state_dir, "coder");
+            fixture.request(
+                "channel.create",
+                json!({"workspace_id": workspace_id, "channel": "dev"}),
+            );
+            let mut model = QueueModel {
+                limit: 2,
+                ..QueueModel::default()
+            };
+            let mut state = seed;
+            let mut next = |bound: u64| {
+                // A linear congruential generator: deterministic, no crate.
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) % bound
+            };
+            for step in 0..60 {
+                let event = next(10);
+                let running = model.active.len();
+                match event {
+                    0..=4 => {
+                        let agent = AGENTS[next(3) as usize];
+                        let channel = CHANNELS[next(2) as usize];
+                        fixture.mention(&workspace_id, channel, &format!("@{agent} passo {step}"));
+                        model.mention(agent, channel);
+                    }
+                    5..=7 if running > 0 => {
+                        let index = next(running as u64) as usize;
+                        let thread_id = format!("t{}", {
+                            let mut active = model.active.clone();
+                            active.sort();
+                            active[index]
+                        });
+                        let pane_id = fixture.running_pane(&thread_id);
+                        match event {
+                            5 => fixture.finish_turn(pane_id),
+                            6 => fixture.exit(pane_id),
+                            _ => {
+                                let public_pane_id = fixture.public_pane_id(pane_id);
+                                fixture.request("pane.close", json!({"pane_id": public_pane_id}));
+                            }
+                        }
+                        let position = model
+                            .active
+                            .iter()
+                            .position(|id| format!("t{id}") == thread_id)
+                            .unwrap();
+                        model.end(position);
+                    }
+                    8 | 9 => {
+                        let limit = 1 + next(3) as usize;
+                        Fixture::set_limit(&state_dir, limit as u32);
+                        fixture.app.refresh_folder_connections();
+                        model.limit = limit;
+                        model.drain();
+                    }
+                    _ => {}
+                }
+                assert_eq!(
+                    Fixture::queue(&state_dir),
+                    model.ids(),
+                    "seed {seed}, step {step}"
+                );
+                fixture.assert_queue_invariants(&state_dir, model.limit);
+            }
+        }
     }
 
     #[test]

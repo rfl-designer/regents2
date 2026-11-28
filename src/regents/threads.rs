@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use super::agents::{AgentCli, Isolation};
 use super::store;
@@ -15,11 +15,9 @@ const DATABASE_FILE: &str = "threads.sqlite";
 /// `<id>.ansi` file per thread.
 const OUTPUT_DIR: &str = "thread-output";
 const ID_PREFIX: &str = "t";
-/// The SQL brings a database of any older version to this one: the table
-/// keeps its version 1 form and each version appends its changes.
 const SCHEMA: store::Schema = store::Schema {
-    version: 2,
-    sql: "CREATE TABLE IF NOT EXISTS threads (
+    steps: &[
+        "CREATE TABLE IF NOT EXISTS threads (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              agent TEXT NOT NULL,
              cli TEXT NOT NULL,
@@ -37,13 +35,26 @@ const SCHEMA: store::Schema = store::Schema {
              session_id TEXT,
              created_at TEXT NOT NULL,
              updated_at TEXT NOT NULL
-         );
-         -- Version 2: the turn of the CLI session, from 0, and the message
-         -- that started it (a resumed turn starts at a threaded reply).
-         ALTER TABLE threads ADD COLUMN turn INTEGER NOT NULL DEFAULT 0;
+         );",
+        // Version 2: the turn of the CLI session, from 0, and the message
+        // that started it (a resumed turn starts at a threaded reply).
+        "ALTER TABLE threads ADD COLUMN turn INTEGER NOT NULL DEFAULT 0;
          ALTER TABLE threads ADD COLUMN turn_message_id INTEGER;
          UPDATE threads SET turn_message_id = origin_message_id;",
+        // Version 3: the thread queue (#16). `queue_seq` orders the entries
+        // into the queue, and `queued_message_id` is the anchor of the
+        // prompt of the queued turn. A queued thread that never ran has no
+        // `turn_message_id`.
+        "ALTER TABLE threads ADD COLUMN queue_seq INTEGER;
+         ALTER TABLE threads ADD COLUMN queued_message_id INTEGER;
+         CREATE UNIQUE INDEX threads_one_queued_per_pair
+             ON threads(agent, channel) WHERE state = 'queued';",
+    ],
 };
+
+/// The threads that take a slot of `max_active_threads`: a direct
+/// conversation takes none.
+const SLOT_FILTER: &str = "state = 'active' AND origin_kind <> 'direct'";
 
 /// The life cycle of a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,8 +167,22 @@ pub(crate) struct ThreadRecord {
     /// The message that started the turn: the opening mention, or the
     /// threaded reply that resumed the thread.
     pub(crate) turn_message_id: Option<u64>,
+    /// Place in the queue of a queued thread, from 1.
+    pub(crate) queue_position: Option<u32>,
+    /// Anchor of the prompt of a queued turn: the newest absorbed mention,
+    /// or the threaded reply of a queued resume.
+    pub(crate) queued_message_id: Option<u64>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+}
+
+/// What a mention did to the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// A new queued thread.
+    Queued(String),
+    /// The queued thread of the same agent and channel took the mention.
+    Absorbed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +220,9 @@ pub(crate) fn registry(state_dir: &Path) -> ThreadRegistry {
 }
 
 impl ThreadRegistry {
-    /// Records a new active thread.
+    /// Records a new active thread outside the queue: tests only, the
+    /// server admits a channel thread with `admit_mention`.
+    #[cfg(test)]
     pub(crate) fn create(
         &self,
         thread: NewThread,
@@ -238,23 +265,75 @@ impl ThreadRegistry {
             session_id: thread.session_id,
             turn: 0,
             turn_message_id: thread.origin_message_id,
+            queue_position: None,
+            queued_message_id: None,
             created_at: now.clone(),
             updated_at: now,
         })
     }
 
-    /// The thread `id`, or `None` when the registry does not have it.
-    pub(crate) fn get(&self, id: &str) -> Result<Option<ThreadRecord>, ThreadError> {
-        let row = parse_id(id)?;
-        // `row` is a parsed number, so the clause is not injectable.
-        Ok(self.query(&format!("WHERE id = {row}"), 1)?.pop())
+    /// Admission of a mention: a new queued thread, or the queued thread of
+    /// the same agent and channel takes the mention as its new anchor. The
+    /// drain starts it.
+    // shortcut: only a queued thread absorbs a mention, and an older mention
+    // can fall out of the RECENT_MESSAGES of the prompt; let an active thread
+    // absorb too (and widen the prompt) when its agent decides (#17).
+    pub(crate) fn admit_mention(
+        &self,
+        thread: NewThread,
+        now: time::OffsetDateTime,
+    ) -> Result<Admission, ThreadError> {
+        let now = super::utc_seconds(now).map_err(ThreadError)?;
+        let message = thread.origin_message_id.map(sql_message_id).transpose()?;
+        let mut connection = store::open_writable(&self.path, &SCHEMA)?;
+        // One writer at a time: the absorb and the insert see the same queue.
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let absorbed: Option<i64> = transaction
+            .query_row(
+                "UPDATE threads
+                 SET queued_message_id = max(coalesce(queued_message_id, 0), ?1), updated_at = ?2
+                 WHERE state = 'queued' AND agent = ?3 AND channel IS ?4
+                 RETURNING id",
+                params![message, now, thread.agent, thread.channel],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let admission = match absorbed {
+            Some(row) => Admission::Absorbed(format!("{ID_PREFIX}{row}")),
+            None => {
+                transaction.execute(
+                    "INSERT INTO threads
+                         (agent, cli, origin_kind, channel, origin_message_id, opener_thread_id,
+                          depth, isolation, state, session_id, created_at, updated_at,
+                          queue_seq, queued_message_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?10, ?10,
+                             (SELECT coalesce(max(queue_seq), 0) + 1 FROM threads), ?5)",
+                    params![
+                        thread.agent,
+                        thread.cli.as_str(),
+                        thread.origin.as_str(),
+                        thread.channel,
+                        message,
+                        thread.opener_thread_id,
+                        thread.depth,
+                        thread.isolation.as_str(),
+                        thread.session_id,
+                        now,
+                    ],
+                )?;
+                Admission::Queued(format!("{ID_PREFIX}{}", transaction.last_insert_rowid()))
+            }
+        };
+        transaction.commit()?;
+        Ok(admission)
     }
 
-    /// Compare-and-set of a resume: the thread `id` becomes active in the
-    /// next turn, started by the message `message_id`, only when it is still
-    /// done in the turn `turn`. `None` when another writer changed it first,
-    /// so two concurrent replies resume the thread once.
-    pub(crate) fn resume(
+    /// Compare-and-set of the admission of a resume: the thread `id` enters
+    /// the queue for its next turn, started by the message `message_id`,
+    /// only when it is still done in the turn `turn`. `None` when another
+    /// writer changed it first.
+    pub(crate) fn admit_resume(
         &self,
         id: &str,
         turn: u32,
@@ -266,16 +345,15 @@ impl ThreadRegistry {
         let connection = store::open_writable(&self.path, &SCHEMA)?;
         let changed = connection.execute(
             "UPDATE threads
-             SET state = ?1, end_reason = NULL, turn = turn + 1, turn_message_id = ?2,
-                 updated_at = ?3
-             WHERE id = ?4 AND state = ?5 AND turn = ?6",
+             SET state = 'queued', end_reason = NULL, queued_message_id = ?1, updated_at = ?2,
+                 queue_seq = (SELECT coalesce(max(queue_seq), 0) + 1 FROM threads)
+             WHERE id = ?3 AND state = ?4 AND turn = ?5",
             params![
-                ThreadState::Active.as_str(),
                 sql_message_id(message_id)?,
                 now,
                 row,
                 ThreadState::Done.as_str(),
-                turn,
+                turn
             ],
         )?;
         drop(connection);
@@ -285,8 +363,132 @@ impl ThreadRegistry {
         self.get(id)
     }
 
-    /// Undoes the resume of `previous`, whose CLI did not start: the thread
-    /// is done again in its previous turn, so the next reply resumes it.
+    /// The queued thread of `agent` in `channel`.
+    pub(crate) fn queued_thread(
+        &self,
+        agent: &str,
+        channel: &str,
+    ) -> Result<Option<String>, ThreadError> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
+        let row: Option<i64> = connection
+            .query_row(
+                "SELECT id FROM threads WHERE state = 'queued' AND agent = ?1 AND channel = ?2",
+                params![agent, channel],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(row.map(|row| format!("{ID_PREFIX}{row}")))
+    }
+
+    /// Compare-and-set of the exit from the queue: the oldest queued thread
+    /// becomes active when fewer than `limit` threads take a slot. Its turn
+    /// starts at its anchor; a thread that ran before begins its next turn.
+    /// The result is the thread as it was queued, which keeps the anchor of
+    /// its previous turn, and as it is now.
+    pub(crate) fn promote_next(
+        &self,
+        limit: u32,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<(ThreadRecord, ThreadRecord)>, ThreadError> {
+        let Some(queued) = self
+            .query("WHERE state = 'queued' ORDER BY queue_seq, id", 1)?
+            .pop()
+        else {
+            return Ok(None);
+        };
+        let now = super::utc_seconds(now).map_err(ThreadError)?;
+        let anchor = queued.queued_message_id.map(sql_message_id).transpose()?;
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
+        let changed = connection.execute(
+            &format!(
+                "UPDATE threads
+                 SET state = 'active', end_reason = NULL,
+                     turn = turn + (turn_message_id IS NOT NULL),
+                     turn_message_id = queued_message_id, queued_message_id = NULL,
+                     updated_at = ?1
+                 WHERE id = ?2 AND state = 'queued' AND queued_message_id IS ?3
+                   AND (SELECT count(*) FROM threads WHERE {SLOT_FILTER}) < ?4"
+            ),
+            params![now, parse_id(&queued.id)?, anchor, limit],
+        )?;
+        drop(connection);
+        if changed == 0 {
+            return Ok(None);
+        }
+        let promoted = self
+            .get(&queued.id)?
+            .ok_or_else(|| ThreadError(format!("thread {} disappeared", queued.id)))?;
+        Ok(Some((queued, promoted)))
+    }
+
+    /// Ends every queued thread as failed, with `reason`; the result is the
+    /// `(id, agent, channel)` of the threads that it ended.
+    pub(crate) fn fail_queued(
+        &self,
+        reason: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<(String, String, Option<String>)>, ThreadError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let now = super::utc_seconds(now).map_err(ThreadError)?;
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
+        // One statement: the list is exactly the threads that it ended.
+        let mut statement = connection.prepare(
+            "UPDATE threads SET state = 'failed', end_reason = ?1, updated_at = ?2
+             WHERE state = 'queued'
+             RETURNING id, agent, channel",
+        )?;
+        let failed = statement
+            .query_map(params![reason, now], |row| {
+                Ok((
+                    format!("{ID_PREFIX}{}", row.get::<_, i64>(0)?),
+                    row.get(1)?,
+                    row.get(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(failed)
+    }
+
+    /// The threads that take a slot, oldest first.
+    pub(crate) fn slot_threads(&self) -> Result<Vec<ThreadRecord>, ThreadError> {
+        self.query(&format!("WHERE {SLOT_FILTER} ORDER BY id"), -1)
+    }
+
+    /// Compare-and-set of an interruption: the thread `id` becomes
+    /// interrupted with `reason` only when it is still active. False when
+    /// another writer ended it first, so one interruption says so once.
+    pub(crate) fn interrupt(
+        &self,
+        id: &str,
+        reason: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<bool, ThreadError> {
+        let now = super::utc_seconds(now).map_err(ThreadError)?;
+        let row = parse_id(id)?;
+        let connection = store::open_writable(&self.path, &SCHEMA)?;
+        let changed = connection.execute(
+            "UPDATE threads SET state = 'interrupted', end_reason = ?1, updated_at = ?2
+             WHERE id = ?3 AND state = 'active'",
+            params![reason, now, row],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The thread `id`, or `None` when the registry does not have it.
+    pub(crate) fn get(&self, id: &str) -> Result<Option<ThreadRecord>, ThreadError> {
+        let row = parse_id(id)?;
+        // `row` is a parsed number, so the clause is not injectable.
+        Ok(self.query(&format!("WHERE id = {row}"), 1)?.pop())
+    }
+
+    /// Undoes the resume of `previous`, the thread as it was queued, whose
+    /// CLI did not start: the thread is done again in its previous turn, so
+    /// the next reply resumes it.
     pub(crate) fn undo_resume(
         &self,
         previous: &ThreadRecord,
@@ -370,7 +572,11 @@ impl ThreadRegistry {
         let mut statement = connection.prepare(&format!(
             "SELECT id, agent, cli, origin_kind, channel, origin_message_id, opener_thread_id,
                     depth, isolation, state, end_reason, session_id, created_at, updated_at,
-                    turn, turn_message_id
+                    turn, turn_message_id, queued_message_id,
+                    CASE WHEN state = 'queued' THEN
+                        (SELECT count(*) FROM threads AS ahead
+                         WHERE ahead.state = 'queued' AND ahead.queue_seq <= threads.queue_seq)
+                    END
              FROM threads {clause} LIMIT ?1"
         ))?;
         let rows = statement.query_map([limit], |row| {
@@ -398,6 +604,10 @@ impl ThreadRegistry {
                 turn_message_id: row
                     .get::<_, Option<i64>>(15)?
                     .and_then(|id| u64::try_from(id).ok()),
+                queued_message_id: row
+                    .get::<_, Option<i64>>(16)?
+                    .and_then(|id| u64::try_from(id).ok()),
+                queue_position: row.get(17)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -564,6 +774,8 @@ mod tests {
                 session_id: Some("session-3".into()),
                 turn: 0,
                 turn_message_id: Some(3),
+                queue_position: None,
+                queued_message_id: None,
                 created_at: "2026-11-27T18:04:05Z".into(),
                 updated_at: "2026-11-27T18:04:05Z".into(),
             }
@@ -726,12 +938,12 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_is_a_compare_and_set_of_a_done_turn() {
+    fn a_resume_is_a_compare_and_set_of_a_done_turn_through_the_queue() {
         let folder = TempFolder::new("threads-resume");
         let registry = registry(&folder.0);
         let created = registry.create(mention("chief", 1), at(0)).unwrap();
         assert_eq!(
-            registry.resume(&created.id, 0, 4, at(1)).unwrap(),
+            registry.admit_resume(&created.id, 0, 4, at(1)).unwrap(),
             None,
             "active"
         );
@@ -739,36 +951,139 @@ mod tests {
             .set_state(&created.id, ThreadState::Done, None, at(2))
             .unwrap();
 
-        let resumed = registry.resume(&created.id, 0, 4, at(3)).unwrap().unwrap();
+        let queued = registry
+            .admit_resume(&created.id, 0, 4, at(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.state, ThreadState::Queued);
+        assert_eq!(queued.queue_position, Some(1));
+        assert_eq!((queued.turn, queued.turn_message_id), (0, Some(1)));
+        assert_eq!(queued.queued_message_id, Some(4));
+        assert_eq!(
+            registry.admit_resume(&created.id, 0, 5, at(4)).unwrap(),
+            None,
+            "queued"
+        );
+        assert_eq!(registry.admit_resume("t9", 0, 5, at(4)).unwrap(), None);
 
+        let (before, resumed) = registry.promote_next(1, at(5)).unwrap().unwrap();
+
+        assert_eq!(before, queued);
         assert_eq!(resumed.state, ThreadState::Active);
         assert_eq!((resumed.turn, resumed.turn_message_id), (1, Some(4)));
+        assert_eq!(resumed.queued_message_id, None);
         assert_eq!(resumed.origin_message_id, Some(1));
         assert_eq!(resumed.session_id, created.session_id);
-        assert_eq!(
-            registry.resume(&created.id, 0, 5, at(4)).unwrap(),
-            None,
-            "a stale turn"
-        );
-        assert_eq!(registry.resume("t9", 0, 5, at(4)).unwrap(), None);
 
-        registry
-            .undo_resume(&created_done(&created), at(5))
-            .unwrap();
+        registry.undo_resume(&before, at(6)).unwrap();
         let undone = registry.get(&created.id).unwrap().unwrap();
         assert_eq!(undone.state, ThreadState::Done);
         assert_eq!((undone.turn, undone.turn_message_id), (0, Some(1)));
     }
 
-    fn created_done(created: &ThreadRecord) -> ThreadRecord {
-        ThreadRecord {
-            state: ThreadState::Done,
-            ..created.clone()
-        }
+    #[test]
+    fn the_queue_is_fifo_under_the_limit_and_a_mention_is_absorbed_once_per_pair() {
+        let folder = TempFolder::new("threads-queue");
+        let registry = registry(&folder.0);
+        let admit = |agent: &str, channel: &str, message| {
+            registry
+                .admit_mention(
+                    NewThread {
+                        channel: Some(channel.into()),
+                        ..mention(agent, message)
+                    },
+                    at(0),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(admit("chief", "geral", 1), Admission::Queued("t1".into()));
+        assert_eq!(
+            admit("reviewer", "geral", 2),
+            Admission::Queued("t2".into())
+        );
+        assert_eq!(admit("chief", "dev", 3), Admission::Queued("t3".into()));
+        assert_eq!(admit("chief", "geral", 4), Admission::Absorbed("t1".into()));
+        let positions: Vec<_> = registry
+            .list()
+            .unwrap()
+            .iter()
+            .map(|thread| (thread.queue_position, thread.queued_message_id))
+            .collect();
+        assert_eq!(
+            positions,
+            [(Some(1), Some(4)), (Some(2), Some(2)), (Some(3), Some(3))]
+        );
+        assert_eq!(registry.list().unwrap()[0].origin_message_id, Some(1));
+        assert_eq!(registry.list().unwrap()[0].turn_message_id, None);
+
+        let (_, first) = registry.promote_next(1, at(1)).unwrap().unwrap();
+        assert_eq!((first.id.as_str(), first.turn), ("t1", 0));
+        assert_eq!(
+            first.turn_message_id,
+            Some(4),
+            "the turn starts at the anchor"
+        );
+        assert_eq!(
+            registry.promote_next(1, at(1)).unwrap(),
+            None,
+            "at the limit"
+        );
+        assert_eq!(registry.get("t2").unwrap().unwrap().queue_position, Some(1));
+        let (_, second) = registry.promote_next(2, at(1)).unwrap().unwrap();
+        assert_eq!(second.id, "t2");
+        assert_eq!(admit("chief", "geral", 5), Admission::Queued("t4".into()));
+        assert_eq!(registry.get("t3").unwrap().unwrap().queue_position, Some(1));
+        assert_eq!(registry.get("t4").unwrap().unwrap().queue_position, Some(2));
+        assert_eq!(
+            registry.queued_thread("chief", "geral").unwrap().as_deref(),
+            Some("t4")
+        );
+        let direct = registry
+            .create(
+                NewThread {
+                    origin: ThreadOrigin::Direct,
+                    channel: None,
+                    ..mention("chief", 9)
+                },
+                at(1),
+            )
+            .unwrap();
+        assert_eq!(direct.state, ThreadState::Active);
+        let (_, third) = registry.promote_next(3, at(1)).unwrap().unwrap();
+        assert_eq!(third.id, "t3", "a direct conversation takes no slot");
+
+        let failed = registry.fail_queued("the workspace closed", at(2)).unwrap();
+        assert_eq!(
+            failed,
+            [(
+                "t4".to_owned(),
+                "chief".to_owned(),
+                Some("geral".to_owned())
+            )]
+        );
+        let t4 = registry.get("t4").unwrap().unwrap();
+        assert_eq!(t4.state, ThreadState::Failed);
+        assert_eq!(t4.end_reason.as_deref(), Some("the workspace closed"));
+        assert_eq!(t4.queue_position, None);
     }
 
     #[test]
-    fn two_concurrent_resumes_resume_a_thread_once() {
+    fn one_interruption_wins() {
+        let folder = TempFolder::new("threads-interrupt");
+        let registry = registry(&folder.0);
+        let created = registry.create(mention("chief", 1), at(0)).unwrap();
+
+        assert!(registry.interrupt(&created.id, "a", at(1)).unwrap());
+        assert!(!registry.interrupt(&created.id, "b", at(2)).unwrap());
+
+        let record = registry.get(&created.id).unwrap().unwrap();
+        assert_eq!(record.state, ThreadState::Interrupted);
+        assert_eq!(record.end_reason.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn two_concurrent_resumes_queue_a_thread_once() {
         let folder = TempFolder::new("threads-resume-race");
         let created = registry(&folder.0)
             .create(mention("chief", 1), at(0))
@@ -786,9 +1101,9 @@ mod tests {
                     let registry = registry(&path);
                     barrier.wait();
                     registry
-                        .resume(&id, 0, 10 + reply, at(2))
+                        .admit_resume(&id, 0, 10 + reply, at(2))
                         .unwrap()
-                        .and_then(|record| record.turn_message_id)
+                        .and_then(|record| record.queued_message_id)
                 })
             })
             .collect::<Vec<_>>()
@@ -799,7 +1114,8 @@ mod tests {
         let won: Vec<u64> = winners.into_iter().flatten().collect();
         assert_eq!(won.len(), 1, "{won:?}");
         let record = registry(&folder.0).get(&created.id).unwrap().unwrap();
-        assert_eq!((record.turn, record.turn_message_id), (1, Some(won[0])));
+        assert_eq!(record.state, ThreadState::Queued);
+        assert_eq!(record.queued_message_id, Some(won[0]));
     }
 
     #[test]
@@ -840,9 +1156,36 @@ mod tests {
 
         assert_eq!((listed[0].turn, listed[0].turn_message_id), (0, Some(3)));
         assert!(registry(&folder.0)
-            .resume("t1", 0, 5, at(0))
+            .admit_resume("t1", 0, 5, at(0))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn a_version_2_registry_gets_the_queue_and_keeps_its_threads() {
+        let folder = TempFolder::new("threads-upgrade-v2");
+        let v2 = rusqlite::Connection::open(folder.0.join(DATABASE_FILE)).unwrap();
+        v2.execute_batch(&format!(
+            "{}\n{}\n
+             INSERT INTO threads (agent, cli, channel, origin_message_id, isolation, state,
+                                  session_id, created_at, updated_at, turn, turn_message_id)
+                 VALUES ('chief', 'claude', 'geral', 3, 'shared', 'done', 'sid', 'x', 'x', 1, 4);
+             PRAGMA user_version = 2;",
+            SCHEMA.steps[0], SCHEMA.steps[1]
+        ))
+        .unwrap();
+        drop(v2);
+
+        let listed = registry(&folder.0).list().unwrap();
+
+        assert_eq!((listed[0].turn, listed[0].turn_message_id), (1, Some(4)));
+        assert_eq!(listed[0].queue_position, None);
+        assert_eq!(
+            registry(&folder.0)
+                .admit_mention(mention("chief", 5), at(0))
+                .unwrap(),
+            Admission::Queued("t2".into())
+        );
     }
 
     #[test]

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub(crate) const STATE_DIR: &str = ".regents";
 pub(crate) const MANIFEST_FILE: &str = "workspace.toml";
 const DEFAULT_MAX_ACTIVE_THREADS: u32 = 3;
+/// With 0 no thread could ever start, so the queue would never drain.
+const MIN_MAX_ACTIVE_THREADS: u32 = 1;
 
 /// Contents of `.regents/workspace.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +68,16 @@ pub(crate) fn read_manifest(root: &Path) -> io::Result<WorkspaceManifest> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{} has an empty id", path.display()),
+        ));
+    }
+    if manifest.max_active_threads < MIN_MAX_ACTIVE_THREADS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid {}: max_active_threads is {}, the minimum is {MIN_MAX_ACTIVE_THREADS}",
+                path.display(),
+                manifest.max_active_threads
+            ),
         ));
     }
     Ok(manifest)
@@ -305,6 +317,29 @@ mod tests {
         assert!(!second.initialized);
         assert_eq!(second.manifest, first.manifest);
         assert_eq!(files_under(&root), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_limit_of_zero_active_threads_is_an_error_that_names_the_field_and_the_minimum() {
+        let root = temp_folder("zero-limit");
+        std::fs::create_dir_all(root.join(".regents")).unwrap();
+        let path = root.join(".regents/workspace.toml");
+        std::fs::write(&path, "id = \"a\"\nname = \"x\"\nmax_active_threads = 0\n").unwrap();
+
+        let err = read_manifest(&root).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid {}: max_active_threads is 0, the minimum is 1",
+                path.display()
+            )
+        );
+        assert!(!holds_workspace(&root, "a"));
+        std::fs::write(&path, "id = \"a\"\nname = \"x\"\nmax_active_threads = 1\n").unwrap();
+        assert_eq!(read_manifest(&root).unwrap().max_active_threads, 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
