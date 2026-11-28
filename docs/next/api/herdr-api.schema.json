@@ -4801,6 +4801,33 @@
           ],
           "type": "object"
         },
+        "ThreadDecisionParams": {
+          "description": "`thread.accept` and `thread.fork`: an active thread decides about the\nmention that waits for it (#17). The CLI reads the thread and its\ncredential from the environment of the thread.",
+          "properties": {
+            "thread_id": {
+              "description": "The thread that decides, from `REGENTS_THREAD_ID`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thread_token": {
+              "description": "Credential of `thread_id`, from `REGENTS_THREAD_TOKEN`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "description": "Workspace of the thread: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "ThreadListParams": {
           "properties": {
             "workspace_id": {
@@ -6986,6 +7013,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/ThreadOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "thread.accept",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ThreadDecisionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "thread.fork",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ThreadDecisionParams"
             }
           },
           "required": [
@@ -11785,6 +11844,43 @@
                 "channel",
                 "opened",
                 "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The decision of a thread about its pending mention: `decision` is\n`accepted`, `forked` or `timed_out`. `fork_thread_id` is the thread\nthat took the mention after a fork or a timeout.",
+              "properties": {
+                "decision": {
+                  "type": "string"
+                },
+                "fork_thread_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "message_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "thread_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "thread_mention_decided",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "thread_id",
+                "message_id",
+                "decision"
               ],
               "type": "object"
             }

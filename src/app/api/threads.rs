@@ -1,14 +1,15 @@
 //! Thread and agent definition commands (Regents): `thread.list`,
-//! `thread.open` and `agent.definition.list`.
+//! `thread.open`, `thread.accept`, `thread.fork` and `agent.definition.list`.
 
 use crate::api::schema::{
     AgentApproval, AgentCliKind, AgentDefinitionInfo, AgentDefinitionListParams, AgentIsolation,
-    ErrorBody, ResponseResult, ThreadInfo, ThreadListParams, ThreadOpenParams, ThreadOriginKind,
-    ThreadState,
+    ErrorBody, ResponseResult, ThreadDecisionParams, ThreadInfo, ThreadListParams,
+    ThreadOpenParams, ThreadOriginKind, ThreadState,
 };
 use crate::app::threads::ThreadPopupError;
 use crate::app::App;
 use crate::regents::agents::{self, AgentCli, AgentDefinition, Approval, Isolation};
+use crate::regents::pending::{self, Event, Refusal};
 use crate::regents::threads::{self, ThreadRecord};
 
 use super::channels::error_body;
@@ -39,6 +40,81 @@ impl App {
                 },
             ),
             Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    /// `thread.accept` and `thread.fork`: the running thread of the
+    /// credential decides about its own pending mention, never about the
+    /// mention of another thread.
+    pub(super) fn handle_thread_decision(
+        &mut self,
+        id: String,
+        params: ThreadDecisionParams,
+        decision: Event,
+    ) -> String {
+        match self.decide_thread_mention(params, decision) {
+            Ok(result) => encode_success(id, result),
+            Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    fn decide_thread_mention(
+        &mut self,
+        params: ThreadDecisionParams,
+        decision: Event,
+    ) -> Result<ResponseResult, ErrorBody> {
+        let (index, state_dir) = self.folder_state_dir(params.workspace_id)?;
+        let (Some(thread_id), Some(token)) = (params.thread_id, params.thread_token) else {
+            return Err(error_body(
+                "invalid_thread_credential",
+                format!(
+                    "a decision runs from a thread, with {} and {}",
+                    crate::regents::THREAD_ID_ENV_VAR,
+                    crate::regents::THREAD_TOKEN_ENV_VAR
+                ),
+            ));
+        };
+        if self.thread_agent(&state_dir, &thread_id, &token).is_none() {
+            return Err(error_body(
+                "invalid_thread_credential",
+                format!(
+                    "the thread credential is not valid for thread {thread_id} of this \
+                     workspace, or the thread is no longer running"
+                ),
+            ));
+        }
+        let pending = self
+            .decide_pending_mention(&state_dir, &thread_id, decision)
+            .map_err(|err| error_body(err.code(), err.to_string()))?
+            .ok_or_else(|| {
+                error_body(
+                    "no_pending_mention",
+                    format!("no mention waits for thread {thread_id}"),
+                )
+            })?;
+        match pending::answer(decision, pending.phase) {
+            Ok(()) => Ok(ResponseResult::ThreadMentionDecided {
+                workspace_id: self.public_workspace_id(index),
+                thread_id,
+                message_id: pending.message_id,
+                decision: pending.phase.as_str().to_owned(),
+                fork_thread_id: pending.fork_thread_id,
+            }),
+            Err(Refusal::NotDelivered) => Err(error_body(
+                "mention_not_delivered",
+                format!(
+                    "the mention {} waits for an idle of thread {thread_id}",
+                    pending.message_id
+                ),
+            )),
+            Err(Refusal::AlreadyDecided(phase)) => Err(error_body(
+                "mention_already_decided",
+                format!(
+                    "the mention {} is already {}",
+                    pending.message_id,
+                    phase.as_str()
+                ),
+            )),
         }
     }
 
