@@ -1983,6 +1983,13 @@
                 "null"
               ]
             },
+            "thread_token": {
+              "description": "Credential of `origin_thread_id`, from `REGENTS_THREAD_TOKEN`.\nWith a valid credential the thread agent is the author.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "workspace_id": {
               "description": "Workspace of the channel: its public ID or the stable ID from\n`workspace.toml`. Absent means the active workspace.",
               "type": [

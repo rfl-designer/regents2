@@ -327,21 +327,24 @@ impl App {
             body,
             reply_to,
             origin_thread_id,
+            thread_token,
         } = params;
         let origin_thread_id = origin_thread_id
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty());
+        let thread_token = thread_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty());
         let (index, state_dir) = self.folder_state_dir(workspace_id)?;
+        let author = self.post_author(&state_dir, origin_thread_id.as_deref(), thread_token)?;
         let channel = channel::open(&state_dir, &channel)?;
         let workspace_id = self.public_workspace_id(index);
         let agents = agents::list(&state_dir);
         let mentions = mention::resolve(&body, agents.iter().map(|agent| agent.name.as_str()));
         let posted = channel.post(
             NewMessage {
-                author: Author {
-                    kind: AuthorKind::Human,
-                    id: local_human_id(),
-                },
+                author,
                 body,
                 reply_to,
                 origin_thread_id,
@@ -368,6 +371,52 @@ impl App {
             workspace_id,
             message,
         })
+    }
+
+    /// The author of a post: the local human without an origin thread, the
+    /// thread agent with an origin thread and its credential. Any other
+    /// combination is refused, so no client can post as an agent or a thread.
+    fn post_author(
+        &self,
+        state_dir: &std::path::Path,
+        origin_thread_id: Option<&str>,
+        thread_token: Option<&str>,
+    ) -> Result<Author, ErrorBody> {
+        match (origin_thread_id, thread_token) {
+            (None, None) => Ok(Author {
+                kind: AuthorKind::Human,
+                id: local_human_id(),
+            }),
+            (Some(thread_id), Some(token)) => self
+                .thread_agent(state_dir, thread_id, token)
+                .map(|agent| Author {
+                    kind: AuthorKind::Agent,
+                    id: agent.to_owned(),
+                })
+                .ok_or_else(|| {
+                    error_body(
+                        "invalid_thread_credential",
+                        format!(
+                            "the thread credential is not valid for thread {thread_id} of this \
+                             workspace, or the thread is no longer running"
+                        ),
+                    )
+                }),
+            (Some(thread_id), None) => Err(error_body(
+                "invalid_thread_credential",
+                format!(
+                    "a post from thread {thread_id} needs its credential in {}",
+                    crate::regents::THREAD_TOKEN_ENV_VAR
+                ),
+            )),
+            (None, Some(_)) => Err(error_body(
+                "invalid_thread_credential",
+                format!(
+                    "a thread credential needs its thread ID in {}",
+                    crate::regents::THREAD_ID_ENV_VAR
+                ),
+            )),
+        }
     }
 
     fn read_channel_messages(
@@ -598,6 +647,36 @@ mod tests {
             shutdown_test_runtimes(&mut self.app);
             let _ = std::fs::remove_dir_all(&self.base);
         }
+    }
+
+    #[tokio::test]
+    async fn a_post_with_an_incomplete_or_unknown_thread_credential_is_refused() {
+        let mut fixture = Fixture::new("credential");
+        let (_, workspace_id) = fixture.workspace("projeto");
+
+        for extra in [
+            json!({"origin_thread_id": "t1"}),
+            json!({"thread_token": "abc"}),
+            json!({"origin_thread_id": "t1", "thread_token": "abc"}),
+        ] {
+            let mut params =
+                json!({"workspace_id": workspace_id, "channel": "geral", "body": "oi"});
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let refused = fixture.request("channel.post", params);
+            assert_eq!(
+                refused["error"]["code"], "invalid_thread_credential",
+                "{extra}: {refused}"
+            );
+        }
+        let read = fixture.request(
+            "channel.read",
+            json!({"workspace_id": workspace_id, "channel": "geral"}),
+        );
+        assert_eq!(read["result"]["messages"], json!([]), "{read}");
+        assert!(fixture.posted_events().is_empty());
     }
 
     #[tokio::test]

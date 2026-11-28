@@ -25,6 +25,11 @@ use std::path::Path;
 /// it as the origin thread of the message.
 pub(crate) const THREAD_ID_ENV_VAR: &str = "REGENTS_THREAD_ID";
 
+/// Environment of a thread CLI: the credential of its thread. The server
+/// accepts a post with an origin thread only with this credential, and then
+/// records the thread agent as the author.
+pub(crate) const THREAD_TOKEN_ENV_VAR: &str = "REGENTS_THREAD_TOKEN";
+
 /// Set by every server for its panes (`integration::apply_pane_base_env`):
 /// the executable of the server that launched the pane.
 const SERVER_BIN_PATH_ENV_VAR: &str = "HERDR_BIN_PATH";

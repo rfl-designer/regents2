@@ -728,6 +728,7 @@ impl ChatSource for ApiSource {
                 body,
                 reply_to: None,
                 origin_thread_id: None,
+                thread_token: None,
             }),
         )?;
         match result {

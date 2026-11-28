@@ -27,6 +27,10 @@ cli_params! {
         /// thread (delegation comes later).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub origin_thread_id: Option<String> => Field::new(Option::<String>::None),
+        /// Credential of `origin_thread_id`, from `REGENTS_THREAD_TOKEN`.
+        /// With a valid credential the thread agent is the author.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub thread_token: Option<String> => Field::new(Option::<String>::None),
     }
 }
 

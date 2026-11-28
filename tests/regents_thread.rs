@@ -19,7 +19,9 @@ use serde_json::Value;
 /// A fake `claude` CLI. It records its arguments (NUL separated) and its
 /// PID, reports `working`, posts the contents of the file `post` to `#geral`
 /// when that file exists, waits for the file `go`, reports `idle` and then
-/// stays alive, as an interactive CLI does.
+/// stays alive, as an interactive CLI does. After that post it also posts with
+/// an invalid credential, posts to the workspace named in the file `other`
+/// when that file exists, and reads the channel.
 struct FakeClaude {
     bin: PathBuf,
     out: PathBuf,
@@ -39,7 +41,16 @@ mv "$out/args.tmp" "$out/args"
 printf '%s' "$$" > "$out/pid"
 '{regents}' pane report-agent "$HERDR_PANE_ID" --source custom:fake-claude --agent claude --state working > /dev/null
 if [ -f "$out/post" ]; then
-  '{regents}' channel post geral "$(cat "$out/post")" > "$out/posted"
+  '{regents}' channel post geral "$(cat "$out/post")" > "$out/posted.tmp"
+  mv "$out/posted.tmp" "$out/posted"
+  REGENTS_THREAD_TOKEN=invalida '{regents}' channel post geral "falsa" 2> "$out/refused.tmp"
+  mv "$out/refused.tmp" "$out/refused"
+  if [ -f "$out/other" ]; then
+    '{regents}' channel post --workspace "$(cat "$out/other")" geral "fora" 2> "$out/elsewhere.tmp"
+    mv "$out/elsewhere.tmp" "$out/elsewhere"
+  fi
+  '{regents}' channel read geral > "$out/read.tmp"
+  mv "$out/read.tmp" "$out/read"
 fi
 while [ ! -f "$out/go" ]; do sleep 0.05; done
 '{regents}' pane report-agent "$HERDR_PANE_ID" --source custom:fake-claude --agent claude --state idle > /dev/null
@@ -85,16 +96,24 @@ exec sleep 600
         fs::write(self.out.join("post"), body).unwrap();
     }
 
+    /// The JSON output `name` of a command that the fake ran in its thread.
+    fn wait_for_output(&self, name: &str) -> Value {
+        let file = self.out.join(name);
+        assert!(
+            wait_until(Duration::from_secs(10), || file.is_file()),
+            "the fake claude did not write {name}"
+        );
+        serde_json::from_slice(&fs::read(file).unwrap()).unwrap()
+    }
+
     /// The JSON result of the post from inside the thread.
     fn wait_for_thread_post(&self) -> Value {
-        let file = self.out.join("posted");
-        assert!(
-            wait_until(Duration::from_secs(10), || fs::read(&file)
-                .is_ok_and(|bytes| bytes.ends_with(b"\n"))),
-            "the fake claude did not post"
-        );
-        let response: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
-        response["result"].clone()
+        self.wait_for_output("posted")["result"].clone()
+    }
+
+    /// Makes the next launch also post to the workspace `workspace_id`.
+    fn post_to_other_workspace(&self, workspace_id: &str) {
+        fs::write(self.out.join("other"), workspace_id).unwrap();
     }
 
     /// Lets the fake finish its turn.
@@ -158,6 +177,7 @@ fn a_mention_opens_a_hidden_thread_that_ends_done_with_its_session() {
     let posted = sandbox.cli(&["channel", "post", "geral", "@chief", "olá"]);
 
     assert_eq!(posted["message"]["mentions"], serde_json::json!(["chief"]));
+    assert_eq!(posted["message"]["author"]["kind"], "human", "{posted}");
     let active = threads(&sandbox);
     assert_eq!(active.len(), 1, "{active:?}");
     let thread = &active[0];
@@ -286,4 +306,43 @@ fn a_mention_posted_from_a_thread_opens_no_thread() {
         1,
         "a post from a thread opened a thread: {after:?}"
     );
+}
+
+#[test]
+fn a_thread_posts_as_its_agent_and_reads_the_channel_history() {
+    let sandbox = Sandbox::new();
+    let fake = FakeClaude::install(&sandbox);
+    fake.post_from_thread("oi");
+    let _server = sandbox.start_server_with_env(&[fake.path_env()]);
+    // `workspace add` does not focus: `projeto`, added first, stays active.
+    add_workspace(&sandbox, "projeto");
+    let other = sandbox.folder("outro");
+    let added = sandbox.cli(&["workspace", "add", other.to_str().unwrap()]);
+    fake.post_to_other_workspace(added["workspace"]["workspace_id"].as_str().unwrap());
+
+    sandbox.cli(&["channel", "post", "geral", "@chief", "olá"]);
+    let from_thread = fake.wait_for_thread_post();
+    let refused = fake.wait_for_output("refused");
+    let elsewhere = fake.wait_for_output("elsewhere");
+    let read = fake.wait_for_output("read")["result"].clone();
+
+    let thread_id = threads(&sandbox)[0]["id"].clone();
+    let message = &from_thread["message"];
+    assert_eq!(
+        message["author"],
+        serde_json::json!({"kind": "agent", "id": "chief"})
+    );
+    assert_eq!(message["origin_thread_id"], thread_id, "{from_thread}");
+    assert_eq!(
+        refused["error"]["code"], "invalid_thread_credential",
+        "{refused}"
+    );
+    let bodies: Vec<&Value> = read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| &message["body"])
+        .collect();
+    assert_eq!(bodies, ["@chief olá", "oi"], "{read}");
+    fake.finish_turn();
 }

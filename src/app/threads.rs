@@ -19,7 +19,7 @@ use crate::regents::threads::{
 };
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 
-use crate::regents::THREAD_ID_ENV_VAR;
+use crate::regents::{THREAD_ID_ENV_VAR, THREAD_TOKEN_ENV_VAR};
 
 /// Environment of a thread CLI: the stable workspace ID, next to
 /// `THREAD_ID_ENV_VAR`.
@@ -34,6 +34,11 @@ pub(crate) struct RunningThread {
     /// `.regents` of the workspace that owns the thread registry.
     pub(crate) state_dir: PathBuf,
     pub(crate) thread_id: String,
+    /// Agent name: the author of the messages that the thread posts.
+    pub(crate) agent: String,
+    /// Credential in `THREAD_TOKEN_ENV_VAR`. Only memory keeps it: a thread
+    /// does not survive a server restart or handoff.
+    pub(crate) token: String,
     terminal_id: TerminalId,
     progress: ThreadProgress,
 }
@@ -125,8 +130,13 @@ impl App {
             .as_ref()
             .map(|binding| binding.id.clone())
             .unwrap_or_default();
+        let token: String = crate::regents::random_bytes(b"thread-token")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let env = vec![
             (THREAD_ID_ENV_VAR.to_owned(), thread.id.clone()),
+            (THREAD_TOKEN_ENV_VAR.to_owned(), token.clone()),
             (WORKSPACE_ID_ENV_VAR.to_owned(), workspace_stable_id),
         ];
         match self.spawn_background_pane(ws_idx, folder, argv, env) {
@@ -136,6 +146,8 @@ impl App {
                     RunningThread {
                         state_dir: state_dir.to_path_buf(),
                         thread_id: thread.id,
+                        agent: thread.agent,
+                        token,
                         terminal_id,
                         progress: ThreadProgress::default(),
                     },
@@ -292,6 +304,24 @@ impl App {
             self.expected_thread_exits.insert(pane_id);
             self.shutdown_terminal_runtime(thread.terminal_id);
         }
+    }
+
+    /// Agent of the running thread `thread_id` of the workspace whose state
+    /// directory is `state_dir`, when `token` is its credential.
+    pub(crate) fn thread_agent(
+        &self,
+        state_dir: &Path,
+        thread_id: &str,
+        token: &str,
+    ) -> Option<&str> {
+        self.running_threads
+            .values()
+            .find(|thread| {
+                thread.thread_id == thread_id
+                    && thread.state_dir == state_dir
+                    && thread.token == token
+            })
+            .map(|thread| thread.agent.as_str())
     }
 
     /// Public pane ID of the running thread `thread_id` of the workspace

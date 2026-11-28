@@ -159,15 +159,17 @@ pub(crate) fn request(args: &[String]) -> Result<Request, ParseError> {
     let cwd = std::env::current_dir().map_err(ParseError::Io)?;
     let mut request = request_in(args, &cwd)?;
     if let Method::ChannelPost(params) = &mut request.method {
-        params.origin_thread_id = thread_id_from_env();
+        params.origin_thread_id = env_value(crate::regents::THREAD_ID_ENV_VAR);
+        params.thread_token = env_value(crate::regents::THREAD_TOKEN_ENV_VAR);
     }
     Ok(request)
 }
 
 /// The thread of a command that a thread CLI runs: the server sets
-/// `REGENTS_THREAD_ID` in the environment of each thread.
-fn thread_id_from_env() -> Option<String> {
-    std::env::var(crate::regents::THREAD_ID_ENV_VAR)
+/// `REGENTS_THREAD_ID` and `REGENTS_THREAD_TOKEN` in the environment of each
+/// thread.
+fn env_value(var: &str) -> Option<String> {
+    std::env::var(var)
         .ok()
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty())
