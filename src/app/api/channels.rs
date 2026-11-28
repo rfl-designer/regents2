@@ -90,6 +90,11 @@ impl App {
             tracing::warn!(%err, from, to, "cannot move the threads of a renamed channel");
         }
         let old_label = format!("#{from}");
+        let argv = crate::regents::chat_panes::view_argv(&ChannelView {
+            folder_id: folder_id.clone(),
+            channel: to.clone(),
+        })
+        .ok();
         let chat_panes: Vec<PaneId> = self
             .state
             .channel_views
@@ -101,14 +106,17 @@ impl App {
             })
             .collect();
         for pane_id in chat_panes {
-            let terminal = self
+            let Some(terminal) = self
                 .find_pane(pane_id)
                 .map(|(_, pane)| pane.attached_terminal_id.clone())
-                .and_then(|terminal_id| self.state.terminals.get_mut(&terminal_id));
+                .and_then(|terminal_id| self.state.terminals.get_mut(&terminal_id))
+            else {
+                continue;
+            };
+            // A live handoff rebuilds the chat pane registry from this argv.
+            terminal.launch_argv.clone_from(&argv);
             // A label that the user changed stays.
-            if let Some(terminal) =
-                terminal.filter(|terminal| terminal.manual_label.as_deref() == Some(&old_label))
-            {
+            if terminal.manual_label.as_deref() == Some(old_label.as_str()) {
                 terminal.set_manual_label(format!("#{to}"));
             }
             self.state.mark_session_dirty();
@@ -981,6 +989,10 @@ mod tests {
             "{pane}"
         );
         assert_eq!(pane["result"]["pane"]["label"], "#release", "{pane}");
+        // A live handoff registers the chat panes again from their argv.
+        fixture.app.register_restored_channel_views();
+        let view = fixture.app.state.channel_views.values().next().cloned();
+        assert_eq!(view.map(|view| view.channel).as_deref(), Some("release"));
         let events: Vec<EventData> = fixture
             .app
             .event_hub

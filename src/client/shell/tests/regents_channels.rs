@@ -203,14 +203,22 @@ fn the_parent_of_a_worktree_group_expands_its_channels_too() {
 }
 
 #[test]
-fn an_unread_channel_row_shows_a_dot() {
+fn an_unread_channel_shows_a_dot_on_its_row_and_on_the_collapsed_workspace() {
     let mut state = state_with_channels(&["deploy", "geral"]);
     if let Some(snapshot) = state.snapshot.as_deref() {
         let mut projected = snapshot.clone();
         projected.workspaces[0].unread_channels = vec!["deploy".into()];
         state.set_snapshot(Box::new(projected));
     }
-    compose_text(&mut state);
+    let collapsed = sidebar_lines(&compose_text(&mut state));
+    let workspace_row = collapsed
+        .iter()
+        .find(|line| line.contains("projeto"))
+        .unwrap_or_else(|| panic!("no workspace row: {collapsed:?}"));
+    assert!(
+        workspace_row.contains('●') && !workspace_row.contains('▸'),
+        "{collapsed:?}"
+    );
     click_channel_toggle(&mut state);
 
     let lines = sidebar_lines(&compose_text(&mut state));

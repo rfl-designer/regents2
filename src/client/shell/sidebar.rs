@@ -360,7 +360,13 @@ pub(crate) fn render_sidebar(
             palette,
         );
         if !workspace.channels.is_empty() {
-            let toggle = render_channel_toggle(buffer, rect, !channels.is_empty(), palette);
+            let toggle = render_channel_toggle(
+                buffer,
+                rect,
+                !channels.is_empty(),
+                !workspace.unread_channels.is_empty(),
+                palette,
+            );
             hits.channel_toggles.push((toggle, entry.index));
         }
         render_channel_rows(
@@ -680,11 +686,13 @@ fn shown_channels<'a>(
 
 /// Draws the expand toggle of a workspace with channels in the left column of
 /// its first row, which every row leaves blank. The right edge stays free
-/// for the worktree group toggle.
+/// for the worktree group toggle. A collapsed workspace with unread channels
+/// shows the unread dot of its channel rows instead of the arrow.
 fn render_channel_toggle(
     buffer: &mut Buffer,
     workspace_rect: Rect,
     expanded: bool,
+    unread: bool,
     palette: &Palette,
 ) -> Rect {
     let toggle = Rect::new(
@@ -698,7 +706,11 @@ fn render_channel_toggle(
         toggle.x,
         toggle.y,
         toggle.width,
-        if expanded { "▾" } else { "▸" },
+        match (expanded, unread) {
+            (true, _) => "▾",
+            (false, true) => "●",
+            (false, false) => "▸",
+        },
         Style::default().fg(palette.accent),
     );
     toggle
