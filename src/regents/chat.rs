@@ -3,15 +3,19 @@
 //! command, so the layout, focus, mouse, popup and remote clients of herdr
 //! treat it as any other pane. The view is an ordinary JSON API client: it
 //! follows `channel.message_posted`, reads the history with `channel.read`
-//! and posts the one-line draft with `channel.post`. A click on the `[↩]`
-//! link of an agent message makes the draft a threaded reply to it. The
-//! draft, its reply target and the scroll position are state of this
-//! process (ADR-0001 records this exception).
+//! and posts the draft with `channel.post`. The draft has several lines: a
+//! paste or a modified Enter inserts a line break, and Enter alone sends.
+//! Typing `@` lists the agents of `agent.definition.list` to complete a
+//! mention. A click on the `[↩]` link of an agent message makes the draft a
+//! threaded reply to it. The draft, its reply target and the scroll position
+//! are state of this process (ADR-0001 records this exception).
 //!
 //! The view draws only after a change, so an idle chat pane writes no bytes
 //! to its PTY. It never exits on its own when the channel cannot be read: it
 //! shows the error and tries again, so the pane keeps its place in the
 //! layout.
+
+mod draft;
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead};
@@ -27,14 +31,17 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Widget, Wrap};
+
+use draft::Draft;
 
 use crate::api::client::{parse_response_value, ApiClient};
 use crate::api::schema::{
-    ChannelAuthorKind, ChannelMessageInfo, ChannelPostParams, ChannelReadParams, EventData,
-    EventEnvelope, EventsSubscribeParams, Method, Request, ResponseResult, Subscription,
-    ThreadOpenParams,
+    AgentDefinitionListParams, ChannelAuthorKind, ChannelMessageInfo, ChannelPostParams,
+    ChannelReadParams, EventData, EventEnvelope, EventsSubscribeParams, Method, Request,
+    ResponseResult, Subscription, ThreadOpenParams,
 };
+use crate::regents::mention;
 
 /// Messages that one history read returns: the most recent ones at start, or
 /// one page of older ones when the scroll reaches the top.
@@ -57,6 +64,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HUMAN_MARKER: &str = "●";
 /// Link of an agent message that makes the draft a reply to it.
 const REPLY_LINK: &str = " [↩]";
+/// Most rows of the input before it scrolls with the cursor.
+const MAX_INPUT_ROWS: usize = 5;
+/// Most agent names that the mention list shows at once.
+const MAX_SUGGESTIONS: usize = 5;
 
 /// What a key asks the chat view to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +78,26 @@ pub(crate) enum ChatAction {
         body: String,
         reply_to: Option<u64>,
     },
+    /// A mention started: read the agent names for its list.
+    ListAgents,
     Quit,
+}
+
+/// The list of agents that completes the mention before the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Suggest {
+    /// No mention before the cursor.
+    Closed,
+    /// Esc closed the list of the mention whose `@` is at this byte index;
+    /// it stays closed until that mention ends.
+    Dismissed(usize),
+    /// The list of the mention whose `@` is at byte index `at`: the agent
+    /// names read when the mention started, and the selected match.
+    Open {
+        at: usize,
+        agents: Vec<String>,
+        selected: usize,
+    },
 }
 
 /// What a click on the first line of a message opens.
@@ -100,7 +130,8 @@ pub(crate) struct ChatView {
     older_exhausted: bool,
     /// A load of older messages dropped the newest ones from the window.
     newest_dropped: bool,
-    draft: String,
+    draft: Draft,
+    suggest: Suggest,
     /// The message that the draft replies to.
     reply_to: Option<u64>,
     /// Rows above the newest line of the history. Zero follows new messages.
@@ -121,7 +152,8 @@ impl ChatView {
             ids: HashSet::new(),
             older_exhausted: false,
             newest_dropped: false,
-            draft: String::new(),
+            draft: Draft::default(),
+            suggest: Suggest::Closed,
             reply_to: None,
             scroll_from_bottom: 0,
             viewport: (0, 0),
@@ -233,7 +265,51 @@ impl ChatView {
         if key.kind == KeyEventKind::Release {
             return ChatAction::None;
         }
+        let action = match self.handle_list_key(key) {
+            Some(action) => action,
+            None => self.handle_draft_key(key),
+        };
+        self.follow_mention(action)
+    }
+
+    /// Inserts pasted text in the draft. A paste never sends.
+    pub(crate) fn handle_paste(&mut self, text: &str) -> ChatAction {
+        self.draft.insert(text);
+        self.follow_mention(ChatAction::None)
+    }
+
+    /// Gives the agent names for the open mention list.
+    pub(crate) fn show_agents(&mut self, agents: Vec<String>) {
+        if let Suggest::Open { agents: shown, .. } = &mut self.suggest {
+            *shown = agents;
+        }
+    }
+
+    /// Keys of the open mention list. No key here clears the draft. None
+    /// when the list is closed or the key edits the draft.
+    fn handle_list_key(&mut self, key: KeyEvent) -> Option<ChatAction> {
+        let (name, selected, last) = {
+            let (matches, selected) = self.suggestions()?;
+            (matches[selected].to_owned(), selected, matches.len() - 1)
+        };
+        let at = self.mention()?.0;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter if key.modifiers.is_empty() => self.complete(&name),
+            KeyCode::Tab => self.complete(&name),
+            KeyCode::Up => self.select(selected.saturating_sub(1)),
+            KeyCode::Down => self.select((selected + 1).min(last)),
+            KeyCode::Esc => self.suggest = Suggest::Dismissed(at),
+            KeyCode::Char('c') if ctrl => self.suggest = Suggest::Dismissed(at),
+            KeyCode::Char('d') if ctrl => {}
+            _ => return None,
+        }
+        Some(ChatAction::None)
+    }
+
+    fn handle_draft_key(&mut self, key: KeyEvent) -> ChatAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let width = draft_width(self.viewport.0);
         match key.code {
             KeyCode::Char('c') if ctrl => {
                 if self.draft.is_empty() && self.reply_to.is_none() {
@@ -245,27 +321,34 @@ impl ChatView {
             KeyCode::Char('d') if ctrl && self.draft.is_empty() && self.reply_to.is_none() => {
                 return ChatAction::Quit
             }
+            // Ctrl+J is LF: the line break of every terminal.
+            KeyCode::Char('j') if ctrl => self.draft.insert("\n"),
             KeyCode::Char(_) if ctrl => {}
-            KeyCode::Char(ch) => self.draft.push(ch),
-            KeyCode::Backspace => {
-                self.draft.pop();
-            }
+            KeyCode::Char(ch) => self.draft.insert(ch.encode_utf8(&mut [0; 4])),
+            KeyCode::Backspace => self.draft.backspace(),
+            KeyCode::Left => self.draft.left(),
+            KeyCode::Right => self.draft.right(),
             KeyCode::Esc => {
                 self.draft.clear();
                 self.reply_to = None;
             }
+            // Shift+Enter, and Alt+Enter (ESC CR) where the terminal has no
+            // keyboard protocol.
+            KeyCode::Enter if !key.modifiers.is_empty() => self.draft.insert("\n"),
             KeyCode::Enter => {
-                if self.draft.trim().is_empty() {
+                if self.draft.as_str().trim().is_empty() {
                     return ChatAction::None;
                 }
                 self.scroll_from_bottom = 0;
+                // A paste often ends with a line break.
+                let body = self.draft.take().trim_end_matches('\n').to_owned();
                 return ChatAction::Send {
-                    body: std::mem::take(&mut self.draft),
+                    body,
                     reply_to: self.reply_to.take(),
                 };
             }
-            KeyCode::Up => self.scroll_up(1),
-            KeyCode::Down => self.scroll_down(1),
+            KeyCode::Up if !self.draft.up(width) => self.scroll_up(1),
+            KeyCode::Down if !self.draft.down(width) => self.scroll_down(1),
             KeyCode::PageUp => self.scroll_up(self.page()),
             KeyCode::PageDown => self.scroll_down(self.page()),
             KeyCode::Home => self.scroll_up(usize::MAX),
@@ -273,6 +356,82 @@ impl ChatView {
             _ => {}
         }
         ChatAction::None
+    }
+
+    /// Opens, keeps or closes the mention list after the draft changed. A
+    /// new mention asks for the agent names: they come from the server each
+    /// time, because no event tells the view that an agent file changed.
+    fn follow_mention(&mut self, action: ChatAction) -> ChatAction {
+        let Some((at, _)) = self.mention() else {
+            self.suggest = Suggest::Closed;
+            return action;
+        };
+        let known = match self.suggest {
+            Suggest::Open { at: open, .. } | Suggest::Dismissed(open) => open == at,
+            Suggest::Closed => false,
+        };
+        if known {
+            return action;
+        }
+        self.suggest = Suggest::Open {
+            at,
+            agents: Vec::new(),
+            selected: 0,
+        };
+        if action == ChatAction::None {
+            ChatAction::ListAgents
+        } else {
+            action
+        }
+    }
+
+    /// The mention before the cursor: the byte index of its `@` and the
+    /// name typed so far. None inside a name, where completing would keep
+    /// the rest of the name after the cursor.
+    fn mention(&self) -> Option<(usize, &str)> {
+        if self.draft.after_cursor().starts_with(mention::is_name_char) {
+            return None;
+        }
+        mention::trailing_mention(self.draft.before_cursor())
+    }
+
+    /// The agents whose name starts with the typed mention, and the selected
+    /// one. None when the list is closed or nothing matches.
+    fn suggestions(&self) -> Option<(Vec<&str>, usize)> {
+        let Suggest::Open {
+            agents, selected, ..
+        } = &self.suggest
+        else {
+            return None;
+        };
+        let typed = self.mention()?.1.to_ascii_lowercase();
+        let matches: Vec<&str> = agents
+            .iter()
+            .map(String::as_str)
+            .filter(|name| name.starts_with(&typed))
+            .collect();
+        let selected = (*selected).min(matches.len().checked_sub(1)?);
+        Some((matches, selected))
+    }
+
+    fn select(&mut self, index: usize) {
+        if let Suggest::Open { selected, .. } = &mut self.suggest {
+            *selected = index;
+        }
+    }
+
+    /// Replaces the typed mention with `@name` and a space, unless a space
+    /// already follows.
+    fn complete(&mut self, name: &str) {
+        if let Some((at, _)) = self.mention() {
+            let space = if self.draft.after_cursor().starts_with(char::is_whitespace) {
+                ""
+            } else {
+                " "
+            };
+            self.draft
+                .replace_before_cursor(at, &format!("@{name}{space}"));
+        }
     }
 
     /// Scrolls on a mouse wheel step. Returns false for other mouse events,
@@ -289,7 +448,7 @@ impl ChatView {
     /// Puts back a draft whose post failed, so the user can send it again.
     pub(crate) fn restore_draft(&mut self, body: String, reply_to: Option<u64>) {
         if self.draft.is_empty() {
-            self.draft = body;
+            self.draft.set(&body);
             self.reply_to = self.reply_to.or(reply_to);
         }
     }
@@ -311,14 +470,48 @@ impl ChatView {
     }
 
     fn page(&self) -> usize {
-        usize::from(history_height(self.viewport.1).saturating_sub(1).max(1))
+        usize::from(self.viewport_history().height.saturating_sub(1).max(1))
     }
 
     fn max_scroll(&self) -> usize {
-        let (width, height) = self.viewport;
+        let history = self.viewport_history();
         self.history_paragraph()
-            .line_count(width)
-            .saturating_sub(usize::from(history_height(height)))
+            .line_count(history.width)
+            .saturating_sub(usize::from(history.height))
+    }
+
+    fn viewport_history(&self) -> Rect {
+        let (width, height) = self.viewport;
+        self.history_area(Rect::new(0, 0, width, height))
+    }
+
+    /// Rows of the input: one per row of the draft, at most
+    /// `MAX_INPUT_ROWS`, and never more than the area has under the header
+    /// and the separator.
+    fn input_height(&self, area: Rect) -> u16 {
+        let rows = self.draft.rows(draft_width(area.width)).len();
+        let rows = rows.min(MAX_INPUT_ROWS);
+        u16::try_from(rows)
+            .unwrap_or(u16::MAX)
+            .min(area.height.saturating_sub(2))
+            .max(1)
+    }
+
+    /// Rows of the history: the area minus the header, the separator and the
+    /// input.
+    fn history_area(&self, area: Rect) -> Rect {
+        Rect {
+            y: area.y.saturating_add(1),
+            height: area.height.saturating_sub(2 + self.input_height(area)),
+            ..area
+        }
+    }
+
+    /// The first draft row that the input shows: the input follows the
+    /// cursor when the draft has more rows than the input.
+    fn input_top(&self, area: Rect) -> usize {
+        let (row, _) = self.draft.cursor_at(draft_width(area.width));
+        (row + 1).saturating_sub(usize::from(self.input_height(area)))
     }
 
     fn history_paragraph(&self) -> Paragraph<'_> {
@@ -335,7 +528,7 @@ impl ChatView {
     /// an agent message replies to it, and a click elsewhere on its first
     /// line opens the thread that posted it.
     pub(crate) fn link_at(&self, area: Rect, column: u16, row: u16) -> Option<ChatLink> {
-        let history = history_area(area);
+        let history = self.history_area(area);
         let inside = column >= history.x
             && column < history.right()
             && row >= history.y
@@ -472,7 +665,7 @@ impl ChatView {
         }
         Paragraph::new(Line::from(header)).render(Rect { height: 1, ..area }, buffer);
 
-        let history = history_area(area);
+        let history = self.history_area(area);
         let paragraph = self.history_paragraph();
         let total = paragraph.line_count(history.width);
         let top = history_top(total, history.height, self.scroll_from_bottom);
@@ -483,7 +676,9 @@ impl ChatView {
         if area.height < 3 {
             return;
         }
-        let separator_y = area.bottom().saturating_sub(2);
+        let input_height = self.input_height(area);
+        let input_y = area.bottom().saturating_sub(input_height);
+        let separator_y = input_y.saturating_sub(1);
         let separator = match self.reply_to {
             Some(id) => {
                 let target = self
@@ -498,59 +693,72 @@ impl ChatView {
             }
             None => "─".repeat(usize::from(area.width)),
         };
+        let row = |y: u16| Rect {
+            y,
+            height: 1,
+            ..area
+        };
         Paragraph::new(Line::styled(
             separator,
             Style::default().add_modifier(Modifier::DIM),
         ))
-        .render(
-            Rect {
-                y: separator_y,
-                height: 1,
-                ..area
-            },
-            buffer,
-        );
-        let input = Rect {
-            y: area.bottom().saturating_sub(1),
-            height: 1,
-            ..area
-        };
-        // Keep the end of a long draft visible.
-        let visible = usize::from(area.width.saturating_sub(3));
-        let skip = self.draft.chars().count().saturating_sub(visible);
-        let shown: String = self.draft.chars().skip(skip).collect();
-        Paragraph::new(Line::from(vec![
-            Span::styled("> ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(shown),
-        ]))
-        .render(input, buffer);
+        .render(row(separator_y), buffer);
+
+        let rows = self.draft.rows(draft_width(area.width));
+        let first = self.input_top(area);
+        for (y, range) in (input_y..area.bottom()).zip(rows.iter().skip(first)) {
+            let prompt = if y == input_y && first == 0 {
+                "> "
+            } else {
+                "  "
+            };
+            Paragraph::new(Line::from(vec![
+                Span::styled(prompt, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(&self.draft.as_str()[range.clone()]),
+            ]))
+            .render(row(y), buffer);
+        }
+
+        // The mention list covers the newest history rows.
+        if let Some((matches, selected)) = self.suggestions() {
+            let shown = matches
+                .len()
+                .min(MAX_SUGGESTIONS)
+                .min(usize::from(history.height));
+            let skip = (selected + 1).saturating_sub(shown);
+            let list_y = separator_y.saturating_sub(u16::try_from(shown).unwrap_or(0));
+            for (y, (index, name)) in
+                (list_y..separator_y).zip(matches.iter().enumerate().skip(skip))
+            {
+                let style = if index == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Clear.render(row(y), buffer);
+                Paragraph::new(Line::styled(format!(" @{name}"), style)).render(row(y), buffer);
+            }
+        }
     }
 
     /// Screen position of the input cursor in `area`.
     pub(crate) fn cursor(&self, area: Rect) -> (u16, u16) {
-        let visible = usize::from(area.width.saturating_sub(3));
-        let shown = self.draft.chars().count().min(visible);
+        let (row, column) = self.draft.cursor_at(draft_width(area.width));
+        let input_y = area.bottom().saturating_sub(self.input_height(area));
+        let row = u16::try_from(row - self.input_top(area)).unwrap_or(u16::MAX);
         (
             area.x
                 .saturating_add(2)
-                .saturating_add(u16::try_from(shown).unwrap_or(u16::MAX)),
-            area.bottom().saturating_sub(1),
+                .saturating_add(u16::try_from(column).unwrap_or(u16::MAX)),
+            input_y.saturating_add(row),
         )
     }
 }
 
-/// Rows of the history: the area minus the header, the separator and the
-/// input line.
-fn history_height(height: u16) -> u16 {
-    height.saturating_sub(3)
-}
-
-fn history_area(area: Rect) -> Rect {
-    Rect {
-        y: area.y.saturating_add(1),
-        height: history_height(area.height),
-        ..area
-    }
+/// Columns of a draft row: the area minus the prompt and one column for the
+/// cursor after a full row.
+fn draft_width(width: u16) -> usize {
+    usize::from(width.saturating_sub(3)).max(1)
 }
 
 /// First shown line of a history of `total` wrapped lines.
@@ -623,6 +831,8 @@ pub(crate) trait ChatSource {
     fn post(&self, body: String, reply_to: Option<u64>) -> Result<ChannelMessageInfo, String>;
     /// Shows the thread `thread_id` of the channel's workspace as a popup.
     fn open_thread(&self, thread_id: &str) -> Result<(), String>;
+    /// Names of the agents of the channel's workspace, read now.
+    fn agents(&self) -> Result<Vec<String>, String>;
     /// The channel has a new name; later reads and posts use it.
     fn rename(&mut self, _channel: &str) {}
 }
@@ -723,6 +933,7 @@ impl<S: ChatSource> ChatSession<S> {
                 self.dirty = true;
                 match self.view.handle_key(key) {
                     ChatAction::Quit => return true,
+                    ChatAction::ListAgents => self.list_agents(),
                     ChatAction::Send { body, reply_to } => {
                         match self.source.post(body.clone(), reply_to) {
                             Ok(message) => {
@@ -755,10 +966,23 @@ impl<S: ChatSource> ChatSession<S> {
                 }
             }
             Event::Mouse(mouse) => self.dirty |= self.view.handle_mouse(mouse),
+            Event::Paste(text) => {
+                self.dirty = true;
+                if self.view.handle_paste(&text) == ChatAction::ListAgents {
+                    self.list_agents();
+                }
+            }
             Event::Resize(..) => self.dirty = true,
             _ => {}
         }
         false
+    }
+
+    fn list_agents(&mut self) {
+        match self.source.agents() {
+            Ok(agents) => self.view.show_agents(agents),
+            Err(err) => self.view.set_notice(Some(err)),
+        }
     }
 
     /// Reads from the channel what the view needs now: the latest messages
@@ -921,6 +1145,21 @@ impl ChatSource for ApiSource {
         .map(|_| ())
     }
 
+    fn agents(&self) -> Result<Vec<String>, String> {
+        let result = self.request(
+            "agents",
+            Method::AgentDefinitionList(AgentDefinitionListParams {
+                workspace_id: self.workspace_id.clone(),
+            }),
+        )?;
+        match result {
+            ResponseResult::AgentDefinitionList { agents, .. } => {
+                Ok(agents.into_iter().map(|agent| agent.name).collect())
+            }
+            result => Err(format!("unexpected api result: {result:?}")),
+        }
+    }
+
     fn rename(&mut self, channel: &str) {
         self.channel = channel.to_owned();
     }
@@ -1020,7 +1259,10 @@ fn follow_channel(client: ApiClient, updates: mpsc::Sender<Update>) {
     });
 }
 
-/// Raw mode, the alternate screen and mouse reports while the view runs.
+/// Raw mode, the alternate screen, mouse reports, bracketed paste and the
+/// keyboard protocol while the view runs. Without the keyboard protocol a
+/// pane sends Shift+Enter as a plain Enter; without bracketed paste a pasted
+/// CR sends the draft.
 struct Screen;
 
 impl Screen {
@@ -1030,16 +1272,26 @@ impl Screen {
         crossterm::execute!(
             io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
         )?;
+        // A terminal without the protocol still has Alt+Enter and Ctrl+J.
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
         Ok(screen)
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
         let _ = crossterm::execute!(
             io::stdout(),
+            crossterm::event::DisableBracketedPaste,
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen
         );
@@ -1111,6 +1363,8 @@ mod tests {
         answers: RefCell<VecDeque<Result<Vec<ChannelMessageInfo>, String>>>,
         opened: RefCell<Vec<String>>,
         posted: RefCell<Vec<(String, Option<u64>)>>,
+        agents: RefCell<Vec<String>>,
+        agent_reads: RefCell<usize>,
     }
 
     impl FakeSource {
@@ -1144,6 +1398,11 @@ mod tests {
         fn open_thread(&self, thread_id: &str) -> Result<(), String> {
             self.opened.borrow_mut().push(thread_id.to_owned());
             Ok(())
+        }
+
+        fn agents(&self) -> Result<Vec<String>, String> {
+            *self.agent_reads.borrow_mut() += 1;
+            Ok(self.agents.borrow().clone())
         }
     }
 
@@ -1569,6 +1828,7 @@ mod tests {
             channel: "anuncios".into(),
         };
 
+        session.handle_event(Event::Key(key(KeyCode::Char('x'))));
         session.apply_update(renamed("w2", "geral"), now);
         session.apply_update(renamed("w1", "design"), now);
         assert_eq!(session.channel, "geral");
@@ -1586,6 +1846,7 @@ mod tests {
 
         assert_eq!(session.channel, "anuncios");
         assert_eq!(session.view.message_count(), 2);
+        assert_eq!(session.view.draft.as_str(), "x", "a rename keeps the draft");
         assert!(screen(&mut session.view, 40, 6)
             .iter()
             .any(|line| line.contains("#anuncios")));
@@ -1672,5 +1933,314 @@ mod tests {
         );
         assert_eq!(message_time("2026-11-27 18:04:05"), None);
         assert_eq!(message_time("2026-13-27T18:04:05Z"), None);
+    }
+
+    const AGENTS: [&str; 4] = ["chief", "chief-of-staff", "code-bot", "reviewer"];
+
+    fn with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Presses `key` and answers an agent read with `AGENTS`.
+    fn press(view: &mut ChatView, key: KeyEvent) -> ChatAction {
+        let action = view.handle_key(key);
+        if action == ChatAction::ListAgents {
+            view.show_agents(AGENTS.map(str::to_owned).to_vec());
+        }
+        action
+    }
+
+    fn type_with_agents(view: &mut ChatView, text: &str) {
+        for ch in text.chars() {
+            press(view, key(KeyCode::Char(ch)));
+        }
+    }
+
+    fn shown_suggestions(view: &ChatView) -> Option<(Vec<String>, usize)> {
+        view.suggestions()
+            .map(|(matches, selected)| (matches.into_iter().map(str::to_owned).collect(), selected))
+    }
+
+    #[test]
+    fn modified_enter_and_ctrl_j_insert_a_line_and_enter_sends_all_lines() {
+        let mut view = view();
+        type_text(&mut view, "a");
+        view.handle_key(with_modifiers(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_text(&mut view, "b");
+        view.handle_key(with_modifiers(KeyCode::Enter, KeyModifiers::ALT));
+        type_text(&mut view, "c");
+        view.handle_key(with_modifiers(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        type_text(&mut view, "d");
+
+        assert_eq!(
+            &screen(&mut view, 20, 8)[3..],
+            ["─".repeat(20).as_str(), "> a", "  b", "  c", "  d"]
+        );
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter)),
+            ChatAction::Send {
+                body: "a\nb\nc\nd".into(),
+                reply_to: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_paste_of_several_lines_enters_the_draft_and_sends_nothing() {
+        let mut view = view();
+
+        assert_eq!(
+            view.handle_paste("linha 1\r\nlinha 2\nlinha 3\r\n"),
+            ChatAction::None
+        );
+        assert_eq!(view.draft.as_str(), "linha 1\nlinha 2\nlinha 3\n");
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter)),
+            ChatAction::Send {
+                body: "linha 1\nlinha 2\nlinha 3".into(),
+                reply_to: None
+            }
+        );
+    }
+
+    #[test]
+    fn up_and_down_move_in_the_draft_and_scroll_the_history_at_its_edges() {
+        let mut view = view();
+        view.add_recent((1..=10).map(human));
+        view.set_viewport(30, 8);
+        view.handle_paste("a\nb\nc");
+
+        view.handle_key(key(KeyCode::Up));
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(view.draft.before_cursor(), "a");
+        assert_eq!(view.scroll_from_bottom, 0, "inside the draft, no scroll");
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(view.scroll_from_bottom, 1, "the first row scrolls up");
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.draft.before_cursor(), "a\nb\nc");
+        assert_eq!(view.scroll_from_bottom, 1);
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.scroll_from_bottom, 0, "the last row scrolls down");
+        assert_eq!(view.draft.as_str(), "a\nb\nc");
+    }
+
+    #[test]
+    fn the_input_grows_with_the_draft_and_the_cursor_uses_the_display_width() {
+        let mut view = view();
+        view.add_recent([human(1)]);
+        view.handle_paste("日本\nabcdefghij");
+        let area = Rect::new(0, 0, 10, 8);
+
+        let lines = screen(&mut view, 10, 8);
+
+        // The cell after a wide character reads as a space here.
+        assert_eq!(
+            &lines[4..],
+            ["─".repeat(10).as_str(), "> 日 本", "  abcdefg", "  hij"]
+        );
+        assert_eq!(view.cursor(area), (5, 7));
+        view.handle_key(key(KeyCode::Up));
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(
+            view.cursor(area),
+            (4, 5),
+            "column 3 falls inside 本: stop before it"
+        );
+        assert_eq!(view.history_area(area).height, 3);
+
+        view.draft
+            .set(&format!("日本\nabcdefghij{}", "\nx".repeat(8)));
+        let lines = screen(&mut view, 10, 8);
+        assert_eq!(lines[2], "─".repeat(10), "the input stops growing");
+        assert_eq!(lines[7], "  x");
+        assert_eq!(view.cursor(area).1, 7);
+    }
+
+    #[test]
+    fn at_opens_a_list_of_the_matching_agents() {
+        let mut view = view();
+
+        type_text(&mut view, "oi ");
+        assert_eq!(
+            view.handle_key(key(KeyCode::Char('@'))),
+            ChatAction::ListAgents
+        );
+        view.show_agents(AGENTS.map(str::to_owned).to_vec());
+        type_text(&mut view, "c");
+
+        assert_eq!(
+            shown_suggestions(&view),
+            Some((
+                vec!["chief".into(), "chief-of-staff".into(), "code-bot".into()],
+                0
+            ))
+        );
+        let lines = screen(&mut view, 30, 8);
+        assert_eq!(&lines[3..6], [" @chief", " @chief-of-staff", " @code-bot"]);
+        type_text(&mut view, "h");
+        assert_eq!(
+            shown_suggestions(&view).unwrap().0,
+            ["chief", "chief-of-staff"]
+        );
+        type_text(&mut view, "x");
+        assert_eq!(shown_suggestions(&view), None, "no match closes the list");
+    }
+
+    #[test]
+    fn the_open_list_takes_enter_tab_arrows_esc_and_ctrl_c_without_clearing_the_draft() {
+        let mut view = view();
+        view.add_recent((1..=10).map(human));
+        view.set_viewport(30, 8);
+        type_with_agents(&mut view, "linha\n@c");
+        let ctrl = |ch| with_modifiers(KeyCode::Char(ch), KeyModifiers::CONTROL);
+
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            shown_suggestions(&view).unwrap().1,
+            2,
+            "down stops at the end"
+        );
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(shown_suggestions(&view).unwrap().1, 1);
+        assert_eq!(view.scroll_from_bottom, 0, "the list takes up and down");
+
+        assert_eq!(view.handle_key(ctrl('c')), ChatAction::None);
+        assert_eq!(shown_suggestions(&view), None);
+        assert_eq!(
+            view.draft.as_str(),
+            "linha\n@c",
+            "ctrl-c only closes the list"
+        );
+        type_text(&mut view, "o");
+        assert_eq!(shown_suggestions(&view), None, "a closed list stays closed");
+
+        type_with_agents(&mut view, " @");
+        assert!(shown_suggestions(&view).is_some(), "a new mention opens it");
+        assert_eq!(view.handle_key(ctrl('d')), ChatAction::None);
+        assert_eq!(view.handle_key(key(KeyCode::Esc)), ChatAction::None);
+        assert_eq!(
+            view.draft.as_str(),
+            "linha\n@co @",
+            "esc only closes the list"
+        );
+        view.handle_key(key(KeyCode::Esc));
+        assert!(
+            view.draft.is_empty(),
+            "esc on a closed list clears the draft"
+        );
+
+        type_with_agents(&mut view, "@re");
+        assert_eq!(view.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(view.draft.as_str(), "@reviewer ");
+        type_with_agents(&mut view, "e @chief-");
+        assert_eq!(view.handle_key(key(KeyCode::Tab)), ChatAction::None);
+        assert_eq!(view.draft.as_str(), "@reviewer e @chief-of-staff ");
+    }
+
+    #[test]
+    fn shift_enter_backspace_and_arrows_edit_the_mention_and_close_the_list_out_of_it() {
+        let mut view = view();
+        type_with_agents(&mut view, "@ch");
+
+        view.handle_key(key(KeyCode::Backspace));
+        assert_eq!(
+            shown_suggestions(&view).unwrap().0,
+            ["chief", "chief-of-staff", "code-bot"]
+        );
+        view.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            shown_suggestions(&view),
+            None,
+            "inside a name the list closes"
+        );
+        view.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            shown_suggestions(&view),
+            None,
+            "before the @ the list closes"
+        );
+        assert_eq!(press(&mut view, key(KeyCode::Right)), ChatAction::None);
+        assert_eq!(
+            press(&mut view, key(KeyCode::Right)),
+            ChatAction::ListAgents
+        );
+        assert!(
+            shown_suggestions(&view).is_some(),
+            "back at the end of the name it opens"
+        );
+        view.handle_key(with_modifiers(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(view.draft.as_str(), "@c\n");
+        assert_eq!(shown_suggestions(&view), None);
+    }
+
+    #[test]
+    fn each_mention_reads_the_agents_again() {
+        let source = FakeSource::default();
+        *source.agents.borrow_mut() = vec!["chief".into()];
+        let now = Instant::now();
+        let mut session = ChatSession::new("geral".into(), &source, time::UtcOffset::UTC, now);
+        let type_key = |session: &mut ChatSession<&FakeSource>, ch| {
+            session.handle_event(Event::Key(key(KeyCode::Char(ch))));
+        };
+
+        type_key(&mut session, '@');
+        type_key(&mut session, 'n');
+        assert_eq!(shown_suggestions(&session.view), None);
+        source.agents.borrow_mut().push("novo".into());
+        type_key(&mut session, ' ');
+        type_key(&mut session, '@');
+        type_key(&mut session, 'n');
+
+        assert_eq!(*source.agent_reads.borrow(), 2);
+        assert_eq!(shown_suggestions(&session.view).unwrap().0, ["novo"]);
+        session.handle_event(Event::Paste(" @".into()));
+        assert_eq!(
+            *source.agent_reads.borrow(),
+            3,
+            "a paste can start a mention"
+        );
+    }
+
+    #[test]
+    fn completing_a_mention_before_text_keeps_one_space() {
+        let mut view = view();
+        type_with_agents(&mut view, "@chie olá");
+        for _ in 0.." olá".chars().count() {
+            press(&mut view, key(KeyCode::Left));
+        }
+
+        assert_eq!(view.handle_key(key(KeyCode::Tab)), ChatAction::None);
+        assert_eq!(view.draft.as_str(), "@chief olá");
+        assert_eq!(view.draft.before_cursor(), "@chief");
+    }
+
+    // Property: completing any prefix of an agent name after any text that
+    // starts a mention gives a draft that `mention::resolve` resolves to
+    // that agent.
+    #[test]
+    fn completing_a_prefix_resolves_to_the_chosen_agent() {
+        for agent in AGENTS {
+            for length in 0..=agent.len() {
+                for lead in ["", "oi ", "linha\n", "(", "a, "] {
+                    let mut view = view();
+                    type_with_agents(&mut view, &format!("{lead}@{}", &agent[..length]));
+                    for _ in 0..AGENTS.len() {
+                        let (matches, selected) = shown_suggestions(&view).unwrap();
+                        if matches[selected] == agent {
+                            break;
+                        }
+                        view.handle_key(key(KeyCode::Down));
+                    }
+
+                    view.handle_key(key(KeyCode::Tab));
+
+                    assert_eq!(view.draft.as_str(), format!("{lead}@{agent} "));
+                    assert_eq!(mention::resolve(view.draft.as_str(), AGENTS), [agent]);
+                }
+            }
+        }
     }
 }

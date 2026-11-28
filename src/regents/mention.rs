@@ -28,30 +28,45 @@ pub(crate) fn unknown<'a>(body: &str, known: impl IntoIterator<Item = &'a str>) 
     unknown
 }
 
-/// Every `@name` token of `body`, lowercased. An `@` counts only at the start
-/// of the text or after a character that is not a letter, digit, `.` or `_`,
-/// so `rafael@example.com` is not a mention.
+/// Every `@name` token of `body`, lowercased.
 fn mentioned_names(body: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut previous: Option<char> = None;
     for (index, ch) in body.char_indices() {
-        let starts_mention = ch == '@'
-            && previous
-                .is_none_or(|before| !(before.is_alphanumeric() || matches!(before, '.' | '_')));
+        let starts = ch == '@' && starts_mention(previous);
         previous = Some(ch);
-        if !starts_mention {
+        if !starts {
             continue;
         }
         let rest = &body[index + 1..];
-        let length = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
-            .unwrap_or(rest.len());
+        let length = rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len());
         let name = rest[..length].trim_end_matches(['-', '_']);
         if !name.is_empty() {
             names.push(name.to_ascii_lowercase());
         }
     }
     names
+}
+
+/// The mention that `text` ends in while the user types it: the byte index
+/// of its `@` and the name typed so far, which can be empty. Same rule as
+/// `resolve`.
+pub(crate) fn trailing_mention(text: &str) -> Option<(usize, &str)> {
+    let at = text.rfind('@')?;
+    let name = &text[at + 1..];
+    (name.chars().all(is_name_char) && starts_mention(text[..at].chars().next_back()))
+        .then_some((at, name))
+}
+
+/// An `@` starts a mention only at the start of the text or after a
+/// character that is not a letter, digit, `.` or `_`, so
+/// `rafael@example.com` is not a mention.
+fn starts_mention(previous: Option<char>) -> bool {
+    previous.is_none_or(|before| !(before.is_alphanumeric() || matches!(before, '.' | '_')))
+}
+
+pub(crate) fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
 }
 
 #[cfg(test)]
@@ -105,5 +120,16 @@ mod tests {
         assert_eq!(resolve("@Chief: oi", AGENTS), ["chief"]);
         assert_eq!(resolve("fale com @chief-", AGENTS), ["chief"]);
         assert_eq!(resolve("oi\n@chief\n", AGENTS), ["chief"]);
+    }
+
+    #[test]
+    fn a_trailing_mention_follows_the_same_rule_as_resolve() {
+        assert_eq!(trailing_mention("@"), Some((0, "")));
+        assert_eq!(trailing_mention("oi @Ch"), Some((3, "Ch")));
+        assert_eq!(trailing_mention("(@code-"), Some((1, "code-")));
+        assert_eq!(trailing_mention("@a e\n@re"), Some((5, "re")));
+        for text in ["", "oi", "@ch ", "rafael@ch", "x.@ch", "a_@ch", "@ch,"] {
+            assert_eq!(trailing_mention(text), None, "{text:?}");
+        }
     }
 }
